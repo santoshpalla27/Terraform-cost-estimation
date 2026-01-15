@@ -1,0 +1,188 @@
+# =========================
+# Go
+# =========================
+# Binaries
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+terraform-cost
+terraform-cost-server
+
+# Test binary
+*.test
+
+# Output of go coverage tool
+*.out
+
+# Go workspace file
+go.work
+
+# Vendor directory (if not using modules)
+# vendor/
+
+# =========================
+# IDE / Editor
+# =========================
+# VS Code
+.vscode/
+*.code-workspace
+
+# JetBrains (GoLand, IntelliJ)
+.idea/
+*.iml
+*.iws
+*.ipr
+
+# Vim
+*.swp
+*.swo
+*~
+
+# Emacs
+*~
+\#*\#
+/.emacs.desktop
+/.emacs.desktop.lock
+*.elc
+
+# Sublime Text
+*.sublime-workspace
+*.sublime-project
+
+# =========================
+# OS Generated
+# =========================
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100
+.Trashes
+
+# Windows
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+ehthumbs_vista.db
+*.stackdump
+Desktop.ini
+$RECYCLE.BIN/
+*.lnk
+
+# Linux
+*~
+
+# =========================
+# Terraform (test files)
+# =========================
+*.tfstate
+*.tfstate.*
+*.tfstate.backup
+.terraform/
+.terraform.lock.hcl
+crash.log
+crash.*.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+.terraformrc
+terraform.rc
+
+# =========================
+# Application Specific
+# =========================
+# Local config
+.terraform-cost.json
+.terraform-cost.yaml
+.terraform-cost.yml
+config.local.json
+config.local.yaml
+
+# Cache
+.cache/
+cache/
+*.cache
+
+# Data directory
+data/
+*.db
+*.sqlite
+*.sqlite3
+
+# Pricing data exports
+pricing-*.json
+pricing-*.csv
+
+# Logs
+logs/
+*.log
+
+# Temp files
+tmp/
+temp/
+*.tmp
+
+# Build artifacts
+dist/
+build/
+
+# Coverage reports
+coverage/
+coverage.html
+coverage.txt
+
+# Secrets (NEVER commit these)
+secrets/
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+.env
+.env.*
+!.env.example
+
+# =========================
+# Docker
+# =========================
+# Ignore local docker overrides
+docker-compose.override.yml
+docker-compose.local.yml
+.docker/
+
+# =========================
+# CI/CD
+# =========================
+# GitHub Actions local testing
+.act/
+
+# =========================
+# Testing
+# =========================
+# Test output
+testdata/output/
+*.test.json
+
+# Benchmarks
+*.bench
+
+# =========================
+# Documentation
+# =========================
+# Generated docs
+docs/_build/
+site/
+
+# =========================
+# Project directories to ignore
+# =========================
+# User's terraform projects mounted in docker
+projects/
+
+# Local examples with real data
+examples/local/
+examples/private/

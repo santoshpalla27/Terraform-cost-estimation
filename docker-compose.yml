@@ -1,0 +1,114 @@
+version: "3.9"
+
+services:
+  # =========================
+  # CLI Service (for batch jobs)
+  # =========================
+  terraform-cost:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: terraform-cost:latest
+    container_name: terraform-cost-cli
+    volumes:
+      # Mount your Terraform projects here
+      - ./projects:/projects:ro
+      # Persist cache and data
+      - terraform-cost-cache:/app/cache
+      - terraform-cost-data:/app/data
+      # Custom config (optional)
+      - ./config:/app/config:ro
+    environment:
+      - TERRAFORM_COST_LOG_LEVEL=info
+      - TERRAFORM_COST_DEFAULT_REGION=us-east-1
+    # Override command for different operations
+    command: ["estimate", "/projects"]
+    networks:
+      - terraform-cost-network
+
+  # =========================
+  # API Server (future)
+  # =========================
+  # terraform-cost-api:
+  #   build:
+  #     context: .
+  #     dockerfile: Dockerfile.server
+  #   image: terraform-cost-api:latest
+  #   container_name: terraform-cost-api
+  #   ports:
+  #     - "8080:8080"
+  #   volumes:
+  #     - terraform-cost-cache:/app/cache
+  #     - terraform-cost-data:/app/data
+  #   environment:
+  #     - TERRAFORM_COST_API_PORT=8080
+  #     - TERRAFORM_COST_LOG_LEVEL=info
+  #   healthcheck:
+  #     test: ["CMD", "wget", "-q", "--spider", "http://localhost:8080/health"]
+  #     interval: 30s
+  #     timeout: 10s
+  #     retries: 3
+  #     start_period: 10s
+  #   networks:
+  #     - terraform-cost-network
+  #   restart: unless-stopped
+
+  # =========================
+  # Pricing Database (future)
+  # =========================
+  # pricing-db:
+  #   image: postgres:16-alpine
+  #   container_name: terraform-cost-db
+  #   environment:
+  #     - POSTGRES_DB=terraform_cost
+  #     - POSTGRES_USER=terraform_cost
+  #     - POSTGRES_PASSWORD_FILE=/run/secrets/db_password
+  #   volumes:
+  #     - pricing-db-data:/var/lib/postgresql/data
+  #     - ./scripts/init-db.sql:/docker-entrypoint-initdb.d/init.sql:ro
+  #   secrets:
+  #     - db_password
+  #   healthcheck:
+  #     test: ["CMD-SHELL", "pg_isready -U terraform_cost -d terraform_cost"]
+  #     interval: 10s
+  #     timeout: 5s
+  #     retries: 5
+  #   networks:
+  #     - terraform-cost-network
+  #   restart: unless-stopped
+
+  # =========================
+  # Redis Cache (future)
+  # =========================
+  # cache:
+  #   image: redis:7-alpine
+  #   container_name: terraform-cost-cache
+  #   command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+  #   volumes:
+  #     - redis-data:/data
+  #   healthcheck:
+  #     test: ["CMD", "redis-cli", "ping"]
+  #     interval: 10s
+  #     timeout: 5s
+  #     retries: 5
+  #   networks:
+  #     - terraform-cost-network
+  #   restart: unless-stopped
+
+volumes:
+  terraform-cost-cache:
+    driver: local
+  terraform-cost-data:
+    driver: local
+  # pricing-db-data:
+  #   driver: local
+  # redis-data:
+  #   driver: local
+
+networks:
+  terraform-cost-network:
+    driver: bridge
+
+# secrets:
+#   db_password:
+#     file: ./secrets/db_password.txt
