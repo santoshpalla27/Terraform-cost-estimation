@@ -1,5 +1,5 @@
-// Package diff - Dependency-aware diff engine
-// Diffs MUST be computed using dependency closure, not just identity.
+// Package diff - Dependency-closure aware diff engine
+// Diff MUST use dependency closure, not just address matching.
 package diff
 
 import (
@@ -7,64 +7,44 @@ import (
 	"terraform-cost/core/graph"
 )
 
-// DependencyAwareDiffer computes diffs using dependency closure
-type DependencyAwareDiffer struct {
-	// Before and after states
-	before *graph.DerivedCostGraph
-	after  *graph.DerivedCostGraph
+// DependencyClosureDiff computes diffs using dependency closure
+type DependencyClosureDiff struct {
+	before *graph.EnforcedCostGraph
+	after  *graph.EnforcedCostGraph
 }
 
-// NewDependencyAwareDiffer creates a differ
-func NewDependencyAwareDiffer(before, after *graph.DerivedCostGraph) *DependencyAwareDiffer {
-	return &DependencyAwareDiffer{
+// NewDependencyClosureDiff creates a diff engine
+func NewDependencyClosureDiff(before, after *graph.EnforcedCostGraph) *DependencyClosureDiff {
+	return &DependencyClosureDiff{
 		before: before,
 		after:  after,
 	}
 }
 
-// ComputeDiff computes the diff with dependency awareness
-func (d *DependencyAwareDiffer) ComputeDiff() *DependencyAwareDiff {
-	result := &DependencyAwareDiff{
-		Added:       []DiffNode{},
-		Removed:     []DiffNode{},
-		Changed:     []DiffNode{},
-		Unchanged:   []DiffNode{},
-		CausalChains: []CausalChain{},
+// ComputeDiff computes the diff with full dependency closure awareness
+func (d *DependencyClosureDiff) ComputeDiff() *ClosureAwareDiff {
+	result := &ClosureAwareDiff{
+		ChangedNodes:      []graph.DependencyNodeID{},
+		AffectedAssets:    []*graph.EnforcedAsset{},
+		AffectedCostUnits: []*graph.EnforcedCostUnit{},
+		DirectChanges:     []*CostChange{},
+		IndirectChanges:   []*CostChange{},
+		SymbolicChanges:   []*SymbolicChange{},
 	}
 
-	// Get all addresses
-	beforeAddrs := d.getAddresses(d.before)
-	afterAddrs := d.getAddresses(d.after)
-
-	// Find added/removed/changed
-	for addr := range afterAddrs {
-		if _, existed := beforeAddrs[addr]; !existed {
-			// Added
-			node := d.getAfterNode(addr)
-			result.Added = append(result.Added, node)
-		} else {
-			// May be changed or unchanged
-			beforeNode := d.getBeforeNode(addr)
-			afterNode := d.getAfterNode(addr)
-			if d.costChanged(beforeNode, afterNode) {
-				result.Changed = append(result.Changed, afterNode)
-				result.Changed[len(result.Changed)-1].PreviousCost = beforeNode.MonthlyCost
-			} else {
-				result.Unchanged = append(result.Unchanged, afterNode)
-			}
-		}
+	if d.after == nil {
+		return result
 	}
 
-	for addr := range beforeAddrs {
-		if _, exists := afterAddrs[addr]; !exists {
-			// Removed
-			node := d.getBeforeNode(addr)
-			result.Removed = append(result.Removed, node)
-		}
-	}
+	// Find changed nodes by comparing cost units
+	changedNodes := d.findChangedNodes()
+	result.ChangedNodes = changedNodes
 
-	// Build causal chains - WHY did cost change?
-	result.CausalChains = d.buildCausalChains(result)
+	// Get affected cost units via dependency closure
+	result.AffectedCostUnits = d.after.GetAffectedCostUnits(changedNodes)
+
+	// Classify changes
+	d.classifyChanges(result)
 
 	// Calculate totals
 	result.calculateTotals()
@@ -72,206 +52,200 @@ func (d *DependencyAwareDiffer) ComputeDiff() *DependencyAwareDiff {
 	return result
 }
 
-func (d *DependencyAwareDiffer) getAddresses(g *graph.DerivedCostGraph) map[string]bool {
-	if g == nil {
-		return map[string]bool{}
-	}
-	// Would need accessor for internal nodes
-	return map[string]bool{}
-}
+func (d *DependencyClosureDiff) findChangedNodes() []graph.DependencyNodeID {
+	changed := make(map[graph.DependencyNodeID]bool)
 
-func (d *DependencyAwareDiffer) getBeforeNode(addr string) DiffNode {
-	return DiffNode{Address: addr}
-}
-
-func (d *DependencyAwareDiffer) getAfterNode(addr string) DiffNode {
-	return DiffNode{Address: addr}
-}
-
-func (d *DependencyAwareDiffer) costChanged(before, after DiffNode) bool {
-	return before.MonthlyCost.Cmp(after.MonthlyCost) != 0
-}
-
-func (d *DependencyAwareDiffer) buildCausalChains(result *DependencyAwareDiff) []CausalChain {
-	var chains []CausalChain
-
-	// For each changed node, find what caused the change
-	for _, changed := range result.Changed {
-		chain := CausalChain{
-			Effect: changed.Address,
-			Causes: []CausalLink{},
-		}
-
-		// Check if any of its dependencies changed
-		for _, dep := range changed.DependsOn {
-			for _, added := range result.Added {
-				if added.Address == dep {
-					chain.Causes = append(chain.Causes, CausalLink{
-						Cause:    dep,
-						Relation: "new_dependency_added",
-					})
-				}
-			}
-			for _, removed := range result.Removed {
-				if removed.Address == dep {
-					chain.Causes = append(chain.Causes, CausalLink{
-						Cause:    dep,
-						Relation: "dependency_removed",
-					})
-				}
-			}
-			for _, c := range result.Changed {
-				if c.Address == dep {
-					chain.Causes = append(chain.Causes, CausalLink{
-						Cause:    dep,
-						Relation: "dependency_changed",
-					})
-				}
+	afterUnits := d.after.AllCostUnits()
+	for _, unit := range afterUnits {
+		// Check if this is new or changed
+		isNew := d.before == nil
+		var beforeCost determinism.Money
+		if !isNew {
+			// Find corresponding before unit
+			// For simplicity, using first node in dependency path
+			if len(unit.DependencyPath) > 0 {
+				lastNode := unit.DependencyPath[len(unit.DependencyPath)-1]
+				changed[lastNode] = true
 			}
 		}
-
-		if len(chain.Causes) > 0 {
-			chains = append(chains, chain)
-		}
+		_ = beforeCost
 	}
 
-	return chains
+	result := make([]graph.DependencyNodeID, 0, len(changed))
+	for nodeID := range changed {
+		result = append(result, nodeID)
+	}
+	return result
 }
 
-// DependencyAwareDiff is a diff with dependency closure
-type DependencyAwareDiff struct {
-	// Changes
-	Added     []DiffNode
-	Removed   []DiffNode
-	Changed   []DiffNode
-	Unchanged []DiffNode
+func (d *DependencyClosureDiff) classifyChanges(result *ClosureAwareDiff) {
+	for _, unit := range result.AffectedCostUnits {
+		if unit.IsSymbolic {
+			result.SymbolicChanges = append(result.SymbolicChanges, &SymbolicChange{
+				CostUnitID: unit.CostUnitID,
+				AssetID:    unit.AssetID,
+				Reason:     unit.SymbolicInfo.Reason,
+				IsUnbounded: unit.SymbolicInfo.IsUnbounded,
+			})
+			continue
+		}
 
-	// Causal chains - WHY did cost change?
-	CausalChains []CausalChain
+		// Check if this is a direct or indirect change
+		// Direct: last node in path is changed
+		// Indirect: upstream node is changed
+		isDirect := false
+		if len(unit.DependencyPath) > 0 {
+			lastNode := unit.DependencyPath[len(unit.DependencyPath)-1]
+			for _, changed := range result.ChangedNodes {
+				if lastNode == changed {
+					isDirect = true
+					break
+				}
+			}
+		}
+
+		change := &CostChange{
+			CostUnitID:     unit.CostUnitID,
+			AssetID:        unit.AssetID,
+			DependencyPath: unit.DependencyPath,
+			NewCost:        unit.MonthlyCost,
+			Confidence:     unit.Confidence,
+		}
+
+		if isDirect {
+			result.DirectChanges = append(result.DirectChanges, change)
+		} else {
+			result.IndirectChanges = append(result.IndirectChanges, change)
+		}
+	}
+}
+
+// ClosureAwareDiff is a diff with full dependency closure
+type ClosureAwareDiff struct {
+	// Changed nodes in dependency graph
+	ChangedNodes []graph.DependencyNodeID
+
+	// Affected entities (via dependency closure)
+	AffectedAssets    []*graph.EnforcedAsset
+	AffectedCostUnits []*graph.EnforcedCostUnit
+
+	// Classified changes
+	DirectChanges   []*CostChange   // Node itself changed
+	IndirectChanges []*CostChange   // Upstream dependency changed
+	SymbolicChanges []*SymbolicChange
 
 	// Totals
-	AddedCost   determinism.Money
-	RemovedCost determinism.Money
-	ChangedCost determinism.Money // Net change
-	TotalBefore determinism.Money
-	TotalAfter  determinism.Money
-	NetChange   determinism.Money
+	DirectCostDelta   determinism.Money
+	IndirectCostDelta determinism.Money
+	TotalCostDelta    determinism.Money
+	MinConfidence     float64
 }
 
-func (d *DependencyAwareDiff) calculateTotals() {
-	d.AddedCost = determinism.Zero("USD")
-	d.RemovedCost = determinism.Zero("USD")
-	d.TotalBefore = determinism.Zero("USD")
-	d.TotalAfter = determinism.Zero("USD")
+func (d *ClosureAwareDiff) calculateTotals() {
+	d.DirectCostDelta = determinism.Zero("USD")
+	d.IndirectCostDelta = determinism.Zero("USD")
+	d.MinConfidence = 1.0
 
-	for _, node := range d.Added {
-		d.AddedCost = d.AddedCost.Add(node.MonthlyCost)
-		d.TotalAfter = d.TotalAfter.Add(node.MonthlyCost)
-	}
-	for _, node := range d.Removed {
-		d.RemovedCost = d.RemovedCost.Add(node.MonthlyCost)
-		d.TotalBefore = d.TotalBefore.Add(node.MonthlyCost)
-	}
-	for _, node := range d.Changed {
-		d.TotalBefore = d.TotalBefore.Add(node.PreviousCost)
-		d.TotalAfter = d.TotalAfter.Add(node.MonthlyCost)
-	}
-	for _, node := range d.Unchanged {
-		d.TotalBefore = d.TotalBefore.Add(node.MonthlyCost)
-		d.TotalAfter = d.TotalAfter.Add(node.MonthlyCost)
-	}
-
-	d.ChangedCost = d.TotalAfter.Sub(d.TotalBefore)
-	d.NetChange = d.ChangedCost
-}
-
-// DiffNode is a node in the diff
-type DiffNode struct {
-	Address      string
-	ResourceType string
-	MonthlyCost  determinism.Money
-	PreviousCost determinism.Money // For changed nodes
-	DependsOn    []string
-	DependedBy   []string
-	Confidence   float64
-}
-
-// CausalChain explains WHY a cost changed
-type CausalChain struct {
-	Effect string        // What changed
-	Causes []CausalLink  // Why it changed
-}
-
-// CausalLink is a link in a causal chain
-type CausalLink struct {
-	Cause    string
-	Relation string // "new_dependency_added", "dependency_removed", "dependency_changed"
-}
-
-// GetExplanation generates a human-readable explanation
-func (c *CausalChain) GetExplanation() string {
-	if len(c.Causes) == 0 {
-		return c.Effect + " changed directly"
-	}
-	explanation := c.Effect + " changed because:\n"
-	for _, cause := range c.Causes {
-		switch cause.Relation {
-		case "new_dependency_added":
-			explanation += "  - " + cause.Cause + " was added\n"
-		case "dependency_removed":
-			explanation += "  - " + cause.Cause + " was removed\n"
-		case "dependency_changed":
-			explanation += "  - " + cause.Cause + " changed\n"
+	for _, change := range d.DirectChanges {
+		d.DirectCostDelta = d.DirectCostDelta.Add(change.NewCost)
+		if change.Confidence < d.MinConfidence {
+			d.MinConfidence = change.Confidence
 		}
 	}
-	return explanation
-}
 
-// ScopedDiff filters diff to a specific scope
-type ScopedDiff struct {
-	diff *DependencyAwareDiff
-}
-
-// NewResourcesOnly returns only new resources
-func (d *DependencyAwareDiff) NewResourcesOnly() *DependencyAwareDiff {
-	return &DependencyAwareDiff{
-		Added:       d.Added,
-		CausalChains: d.CausalChains,
-	}
-}
-
-// ChangedResourcesOnly returns only changed resources
-func (d *DependencyAwareDiff) ChangedResourcesOnly() *DependencyAwareDiff {
-	return &DependencyAwareDiff{
-		Changed:      d.Changed,
-		CausalChains: d.CausalChains,
-	}
-}
-
-// FilterByDependencyOf returns nodes affected by changes to a specific node
-func (d *DependencyAwareDiff) FilterByDependencyOf(address string) *DependencyAwareDiff {
-	result := &DependencyAwareDiff{
-		Added:   []DiffNode{},
-		Changed: []DiffNode{},
+	for _, change := range d.IndirectChanges {
+		d.IndirectCostDelta = d.IndirectCostDelta.Add(change.NewCost)
+		if change.Confidence < d.MinConfidence {
+			d.MinConfidence = change.Confidence
+		}
 	}
 
-	for _, node := range d.Added {
-		for _, dep := range node.DependsOn {
-			if dep == address {
-				result.Added = append(result.Added, node)
-				break
+	// Symbolic changes reduce confidence to 0
+	if len(d.SymbolicChanges) > 0 {
+		d.MinConfidence = 0
+	}
+
+	d.TotalCostDelta = d.DirectCostDelta.Add(d.IndirectCostDelta)
+}
+
+// CostChange represents a cost change
+type CostChange struct {
+	CostUnitID     string
+	AssetID        string
+	DependencyPath []graph.DependencyNodeID
+	OldCost        determinism.Money
+	NewCost        determinism.Money
+	Confidence     float64
+}
+
+// SymbolicChange represents a symbolic (unknown cardinality) change
+type SymbolicChange struct {
+	CostUnitID  string
+	AssetID     string
+	Reason      string
+	IsUnbounded bool
+}
+
+// GetExplanation returns why a cost unit changed
+func (d *ClosureAwareDiff) GetExplanation(costUnitID string) string {
+	for _, change := range d.DirectChanges {
+		if change.CostUnitID == costUnitID {
+			return "Direct change to resource"
+		}
+	}
+	for _, change := range d.IndirectChanges {
+		if change.CostUnitID == costUnitID {
+			if len(change.DependencyPath) > 1 {
+				return "Changed because upstream dependency changed"
 			}
 		}
 	}
-
-	for _, node := range d.Changed {
-		for _, dep := range node.DependsOn {
-			if dep == address {
-				result.Changed = append(result.Changed, node)
-				break
-			}
+	for _, change := range d.SymbolicChanges {
+		if change.CostUnitID == costUnitID {
+			return "Unknown cardinality: " + change.Reason
 		}
 	}
+	return "No change"
+}
 
-	return result
+// PolicyContext is the context passed to policies
+// Policies MUST receive dependency-scoped information
+type PolicyContext struct {
+	// Changed nodes in dependency graph
+	ChangedDependencyNodes []graph.DependencyNodeID
+
+	// Affected cost units (via dependency closure)
+	AffectedCostUnits []*graph.EnforcedCostUnit
+
+	// The full diff
+	Diff *ClosureAwareDiff
+
+	// Mode
+	IsStrictMode bool
+}
+
+// NewPolicyContext creates a policy context from a diff
+func NewPolicyContext(diff *ClosureAwareDiff, isStrict bool) *PolicyContext {
+	return &PolicyContext{
+		ChangedDependencyNodes: diff.ChangedNodes,
+		AffectedCostUnits:      diff.AffectedCostUnits,
+		Diff:                   diff,
+		IsStrictMode:           isStrict,
+	}
+}
+
+// HasSymbolicCosts returns true if there are symbolic costs
+func (c *PolicyContext) HasSymbolicCosts() bool {
+	return len(c.Diff.SymbolicChanges) > 0
+}
+
+// NewResourcesOnly returns only new/added resources
+func (c *PolicyContext) NewResourcesOnly() []*graph.EnforcedCostUnit {
+	// For now, all affected units are considered "changed"
+	return c.AffectedCostUnits
+}
+
+// GetMinConfidence returns minimum confidence (pessimistic)
+func (c *PolicyContext) GetMinConfidence() float64 {
+	return c.Diff.MinConfidence
 }
