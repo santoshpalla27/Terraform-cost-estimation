@@ -1,0 +1,182 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Terraform Cost Estimation</title>
+    <link rel="stylesheet" href="styles.css">
+</head>
+
+<body>
+    <div class="app">
+        <!-- Header -->
+        <header class="header">
+            <div class="logo">
+                <span class="logo-icon">💰</span>
+                <h1>Terraform Cost</h1>
+            </div>
+            <nav class="nav">
+                <button class="nav-btn active" data-view="estimate">Estimate</button>
+                <button class="nav-btn" data-view="diff">Diff</button>
+            </nav>
+            <div class="header-meta">
+                <span class="api-version">API v1</span>
+                <span class="engine-version" id="engine-version">Engine --</span>
+            </div>
+        </header>
+
+        <!-- Symbolic Cost Banner - ALWAYS visible when unknowns exist -->
+        <div class="symbolic-banner" id="symbolic-banner">
+            <div class="symbolic-banner-icon">⚠️</div>
+            <div class="symbolic-banner-content">
+                <strong>Unknown Cardinality Detected</strong>
+                <span id="symbolic-count">0</span> resources cannot produce numeric estimates.
+                These are shown with <span class="symbolic-highlight">yellow highlighting</span>.
+            </div>
+            <button class="symbolic-banner-toggle" onclick="scrollToSymbolic()">Jump to Unknowns ↓</button>
+        </div>
+
+        <!-- Main Content -->
+        <main class="main">
+            <!-- Estimate View -->
+            <section id="estimate-view" class="view active">
+                <!-- Summary Row -->
+                <div class="summary-row">
+                    <div class="summary-card primary">
+                        <div class="summary-label">Monthly Cost</div>
+                        <div class="summary-value" id="total-cost">$0.00</div>
+                        <div class="summary-currency">USD</div>
+                    </div>
+                    <div class="summary-card">
+                        <div class="summary-label">Confidence</div>
+                        <div class="confidence-display">
+                            <div class="confidence-value" id="total-confidence">--</div>
+                            <div class="confidence-bar-container">
+                                <div class="confidence-bar" id="confidence-bar"></div>
+                            </div>
+                        </div>
+                        <div class="confidence-reason" id="confidence-reason"></div>
+                    </div>
+                    <div class="summary-card stats">
+                        <div class="stat-item">
+                            <span class="stat-value" id="resource-count">0</span>
+                            <span class="stat-label">Resources</span>
+                        </div>
+                        <div class="stat-item symbolic-stat">
+                            <span class="stat-value" id="symbolic-stat-count">0</span>
+                            <span class="stat-label">Unknown</span>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Two Column Layout -->
+                <div class="content-columns">
+                    <!-- Left: Cost Graph Tree -->
+                    <div class="column-main">
+                        <div class="panel">
+                            <div class="panel-header">
+                                <h2>📊 Cost Graph</h2>
+                                <div class="panel-controls">
+                                    <button class="btn-sm" onclick="expandAll()">Expand All</button>
+                                    <button class="btn-sm" onclick="collapseAll()">Collapse</button>
+                                </div>
+                            </div>
+                            <div class="cost-graph" id="cost-graph">
+                                <!-- Rendered by JS -->
+                            </div>
+                        </div>
+
+                        <!-- Symbolic Costs Section -->
+                        <div class="panel symbolic-section" id="symbolic-section">
+                            <div class="panel-header symbolic-header">
+                                <h2>⚠️ Symbolic Costs (Unknown Cardinality)</h2>
+                            </div>
+                            <div class="symbolic-explanation">
+                                These resources have unknown cardinality and <strong>cannot produce numeric
+                                    estimates</strong>.
+                                They are shown as cost ranges or symbolic values.
+                            </div>
+                            <div class="symbolic-costs" id="symbolic-costs">
+                                <!-- Rendered by JS -->
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Right: Lineage Panel -->
+                    <div class="column-side">
+                        <div class="panel lineage-panel" id="lineage-panel">
+                            <div class="panel-header">
+                                <h2>🔗 Dependency Lineage</h2>
+                            </div>
+                            <div class="lineage-content" id="lineage-content">
+                                <div class="lineage-placeholder">
+                                    Click on a cost node to see why it exists
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Confidence Breakdown -->
+                        <div class="panel">
+                            <div class="panel-header">
+                                <h2>📉 Confidence Contributors</h2>
+                            </div>
+                            <div class="confidence-contributors" id="confidence-contributors">
+                                <!-- Rendered by JS -->
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Diff View -->
+            <section id="diff-view" class="view">
+                <div class="diff-comparison">
+                    <div class="diff-side base">
+                        <div class="diff-side-label">Base</div>
+                        <div class="diff-side-ref" id="base-ref">main</div>
+                        <div class="diff-side-cost" id="base-cost">$0.00</div>
+                        <div class="diff-side-confidence" id="base-conf">Confidence: --</div>
+                    </div>
+                    <div class="diff-delta">
+                        <div class="diff-delta-value" id="diff-delta">+$0.00</div>
+                        <div class="diff-delta-percent" id="diff-percent">+0%</div>
+                    </div>
+                    <div class="diff-side head">
+                        <div class="diff-side-label">Head</div>
+                        <div class="diff-side-ref" id="head-ref">feature</div>
+                        <div class="diff-side-cost" id="head-cost">$0.00</div>
+                        <div class="diff-side-confidence" id="head-conf">Confidence: --</div>
+                    </div>
+                </div>
+
+                <div class="panel">
+                    <div class="panel-header">
+                        <h2>Changes</h2>
+                    </div>
+                    <div id="diff-changes"></div>
+                </div>
+            </section>
+        </main>
+
+        <!-- Footer -->
+        <footer class="footer">
+            <div class="footer-item">
+                <span class="footer-label">Input Hash:</span>
+                <code id="footer-hash">--</code>
+            </div>
+            <div class="footer-item">
+                <span class="footer-label">Pricing Snapshot:</span>
+                <code id="footer-pricing">--</code>
+            </div>
+            <div class="footer-item">
+                <span class="footer-label">Duration:</span>
+                <code id="footer-duration">--</code>
+            </div>
+        </footer>
+    </div>
+
+    <script src="app.js"></script>
+</body>
+
+</html>

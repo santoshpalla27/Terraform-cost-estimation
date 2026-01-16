@@ -130,10 +130,6 @@ temp/
 dist/
 build/
 
-# Coverage reports
-coverage/
-coverage.html
-coverage.txt
 
 # Secrets (NEVER commit these)
 secrets/

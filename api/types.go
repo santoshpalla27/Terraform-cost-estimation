@@ -85,6 +85,9 @@ type EstimateResponse struct {
 	RequestID string    `json:"request_id"`
 	Timestamp time.Time `json:"timestamp"`
 
+	// Metadata for reproducibility
+	Metadata *ResponseMetadata `json:"metadata,omitempty"`
+
 	// Status
 	Status  string `json:"status"` // "success", "partial", "error"
 	Message string `json:"message,omitempty"`
