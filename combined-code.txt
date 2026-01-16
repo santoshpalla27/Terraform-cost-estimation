@@ -3,7 +3,7 @@
 #                    TERRAFORM COST ESTIMATION SYSTEM                          #
 #                         Combined Source Code                                 #
 #                                                                              #
-#                    Generated: 2026-01-16 14:06:11                          #
+#                    Generated: 2026-01-16 19:09:35                          #
 #                                                                              #
 ################################################################################
 
@@ -22,7 +22,12 @@ cost estimation/
 |   |   +-- plan/
 |   +-- terragrunt/
 |-- api/
-|   +-- handlers/
+|   |-- handlers/
+|   |-- handler.go
+|   +-- types.go
+|-- cloud/
+|   +-- aws/
+|       +-- plugin.go
 |-- clouds/
 |   |-- aws/
 |   |   |-- assets/
@@ -52,8 +57,7 @@ cost estimation/
 |   |   |-- builder.go
 |   |   +-- registry.go
 |   |-- confidence/
-|   |   |-- pessimistic.go
-|   |   +-- propagation.go
+|   |   +-- strict_confidence.go
 |   |-- cost/
 |   |   |-- confidence.go
 |   |   |-- engine.go
@@ -69,10 +73,12 @@ cost estimation/
 |   |   +-- pipeline.go
 |   |-- engine/
 |   |   |-- engine.go
-|   |   +-- orchestrator.go
+|   |   |-- orchestrator.go
+|   |   +-- sealed_builder.go
 |   |-- expansion/
 |   |   |-- expander.go
-|   |   +-- expander_test.go
+|   |   |-- expander_test.go
+|   |   +-- sealed_expander.go
 |   |-- expression/
 |   |   |-- context.go
 |   |   |-- reference.go
@@ -81,14 +87,17 @@ cost estimation/
 |   |   |-- bypass_prevention.go
 |   |   |-- canonical_graph.go
 |   |   |-- concurrent.go
+|   |   |-- cost_lineage.go
 |   |   |-- dependency_cost.go
 |   |   |-- derived_cost.go
 |   |   |-- enforced_asset.go
 |   |   |-- enforced_cost.go
+|   |   |-- epistemic_cardinality.go
 |   |   |-- expansion_guard.go
 |   |   |-- infrastructure.go
 |   |   |-- invariant_checker.go
-|   |   +-- invariant_test.go
+|   |   |-- invariant_test.go
+|   |   +-- no_placeholder.go
 |   |-- guards/
 |   |   +-- invariants.go
 |   |-- input/
@@ -112,8 +121,10 @@ cost estimation/
 |   |   |-- enforcer.go
 |   |   |-- immutable_store.go
 |   |   |-- pricing_gate.go
+|   |   |-- pricing_test.go
 |   |   |-- resolver.go
-|   |   +-- snapshot.go
+|   |   |-- snapshot.go
+|   |   +-- strict_rate_key.go
 |   |-- scanner/
 |   |   |-- registry.go
 |   |   +-- scanner.go
@@ -2178,6 +2189,678 @@ func (s *Scanner) loadVariables(basePath string) map[string]interface{} {
 func init() {
 	// Register this scanner
 	scanner.Register(NewScanner())
+}
+
+################################################################################
+# FILE: :\good projects\cost estimation\api\handler.go
+# TYPE: go
+# SIZE: 5844 bytes
+################################################################################
+// Package api - HTTP handler for cost estimation
+// This handler wraps the engine - it contains NO estimation logic.
+// All logic is delegated to core packages.
+package api
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"time"
+
+	"terraform-cost/core/confidence"
+	"terraform-cost/core/graph"
+	"terraform-cost/core/pricing"
+)
+
+// Handler handles estimation requests
+type Handler struct {
+	// Dependencies
+	pricingGate *pricing.PricingGate
+
+	// Configuration
+	defaultMode EstimationMode
+}
+
+// NewHandler creates a new handler
+func NewHandler() *Handler {
+	return &Handler{
+		pricingGate: pricing.NewPricingGate(),
+		defaultMode: ModePermissive,
+	}
+}
+
+// HandleEstimate handles POST /estimate
+func (h *Handler) HandleEstimate(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	requestID := generateRequestID()
+
+	// Parse request
+	var req EstimateRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.writeError(w, requestID, "INVALID_REQUEST", err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	// Validate request
+	if err := validateRequest(&req); err != nil {
+		h.writeError(w, requestID, "VALIDATION_ERROR", err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	// Execute estimation
+	resp, err := h.execute(ctx, requestID, &req)
+	if err != nil {
+		h.writeError(w, requestID, "EXECUTION_ERROR", err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	// Write response
+	h.writeJSON(w, resp, http.StatusOK)
+}
+
+func (h *Handler) execute(ctx context.Context, requestID string, req *EstimateRequest) (*EstimateResponse, error) {
+	resp := &EstimateResponse{
+		RequestID:   requestID,
+		Timestamp:   time.Now().UTC(),
+		Status:      "success",
+		Resources:   []ResourceCost{},
+		Unknowns:    []UnknownCost{},
+		Assumptions: []Assumption{},
+	}
+
+	isStrict := req.Mode == ModeStrict
+
+	// Step 1: Build canonical dependency graph
+	depGraph := graph.NewCanonicalDependencyGraph()
+	// ... parsing and building would go here
+	depGraph.Seal()
+	depGraph.MustBeClosed() // INVARIANT: graph must be closed
+
+	// Step 2: Create expansion guard
+	expansionGuard := graph.NewExpansionGuard(isStrict)
+
+	// Step 3: Create asset graph
+	assetGraph, err := graph.NewEnforcedAssetGraph(depGraph)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create asset graph: %w", err)
+	}
+
+	// Step 4: Create cost graph (ONLY from asset graph with dep graph)
+	costGraph, err := graph.NewEnforcedCostGraph(assetGraph)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create cost graph: %w", err)
+	}
+
+	// Step 5: Run invariant checks
+	checker := graph.NewInvariantChecker(isStrict)
+	if err := checker.RunFullCheck(costGraph); err != nil {
+		return nil, fmt.Errorf("invariant check failed: %w", err)
+	}
+
+	// Step 6: Collect results
+	confidences := []float64{}
+	for _, unit := range costGraph.AllCostUnits() {
+		confidences = append(confidences, unit.Confidence)
+
+		if unit.IsSymbolic {
+			// Add to unknowns
+			resp.Unknowns = append(resp.Unknowns, UnknownCost{
+				Address:     unit.AssetID,
+				Reason:      unit.SymbolicInfo.Reason,
+				IsUnbounded: unit.SymbolicInfo.IsUnbounded,
+			})
+		} else {
+			// Add to resources
+			resp.Resources = append(resp.Resources, ResourceCost{
+				Address:        unit.AssetID,
+				MonthlyCost:    &CostValue{Amount: unit.MonthlyCost.String(), Currency: "USD"},
+				Confidence:     unit.Confidence,
+				DependencyPath: unit.DependencyPath,
+			})
+		}
+	}
+
+	// Step 7: Aggregate confidence (PESSIMISTIC)
+	resp.Confidence = confidence.AggregateConfidence(confidences)
+	resp.ConfidenceLevel = confidence.ConfidenceLevel(resp.Confidence)
+
+	// Step 8: Add blocked expansions as unknowns
+	for _, blocked := range expansionGuard.GetBlocked() {
+		resp.Unknowns = append(resp.Unknowns, UnknownCost{
+			Address:     blocked.Address,
+			Reason:      blocked.Reason,
+			IsUnbounded: true,
+		})
+	}
+
+	// Set status based on unknowns
+	if len(resp.Unknowns) > 0 {
+		resp.Status = "partial"
+		resp.Message = fmt.Sprintf("%d resources have unknown cardinality", len(resp.Unknowns))
+	}
+
+	return resp, nil
+}
+
+func validateRequest(req *EstimateRequest) error {
+	if req.Source.Type == "" {
+		return fmt.Errorf("source.type is required")
+	}
+	switch req.Source.Type {
+	case "directory":
+		if req.Source.Path == "" {
+			return fmt.Errorf("source.path is required for directory type")
+		}
+	case "git":
+		if req.Source.URL == "" {
+			return fmt.Errorf("source.url is required for git type")
+		}
+	case "inline":
+		if len(req.Source.InlineHCL) == 0 {
+			return fmt.Errorf("source.inline_hcl is required for inline type")
+		}
+	default:
+		return fmt.Errorf("invalid source.type: %s", req.Source.Type)
+	}
+	return nil
+}
+
+func (h *Handler) writeError(w http.ResponseWriter, requestID, code, message string, status int) {
+	resp := &EstimateResponse{
+		RequestID: requestID,
+		Timestamp: time.Now().UTC(),
+		Status:    "error",
+		Message:   message,
+		Errors: []ErrorDetail{
+			{Code: code, Message: message},
+		},
+	}
+	h.writeJSON(w, resp, status)
+}
+
+func (h *Handler) writeJSON(w http.ResponseWriter, data interface{}, status int) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	json.NewEncoder(w).Encode(data)
+}
+
+func generateRequestID() string {
+	return fmt.Sprintf("est-%d", time.Now().UnixNano())
+}
+
+// RegisterRoutes registers API routes
+func RegisterRoutes(mux *http.ServeMux, h *Handler) {
+	mux.HandleFunc("POST /estimate", h.HandleEstimate)
+	mux.HandleFunc("GET /health", handleHealth)
+}
+
+func handleHealth(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+}
+
+################################################################################
+# FILE: :\good projects\cost estimation\api\types.go
+# TYPE: go
+# SIZE: 6244 bytes
+################################################################################
+// Package api - API types for cost estimation
+// These types define the contract for /estimate endpoint.
+// API is stateless, idempotent, and deterministic.
+package api
+
+import (
+	"time"
+
+	"terraform-cost/core/graph"
+)
+
+// EstimateRequest is the input to POST /estimate
+type EstimateRequest struct {
+	// Source configuration
+	Source SourceConfig `json:"source"`
+
+	// Estimation mode
+	Mode EstimationMode `json:"mode"`
+
+	// Usage overrides (optional)
+	UsageOverrides map[string]UsageOverride `json:"usage_overrides,omitempty"`
+
+	// Pricing snapshot ID (optional, uses latest if empty)
+	PricingSnapshotID string `json:"pricing_snapshot_id,omitempty"`
+
+	// Policy configuration (optional)
+	PolicyConfig *PolicyConfig `json:"policy_config,omitempty"`
+}
+
+// SourceConfig defines the Terraform source
+type SourceConfig struct {
+	// Type of source: "directory", "git", "inline"
+	Type string `json:"type"`
+
+	// Path or URL
+	Path string `json:"path,omitempty"`
+	URL  string `json:"url,omitempty"`
+	Ref  string `json:"ref,omitempty"` // git ref
+
+	// Inline HCL (for type="inline")
+	InlineHCL map[string]string `json:"inline_hcl,omitempty"`
+
+	// Variables
+	Variables map[string]interface{} `json:"variables,omitempty"`
+
+	// Workspace
+	Workspace string `json:"workspace,omitempty"`
+}
+
+// EstimationMode controls strictness
+type EstimationMode string
+
+const (
+	ModeStrict     EstimationMode = "strict"
+	ModePermissive EstimationMode = "permissive"
+)
+
+// UsageOverride overrides default usage assumptions
+type UsageOverride struct {
+	ResourceAddress string                 `json:"resource_address"`
+	Values          map[string]interface{} `json:"values"`
+}
+
+// PolicyConfig configures policy evaluation
+type PolicyConfig struct {
+	// Policies to evaluate
+	Policies []PolicyRule `json:"policies"`
+
+	// Baseline for diff (optional)
+	BaselineID string `json:"baseline_id,omitempty"`
+}
+
+// PolicyRule defines a policy
+type PolicyRule struct {
+	Name      string                 `json:"name"`
+	Type      string                 `json:"type"` // "budget", "change", "unknown"
+	Threshold interface{}            `json:"threshold,omitempty"`
+	Scope     string                 `json:"scope,omitempty"` // "all", "new", "changed"
+	Config    map[string]interface{} `json:"config,omitempty"`
+}
+
+// EstimateResponse is the output of POST /estimate
+type EstimateResponse struct {
+	// Request tracking
+	RequestID string    `json:"request_id"`
+	Timestamp time.Time `json:"timestamp"`
+
+	// Status
+	Status  string `json:"status"` // "success", "partial", "error"
+	Message string `json:"message,omitempty"`
+
+	// Cost summary
+	TotalMonthlyCost  *CostValue `json:"total_monthly_cost,omitempty"`
+	TotalHourlyCost   *CostValue `json:"total_hourly_cost,omitempty"`
+
+	// Confidence (pessimistic)
+	Confidence       float64  `json:"confidence"`
+	ConfidenceLevel  string   `json:"confidence_level"` // "high", "medium", "low", "unknown"
+	ConfidenceReason string   `json:"confidence_reason,omitempty"`
+
+	// Cost breakdown
+	Resources []ResourceCost `json:"resources,omitempty"`
+
+	// Unknowns (symbolic costs)
+	Unknowns []UnknownCost `json:"unknowns,omitempty"`
+
+	// Assumptions made
+	Assumptions []Assumption `json:"assumptions,omitempty"`
+
+	// Policy results
+	PolicyResults []PolicyResult `json:"policy_results,omitempty"`
+
+	// Pricing reference
+	PricingSnapshot *PricingReference `json:"pricing_snapshot,omitempty"`
+
+	// Errors (for partial results)
+	Errors []ErrorDetail `json:"errors,omitempty"`
+}
+
+// CostValue represents a cost with currency
+type CostValue struct {
+	Amount   string `json:"amount"` // Decimal string for precision
+	Currency string `json:"currency"`
+}
+
+// ResourceCost is the cost of a single resource
+type ResourceCost struct {
+	Address        string                      `json:"address"`
+	ResourceType   string                      `json:"resource_type"`
+	MonthlyCost    *CostValue                  `json:"monthly_cost"`
+	HourlyCost     *CostValue                  `json:"hourly_cost"`
+	Confidence     float64                     `json:"confidence"`
+	DependsOn      []string                    `json:"depends_on,omitempty"`
+	Components     []CostComponent             `json:"components,omitempty"`
+	DependencyPath []graph.DependencyNodeID    `json:"dependency_path,omitempty"`
+}
+
+// CostComponent is a component of resource cost
+type CostComponent struct {
+	Name        string     `json:"name"`
+	MonthlyCost *CostValue `json:"monthly_cost"`
+	Unit        string     `json:"unit,omitempty"`
+	Quantity    float64    `json:"quantity,omitempty"`
+}
+
+// UnknownCost represents a symbolic cost bucket
+type UnknownCost struct {
+	Address     string     `json:"address"`
+	Reason      string     `json:"reason"`
+	Expression  string     `json:"expression,omitempty"`
+	MinCost     *CostValue `json:"min_cost,omitempty"`
+	MaxCost     *CostValue `json:"max_cost,omitempty"`
+	IsUnbounded bool       `json:"is_unbounded"`
+}
+
+// Assumption is a usage assumption made
+type Assumption struct {
+	ResourceAddress string  `json:"resource_address"`
+	Attribute       string  `json:"attribute"`
+	Value           string  `json:"value"`
+	Unit            string  `json:"unit,omitempty"`
+	Reason          string  `json:"reason"`
+	Impact          float64 `json:"impact"` // Confidence impact
+	Overrideable    bool    `json:"overrideable"`
+	OverrideKey     string  `json:"override_key,omitempty"`
+}
+
+// PolicyResult is the result of a policy evaluation
+type PolicyResult struct {
+	PolicyName string `json:"policy_name"`
+	Passed     bool   `json:"passed"`
+	Message    string `json:"message,omitempty"`
+	Severity   string `json:"severity,omitempty"` // "error", "warning", "info"
+}
+
+// PricingReference identifies the pricing snapshot used
+type PricingReference struct {
+	ID          string    `json:"id"`
+	Version     string    `json:"version"`
+	EffectiveAt time.Time `json:"effective_at"`
+	ContentHash string    `json:"content_hash"`
+}
+
+// ErrorDetail provides error information
+type ErrorDetail struct {
+	Code    string `json:"code"`
+	Message string `json:"message"`
+	Path    string `json:"path,omitempty"`
+}
+
+################################################################################
+# FILE: :\good projects\cost estimation\cloud\aws\plugin.go
+# TYPE: go
+# SIZE: 6036 bytes
+################################################################################
+// Package aws - AWS cloud plugin
+// Provides resource mappers, usage defaults, and pricing adapters.
+// Core engine remains untouched.
+package aws
+
+import (
+	"terraform-cost/core/determinism"
+)
+
+// ResourceMapper maps Terraform resources to cost components
+type ResourceMapper struct {
+	resourceType string
+}
+
+// NewResourceMapper creates a mapper for a resource type
+func NewResourceMapper(resourceType string) *ResourceMapper {
+	return &ResourceMapper{resourceType: resourceType}
+}
+
+// Map maps resource attributes to cost components
+func (m *ResourceMapper) Map(attrs map[string]interface{}) []CostComponent {
+	mapper, ok := resourceMappers[m.resourceType]
+	if !ok {
+		return nil
+	}
+	return mapper(attrs)
+}
+
+// CostComponent represents a cost component
+type CostComponent struct {
+	Name     string
+	Unit     string
+	Quantity float64
+	RateKey  string
+}
+
+// UsageDefaults provides default usage values
+var UsageDefaults = map[string]map[string]interface{}{
+	"aws_instance": {
+		"monthly_hours": 730,
+	},
+	"aws_lambda_function": {
+		"monthly_requests":   1000000,
+		"average_duration_ms": 100,
+	},
+	"aws_s3_bucket": {
+		"storage_gb":          100,
+		"put_requests":        10000,
+		"get_requests":        100000,
+	},
+	"aws_db_instance": {
+		"monthly_hours": 730,
+		"storage_gb":    20,
+	},
+	"aws_nat_gateway": {
+		"data_processed_gb": 100,
+	},
+	"aws_ebs_volume": {
+		"iops": 3000,
+	},
+}
+
+// GetUsageDefault returns the default usage value
+func GetUsageDefault(resourceType, attribute string) (interface{}, bool) {
+	if defaults, ok := UsageDefaults[resourceType]; ok {
+		if val, ok := defaults[attribute]; ok {
+			return val, true
+		}
+	}
+	return nil, false
+}
+
+// Resource mappers by type
+var resourceMappers = map[string]func(map[string]interface{}) []CostComponent{
+	"aws_instance":         mapInstance,
+	"aws_lambda_function":  mapLambda,
+	"aws_s3_bucket":        mapS3,
+	"aws_db_instance":      mapRDS,
+	"aws_nat_gateway":      mapNATGateway,
+	"aws_ebs_volume":       mapEBS,
+	"aws_lb":               mapALB,
+}
+
+func mapInstance(attrs map[string]interface{}) []CostComponent {
+	instanceType, _ := attrs["instance_type"].(string)
+	if instanceType == "" {
+		instanceType = "t3.micro"
+	}
+
+	components := []CostComponent{
+		{
+			Name:     "compute",
+			Unit:     "hours",
+			Quantity: 730,
+			RateKey:  "aws_instance:" + instanceType,
+		},
+	}
+
+	// EBS root volume
+	if rootSize, ok := attrs["root_block_device.volume_size"].(float64); ok && rootSize > 0 {
+		components = append(components, CostComponent{
+			Name:     "storage",
+			Unit:     "GB-months",
+			Quantity: rootSize,
+			RateKey:  "aws_ebs_volume:gp3",
+		})
+	}
+
+	return components
+}
+
+func mapLambda(attrs map[string]interface{}) []CostComponent {
+	memoryMB := 128.0
+	if m, ok := attrs["memory_size"].(float64); ok {
+		memoryMB = m
+	}
+
+	return []CostComponent{
+		{
+			Name:     "requests",
+			Unit:     "requests",
+			Quantity: 1000000,
+			RateKey:  "aws_lambda:requests",
+		},
+		{
+			Name:     "duration",
+			Unit:     "GB-seconds",
+			Quantity: 1000000 * 0.1 * (memoryMB / 1024),
+			RateKey:  "aws_lambda:duration",
+		},
+	}
+}
+
+func mapS3(attrs map[string]interface{}) []CostComponent {
+	return []CostComponent{
+		{
+			Name:     "storage",
+			Unit:     "GB-months",
+			Quantity: 100,
+			RateKey:  "aws_s3:storage:standard",
+		},
+		{
+			Name:     "put_requests",
+			Unit:     "requests",
+			Quantity: 10000,
+			RateKey:  "aws_s3:put_requests",
+		},
+		{
+			Name:     "get_requests",
+			Unit:     "requests",
+			Quantity: 100000,
+			RateKey:  "aws_s3:get_requests",
+		},
+	}
+}
+
+func mapRDS(attrs map[string]interface{}) []CostComponent {
+	instanceClass, _ := attrs["instance_class"].(string)
+	if instanceClass == "" {
+		instanceClass = "db.t3.micro"
+	}
+
+	engine, _ := attrs["engine"].(string)
+	if engine == "" {
+		engine = "mysql"
+	}
+
+	return []CostComponent{
+		{
+			Name:     "instance",
+			Unit:     "hours",
+			Quantity: 730,
+			RateKey:  "aws_db_instance:" + engine + ":" + instanceClass,
+		},
+		{
+			Name:     "storage",
+			Unit:     "GB-months",
+			Quantity: 20,
+			RateKey:  "aws_db_instance:storage:gp2",
+		},
+	}
+}
+
+func mapNATGateway(attrs map[string]interface{}) []CostComponent {
+	return []CostComponent{
+		{
+			Name:     "hourly",
+			Unit:     "hours",
+			Quantity: 730,
+			RateKey:  "aws_nat_gateway:hourly",
+		},
+		{
+			Name:     "data_processed",
+			Unit:     "GB",
+			Quantity: 100,
+			RateKey:  "aws_nat_gateway:data",
+		},
+	}
+}
+
+func mapEBS(attrs map[string]interface{}) []CostComponent {
+	volumeType, _ := attrs["type"].(string)
+	if volumeType == "" {
+		volumeType = "gp3"
+	}
+
+	size := 8.0
+	if s, ok := attrs["size"].(float64); ok {
+		size = s
+	}
+
+	return []CostComponent{
+		{
+			Name:     "storage",
+			Unit:     "GB-months",
+			Quantity: size,
+			RateKey:  "aws_ebs_volume:" + volumeType,
+		},
+	}
+}
+
+func mapALB(attrs map[string]interface{}) []CostComponent {
+	return []CostComponent{
+		{
+			Name:     "hourly",
+			Unit:     "hours",
+			Quantity: 730,
+			RateKey:  "aws_lb:hourly",
+		},
+		{
+			Name:     "lcu",
+			Unit:     "LCU-hours",
+			Quantity: 730, // Assumes 1 LCU average
+			RateKey:  "aws_lb:lcu",
+		},
+	}
+}
+
+// PricingAdapter adapts AWS pricing responses
+type PricingAdapter struct{}
+
+// NewPricingAdapter creates a pricing adapter
+func NewPricingAdapter() *PricingAdapter {
+	return &PricingAdapter{}
+}
+
+// GetRate returns the rate for a rate key
+func (a *PricingAdapter) GetRate(rateKey string, region string) (determinism.Money, error) {
+	// This would call AWS Pricing API
+	// For now, return placeholder
+	return determinism.Zero("USD"), nil
+}
+
+// SupportedResources returns all supported resource types
+func SupportedResources() []string {
+	resources := make([]string, 0, len(resourceMappers))
+	for k := range resourceMappers {
+		resources = append(resources, k)
+	}
+	return resources
 }
 
 ################################################################################
@@ -4965,20 +5648,25 @@ func GetDefaultBuilderRegistry() *DefaultBuilderRegistry {
 }
 
 ################################################################################
-# FILE: :\good projects\cost estimation\core\confidence\pessimistic.go
+# FILE: :\good projects\cost estimation\core\confidence\strict_confidence.go
 # TYPE: go
-# SIZE: 3620 bytes
+# SIZE: 5822 bytes
 ################################################################################
-// Package confidence - Pessimistic confidence propagation
-// Aggregate confidence = MIN(child confidence)
-// This ensures low-confidence components are never hidden.
+// Package confidence - Strictly pessimistic confidence
+// Aggregate confidence = MIN(all children)
+// No averaging, weighting, or smoothing allowed.
 package confidence
 
-// AggregateConfidence returns the minimum confidence (pessimistic)
-// This is the REQUIRED behavior for all aggregations.
-func AggregateConfidence(values []float64) float64 {
+import (
+	"fmt"
+	"sort"
+)
+
+// StrictAggregateConfidence returns the minimum confidence
+// This is the ONLY valid aggregation function
+func StrictAggregateConfidence(values []float64) float64 {
 	if len(values) == 0 {
-		return 0.0
+		return 0.0 // No data = no confidence
 	}
 
 	min := 1.0
@@ -4990,442 +5678,184 @@ func AggregateConfidence(values []float64) float64 {
 	return min
 }
 
-// AggregateWithWeights returns weighted minimum
-// Still pessimistic, but considers weight
-func AggregateWithWeights(values []WeightedConfidence) float64 {
-	if len(values) == 0 {
-		return 0.0
-	}
+// BLOCKED: These functions are epistemically dishonest
 
-	min := 1.0
-	for _, wc := range values {
-		// Weight affects how much this drags down the aggregate
-		effective := wc.Confidence
-		if wc.Weight > 0 && wc.Confidence < 1.0 {
-			// Heavier weights have more impact
-			penalty := (1.0 - wc.Confidence) * wc.Weight
-			effective = 1.0 - penalty
-		}
-		if effective < min {
-			min = effective
-		}
-	}
-	return min
+// AvgConfidence is BLOCKED - averaging hides low confidence
+func AvgConfidence(values []float64) float64 {
+	panic("BLOCKED: AvgConfidence - use StrictAggregateConfidence instead")
 }
 
-// WeightedConfidence is a confidence value with weight
-type WeightedConfidence struct {
-	Confidence float64
-	Weight     float64 // 0.0 to 1.0
+// WeightedConfidence is BLOCKED - weighting masks weak assumptions
+func WeightedConfidence(values []float64, weights []float64) float64 {
+	panic("BLOCKED: WeightedConfidence - use StrictAggregateConfidence instead")
 }
 
-// ConfidenceTracker tracks confidence across operations
-type ConfidenceTracker struct {
-	values []float64
-	min    float64
+// SmoothedConfidence is BLOCKED - smoothing is cosmetic
+func SmoothedConfidence(values []float64) float64 {
+	panic("BLOCKED: SmoothedConfidence - use StrictAggregateConfidence instead")
 }
 
-// NewConfidenceTracker creates a tracker
-func NewConfidenceTracker() *ConfidenceTracker {
-	return &ConfidenceTracker{
-		values: []float64{},
-		min:    1.0,
-	}
+// ConfidenceWithCause tracks confidence with explanation
+type ConfidenceWithCause struct {
+	Value  float64
+	Cause  string
+	Source string // e.g., "aws_instance.web", "module.vpc"
 }
 
-// Add adds a confidence value
-func (t *ConfidenceTracker) Add(confidence float64) {
-	t.values = append(t.values, confidence)
-	if confidence < t.min {
-		t.min = confidence
+// ConfidenceAggregator aggregates confidence pessimistically with cause tracking
+type ConfidenceAggregator struct {
+	entries []ConfidenceWithCause
+	min     float64
+	minCause string
+	minSource string
+}
+
+// NewConfidenceAggregator creates an aggregator
+func NewConfidenceAggregator() *ConfidenceAggregator {
+	return &ConfidenceAggregator{
+		entries:   []ConfidenceWithCause{},
+		min:       1.0,
+		minCause:  "",
+		minSource: "",
 	}
 }
 
-// AddWithReason adds a confidence value with reason
-func (t *ConfidenceTracker) AddWithReason(confidence float64, reason string) {
-	t.Add(confidence)
-	// Could track reasons if needed
-}
-
-// Min returns the minimum confidence
-func (t *ConfidenceTracker) Min() float64 {
-	return t.min
-}
-
-// Apply applies a degradation factor
-func (t *ConfidenceTracker) Apply(factor string, reason string) {
-	// Apply a default degradation
-	t.Add(0.9)
-}
-
-// Average returns the average (NOT recommended for production)
-func (t *ConfidenceTracker) Average() float64 {
-	if len(t.values) == 0 {
-		return 0.0
+// Add adds a confidence value with cause
+func (a *ConfidenceAggregator) Add(value float64, cause, source string) {
+	entry := ConfidenceWithCause{
+		Value:  value,
+		Cause:  cause,
+		Source: source,
 	}
-	sum := 0.0
-	for _, v := range t.values {
-		sum += v
+	a.entries = append(a.entries, entry)
+
+	if value < a.min {
+		a.min = value
+		a.minCause = cause
+		a.minSource = source
 	}
-	return sum / float64(len(t.values))
 }
 
-// IsDegraded returns true if confidence is below threshold
-func (t *ConfidenceTracker) IsDegraded(threshold float64) bool {
-	return t.min < threshold
+// Aggregate returns the minimum confidence (pessimistic)
+func (a *ConfidenceAggregator) Aggregate() float64 {
+	return a.min
 }
 
-// ConfidenceImpact represents what impacts confidence
-type ConfidenceImpact struct {
-	Source     string  // What caused the impact
-	Impact     float64 // How much it reduces confidence (0.0-1.0)
-	Reason     string
-	IsBlocking bool // If true in strict mode, blocks estimation
+// GetLowestCause returns the cause of lowest confidence
+func (a *ConfidenceAggregator) GetLowestCause() string {
+	return a.minCause
 }
 
-// ApplyImpacts applies confidence impacts
-func ApplyImpacts(base float64, impacts []ConfidenceImpact) float64 {
-	result := base
-	for _, impact := range impacts {
-		result *= (1.0 - impact.Impact)
+// GetLowestSource returns the source of lowest confidence
+func (a *ConfidenceAggregator) GetLowestSource() string {
+	return a.minSource
+}
+
+// GetAllCauses returns all causes sorted by confidence (lowest first)
+func (a *ConfidenceAggregator) GetAllCauses() []ConfidenceWithCause {
+	sorted := make([]ConfidenceWithCause, len(a.entries))
+	copy(sorted, a.entries)
+	sort.Slice(sorted, func(i, j int) bool {
+		return sorted[i].Value < sorted[j].Value
+	})
+	return sorted
+}
+
+// ConfidenceResult is the result of confidence aggregation
+type ConfidenceResult struct {
+	FinalConfidence   float64
+	LowestConfidence  float64
+	LowestCause       string
+	LowestSource      string
+	Level             string // "high", "medium", "low", "unknown"
+	AllContributors   []ConfidenceWithCause
+}
+
+// GetResult returns the full confidence result
+func (a *ConfidenceAggregator) GetResult() *ConfidenceResult {
+	return &ConfidenceResult{
+		FinalConfidence:  a.min,
+		LowestConfidence: a.min,
+		LowestCause:      a.minCause,
+		LowestSource:     a.minSource,
+		Level:            ConfidenceLevel(a.min),
+		AllContributors:  a.GetAllCauses(),
 	}
-	if result < 0 {
-		result = 0
-	}
-	return result
 }
 
-// REQUIRED confidence thresholds
-const (
-	ConfidenceHigh   = 0.9
-	ConfidenceMedium = 0.7
-	ConfidenceLow    = 0.5
-	ConfidenceNone   = 0.0
-)
-
-// ConfidenceLevel returns a human-readable level
+// ConfidenceLevel returns human-readable level
 func ConfidenceLevel(confidence float64) string {
 	switch {
-	case confidence >= ConfidenceHigh:
+	case confidence >= 0.9:
 		return "high"
-	case confidence >= ConfidenceMedium:
+	case confidence >= 0.7:
 		return "medium"
-	case confidence >= ConfidenceLow:
+	case confidence >= 0.5:
 		return "low"
 	default:
 		return "unknown"
 	}
 }
 
-################################################################################
-# FILE: :\good projects\cost estimation\core\confidence\propagation.go
-# TYPE: go
-# SIZE: 7605 bytes
-################################################################################
-// Package confidence - Pessimistic confidence propagation
-// Aggregation MUST NOT mask low-confidence components.
-// Confidence propagates pessimistically, never optimistically.
-package confidence
-
-import (
-	"fmt"
-	"sort"
-)
-
-// PessimisticPropagator ensures confidence degrades, never improves
-type PessimisticPropagator struct {
-	// Minimum confidence floor
-	floor float64
-
-	// Aggregation rules
-	rules PropagationRules
-}
-
-// PropagationRules define how confidence propagates
-type PropagationRules struct {
-	// How to combine multiple confidences
-	CombineMethod CombineMethod
-
-	// Weight low-confidence items more heavily
-	PessimisticBias float64
-
-	// Minimum items to trigger extra penalty
-	MinItemsForPenalty int
-
-	// Penalty per additional low-confidence item
-	AdditionalPenalty float64
-}
-
-// CombineMethod defines how to combine confidences
-type CombineMethod int
-
+// Common confidence causes
 const (
-	// CombineMinimum takes the minimum confidence
-	CombineMinimum CombineMethod = iota
-
-	// CombineProduct multiplies confidences
-	CombineProduct
-
-	// CombineWeightedMin uses weighted minimum with bias
-	CombineWeightedMin
-
-	// CombineHarmonic uses harmonic mean (penalizes outliers)
-	CombineHarmonic
+	CauseUnknownUsage       = "unknown usage assumption"
+	CauseUnknownCardinality = "unknown cardinality"
+	CauseImpureFunction     = "impure function in expression"
+	CauseDataSource         = "data source dependency"
+	CauseModuleOutput       = "module output dependency"
+	CauseDefaultValue       = "default value used"
+	CauseMissingPricing     = "pricing data unavailable"
 )
 
-// NewPessimisticPropagator creates a propagator
-func NewPessimisticPropagator() *PessimisticPropagator {
-	return &PessimisticPropagator{
-		floor: 0.05, // Never go below 5%
-		rules: PropagationRules{
-			CombineMethod:      CombineWeightedMin,
-			PessimisticBias:    1.5,
-			MinItemsForPenalty: 3,
-			AdditionalPenalty:  0.05,
-		},
-	}
+// Standard confidence values
+const (
+	ConfidenceKnown      = 1.0
+	ConfidenceHigh       = 0.9
+	ConfidenceMedium     = 0.7
+	ConfidenceLow        = 0.5
+	ConfidenceVeryLow    = 0.3
+	ConfidenceUnknown    = 0.0
+)
+
+// RollupConfidence rolls up confidence from children to parent
+// This MUST be used at every boundary (CostUnitâ†’Assetâ†’Moduleâ†’Project)
+func RollupConfidence(children []float64) float64 {
+	return StrictAggregateConfidence(children)
 }
 
-// ConfidenceItem is an item with confidence
-type ConfidenceItem struct {
-	ID         string
-	Confidence float64
-	Reason     string
-	Category   string
-}
-
-// Propagate calculates aggregate confidence pessimistically
-func (p *PessimisticPropagator) Propagate(items []ConfidenceItem) *PropagatedConfidence {
-	if len(items) == 0 {
-		return &PropagatedConfidence{
-			Value:       1.0,
-			Method:      p.rules.CombineMethod.String(),
-			ItemCount:   0,
-			LowItems:    []ConfidenceItem{},
-			Explanation: "no items to aggregate",
-		}
+// AssertPessimistic panics if aggregate exceeds minimum
+func AssertPessimistic(aggregate float64, components []float64) {
+	if len(components) == 0 {
+		return
 	}
-
-	result := &PropagatedConfidence{
-		Method:    p.rules.CombineMethod.String(),
-		ItemCount: len(items),
-		LowItems:  []ConfidenceItem{},
-	}
-
-	// Find low-confidence items (< 80%)
-	lowThreshold := 0.8
-	for _, item := range items {
-		if item.Confidence < lowThreshold {
-			result.LowItems = append(result.LowItems, item)
-		}
-	}
-
-	// Calculate base confidence
-	switch p.rules.CombineMethod {
-	case CombineMinimum:
-		result.Value = p.combineMinimum(items)
-	case CombineProduct:
-		result.Value = p.combineProduct(items)
-	case CombineWeightedMin:
-		result.Value = p.combineWeightedMin(items)
-	case CombineHarmonic:
-		result.Value = p.combineHarmonic(items)
-	default:
-		result.Value = p.combineMinimum(items)
-	}
-
-	// Apply additional penalty for multiple low-confidence items
-	if len(result.LowItems) > p.rules.MinItemsForPenalty {
-		extraPenalty := float64(len(result.LowItems)-p.rules.MinItemsForPenalty) * p.rules.AdditionalPenalty
-		result.Value -= extraPenalty
-	}
-
-	// Apply floor
-	if result.Value < p.floor {
-		result.Value = p.floor
-	}
-
-	// Generate explanation
-	result.Explanation = p.explain(result, items)
-
-	return result
-}
-
-func (p *PessimisticPropagator) combineMinimum(items []ConfidenceItem) float64 {
 	min := 1.0
-	for _, item := range items {
-		if item.Confidence < min {
-			min = item.Confidence
+	for _, c := range components {
+		if c < min {
+			min = c
 		}
 	}
-	return min
-}
-
-func (p *PessimisticPropagator) combineProduct(items []ConfidenceItem) float64 {
-	product := 1.0
-	for _, item := range items {
-		product *= item.Confidence
-	}
-	return product
-}
-
-func (p *PessimisticPropagator) combineWeightedMin(items []ConfidenceItem) float64 {
-	if len(items) == 0 {
-		return 1.0
-	}
-
-	// Sort by confidence
-	sorted := make([]ConfidenceItem, len(items))
-	copy(sorted, items)
-	sort.Slice(sorted, func(i, j int) bool {
-		return sorted[i].Confidence < sorted[j].Confidence
-	})
-
-	// Apply pessimistic bias to lowest items
-	total := 0.0
-	weights := 0.0
-	for i, item := range sorted {
-		// Lower items get higher weight
-		weight := p.rules.PessimisticBias
-		if i > 0 {
-			weight = 1.0
-		}
-		total += item.Confidence * weight
-		weights += weight
-	}
-
-	return total / weights
-}
-
-func (p *PessimisticPropagator) combineHarmonic(items []ConfidenceItem) float64 {
-	if len(items) == 0 {
-		return 1.0
-	}
-
-	// Harmonic mean: n / sum(1/x)
-	sum := 0.0
-	for _, item := range items {
-		if item.Confidence > 0 {
-			sum += 1.0 / item.Confidence
-		} else {
-			return p.floor // Zero confidence means floor
-		}
-	}
-
-	return float64(len(items)) / sum
-}
-
-func (p *PessimisticPropagator) explain(result *PropagatedConfidence, items []ConfidenceItem) string {
-	if len(result.LowItems) == 0 {
-		return fmt.Sprintf("All %d components have high confidence", len(items))
-	}
-
-	explanation := fmt.Sprintf("%d of %d components have low confidence: ", 
-		len(result.LowItems), len(items))
-	
-	for i, item := range result.LowItems {
-		if i > 0 {
-			explanation += ", "
-		}
-		explanation += fmt.Sprintf("%s (%.0f%%)", item.ID, item.Confidence*100)
-	}
-
-	return explanation
-}
-
-// PropagatedConfidence is the result of propagation
-type PropagatedConfidence struct {
-	Value       float64
-	Method      string
-	ItemCount   int
-	LowItems    []ConfidenceItem
-	Explanation string
-}
-
-// String returns the combine method name
-func (m CombineMethod) String() string {
-	switch m {
-	case CombineMinimum:
-		return "minimum"
-	case CombineProduct:
-		return "product"
-	case CombineWeightedMin:
-		return "weighted_min"
-	case CombineHarmonic:
-		return "harmonic"
-	default:
-		return "unknown"
+	if aggregate > min {
+		panic(fmt.Sprintf("INVARIANT VIOLATED: aggregate confidence %.2f exceeds minimum component %.2f", aggregate, min))
 	}
 }
 
-// ConfidenceAggregator aggregates confidence with full visibility
-type ConfidenceAggregator struct {
-	propagator *PessimisticPropagator
-	items      []ConfidenceItem
-	result     *PropagatedConfidence
+// ConfidenceTracker is an alias for ConfidenceAggregator (backwards compatibility)
+type ConfidenceTracker = ConfidenceAggregator
+
+// NewConfidenceTracker creates a new tracker (backwards compatibility)
+func NewConfidenceTracker() *ConfidenceTracker {
+	return NewConfidenceAggregator()
 }
 
-// NewConfidenceAggregator creates an aggregator
-func NewConfidenceAggregator() *ConfidenceAggregator {
-	return &ConfidenceAggregator{
-		propagator: NewPessimisticPropagator(),
-		items:      []ConfidenceItem{},
-	}
+// AggregateConfidence is the public function for MIN aggregation
+func AggregateConfidence(values []float64) float64 {
+	return StrictAggregateConfidence(values)
 }
 
-// Add adds an item
-func (a *ConfidenceAggregator) Add(id string, confidence float64, reason, category string) {
-	a.items = append(a.items, ConfidenceItem{
-		ID:         id,
-		Confidence: confidence,
-		Reason:     reason,
-		Category:   category,
-	})
-	a.result = nil // Invalidate cached result
-}
-
-// Result returns the propagated confidence
-func (a *ConfidenceAggregator) Result() *PropagatedConfidence {
-	if a.result == nil {
-		a.result = a.propagator.Propagate(a.items)
-	}
-	return a.result
-}
-
-// HasLowConfidence returns true if any item is below threshold
-func (a *ConfidenceAggregator) HasLowConfidence(threshold float64) bool {
-	for _, item := range a.items {
-		if item.Confidence < threshold {
-			return true
-		}
-	}
-	return false
-}
-
-// LowestConfidence returns the item with lowest confidence
-func (a *ConfidenceAggregator) LowestConfidence() *ConfidenceItem {
-	if len(a.items) == 0 {
-		return nil
-	}
-
-	lowest := &a.items[0]
-	for i := range a.items {
-		if a.items[i].Confidence < lowest.Confidence {
-			lowest = &a.items[i]
-		}
-	}
-	return lowest
-}
-
-// LowConfidenceWarning generates a warning for low confidence
-func (a *ConfidenceAggregator) LowConfidenceWarning() string {
-	result := a.Result()
-	if result.Value >= 0.8 {
-		return ""
-	}
-
-	return fmt.Sprintf("âš ï¸ Low confidence (%.0f%%): %s", 
-		result.Value*100, result.Explanation)
+// Apply applies a degradation (for backwards compatibility)
+func (a *ConfidenceAggregator) Apply(factor string, reason string) {
+	a.Add(0.9, reason, factor)
 }
 
 ################################################################################
@@ -8616,6 +9046,94 @@ func NewOrchestrationResult(o *AuthoritativeOrchestrator, duration time.Duration
 }
 
 ################################################################################
+# FILE: :\good projects\cost estimation\core\engine\sealed_builder.go
+# TYPE: go
+# SIZE: 2627 bytes
+################################################################################
+// Package engine - Sealed cost graph construction
+// This file SEALS the cost graph construction path.
+// There is ONE way to build a cost graph - no exceptions.
+package engine
+
+import (
+	"fmt"
+
+	"terraform-cost/core/graph"
+)
+
+// SealedCostGraphBuilder is the ONLY way to build a cost graph
+// All other paths are BLOCKED at compile time by making this the only export
+type SealedCostGraphBuilder struct {
+	depGraph   *graph.CanonicalDependencyGraph
+	assetGraph *graph.EnforcedAssetGraph
+	validated  bool
+}
+
+// NewSealedCostGraphBuilder creates a builder with REQUIRED dependency graph
+// Panics immediately if dependency graph is not ready
+func NewSealedCostGraphBuilder(
+	depGraph *graph.CanonicalDependencyGraph,
+	assetGraph *graph.EnforcedAssetGraph,
+) *SealedCostGraphBuilder {
+	// INVARIANT: depGraph is required
+	if depGraph == nil {
+		panic("SEALED: cannot build cost graph - depGraph is nil")
+	}
+
+	// INVARIANT: depGraph must be sealed
+	if !depGraph.IsSealed() {
+		panic("SEALED: cannot build cost graph - depGraph is not sealed")
+	}
+
+	// INVARIANT: depGraph must be transitively closed
+	if !depGraph.IsTransitivelyClosed() {
+		panic("SEALED: cannot build cost graph - dependency graph not transitively closed")
+	}
+
+	// INVARIANT: assetGraph is required
+	if assetGraph == nil {
+		panic("SEALED: cannot build cost graph - assetGraph is nil")
+	}
+
+	return &SealedCostGraphBuilder{
+		depGraph:   depGraph,
+		assetGraph: assetGraph,
+		validated:  true,
+	}
+}
+
+// Build builds the cost graph - only succeeds if all invariants hold
+func (b *SealedCostGraphBuilder) Build() (*graph.AuthoritativeCostGraph, error) {
+	if !b.validated {
+		return nil, fmt.Errorf("SEALED: builder not properly initialized")
+	}
+
+	return graph.BuildAuthoritativeCostGraph(b.depGraph, b.assetGraph)
+}
+
+// BLOCKED PATHS - These exist only to provide clear error messages
+
+// BuildCostGraphWithoutDependencies is BLOCKED
+func BuildCostGraphWithoutDependencies() {
+	panic("SEALED: BuildCostGraphWithoutDependencies - use NewSealedCostGraphBuilder")
+}
+
+// BuildCostGraphFromExpandedInstances is BLOCKED
+func BuildCostGraphFromExpandedInstances() {
+	panic("SEALED: BuildCostGraphFromExpandedInstances - use NewSealedCostGraphBuilder")
+}
+
+// BuildCostGraphFromAssetList is BLOCKED
+func BuildCostGraphFromAssetList() {
+	panic("SEALED: BuildCostGraphFromAssetList - use NewSealedCostGraphBuilder")
+}
+
+// AcceptInstancesWithoutDepGraph is BLOCKED
+func AcceptInstancesWithoutDepGraph() {
+	panic("SEALED: AcceptInstancesWithoutDepGraph - instances require dependency lineage")
+}
+
+################################################################################
 # FILE: :\good projects\cost estimation\core\expansion\expander.go
 # TYPE: go
 # SIZE: 10260 bytes
@@ -9307,6 +9825,210 @@ func TestExpandedGraph(t *testing.T) {
 	if len(baseInstances) != 2 {
 		t.Errorf("expected 2 instances for base address, got %d", len(baseInstances))
 	}
+}
+
+################################################################################
+# FILE: :\good projects\cost estimation\core\expansion\sealed_expander.go
+# TYPE: go
+# SIZE: 5934 bytes
+################################################################################
+// Package expansion - Sealed expansion that NEVER creates instances for unknown cardinality
+// This file replaces the permissive behavior with strict epistemic honesty.
+package expansion
+
+import (
+	"fmt"
+)
+
+// ExpansionOutcome represents what happened during expansion
+type ExpansionOutcome int
+
+const (
+	OutcomeExpanded ExpansionOutcome = iota // Known cardinality, instances created
+	OutcomeSymbolic                         // Unknown cardinality, symbolic bucket created
+	OutcomeBlocked                          // Strict mode, expansion blocked
+	OutcomeEmpty                            // count = 0 or empty for_each
+)
+
+// SealedExpansionResult is the result of sealed expansion
+type SealedExpansionResult struct {
+	Outcome ExpansionOutcome
+
+	// Only set for OutcomeExpanded
+	Instances []*AssetInstance
+
+	// Only set for OutcomeSymbolic
+	SymbolicReason     string
+	SymbolicExpression string
+
+	// Only set for OutcomeBlocked
+	BlockedError error
+
+	// Warnings
+	Warnings []string
+}
+
+// SealedExpander is an expander that NEVER creates instances for unknown cardinality
+type SealedExpander struct {
+	strictMode bool
+	// DefaultCountOnUnknown is REMOVED - unknown means unknown
+}
+
+// NewSealedExpander creates a sealed expander
+func NewSealedExpander(strictMode bool) *SealedExpander {
+	return &SealedExpander{
+		strictMode: strictMode,
+	}
+}
+
+// ExpandSealed expands an asset with sealed semantics
+// Unknown cardinality NEVER produces instances
+func (e *SealedExpander) ExpandSealed(asset *AssetInstance) *SealedExpansionResult {
+	// This is already an instance - just return it
+	return &SealedExpansionResult{
+		Outcome:   OutcomeExpanded,
+		Instances: []*AssetInstance{asset},
+	}
+}
+
+// TryExpandCount attempts count expansion with strict semantics
+func (e *SealedExpander) TryExpandCount(address string, count interface{}, isKnown bool) *SealedExpansionResult {
+	if !isKnown {
+		// UNKNOWN CARDINALITY - NO EXPANSION
+		if e.strictMode {
+			return &SealedExpansionResult{
+				Outcome:      OutcomeBlocked,
+				BlockedError: fmt.Errorf("STRICT: cannot expand %s - count is unknown", address),
+			}
+		}
+
+		// Permissive: symbolic bucket, NOT instances
+		return &SealedExpansionResult{
+			Outcome:            OutcomeSymbolic,
+			SymbolicReason:     "count is unknown",
+			SymbolicExpression: "count = <unknown>",
+			Warnings:           []string{fmt.Sprintf("%s: count cannot be determined pre-apply", address)},
+		}
+	}
+
+	// Known cardinality
+	countVal, ok := count.(int)
+	if !ok {
+		if f, fok := count.(float64); fok {
+			countVal = int(f)
+		} else {
+			// Cannot convert - treat as unknown
+			if e.strictMode {
+				return &SealedExpansionResult{
+					Outcome:      OutcomeBlocked,
+					BlockedError: fmt.Errorf("STRICT: cannot expand %s - count type invalid", address),
+				}
+			}
+			return &SealedExpansionResult{
+				Outcome:        OutcomeSymbolic,
+				SymbolicReason: "count type cannot be converted",
+			}
+		}
+	}
+
+	if countVal == 0 {
+		return &SealedExpansionResult{
+			Outcome: OutcomeEmpty,
+		}
+	}
+
+	// Create instances
+	instances := make([]*AssetInstance, countVal)
+	for i := 0; i < countVal; i++ {
+		instances[i] = &AssetInstance{
+			Key: InstanceKey{Type: KeyTypeInt, NumValue: i},
+			Metadata: InstanceMetadata{
+				ExpansionType: ExpansionCount,
+				IsKnown:       true,
+			},
+		}
+	}
+
+	return &SealedExpansionResult{
+		Outcome:   OutcomeExpanded,
+		Instances: instances,
+	}
+}
+
+// TryExpandForEach attempts for_each expansion with strict semantics
+func (e *SealedExpander) TryExpandForEach(address string, keys []string, isKnown bool) *SealedExpansionResult {
+	if !isKnown {
+		// UNKNOWN CARDINALITY - NO EXPANSION
+		if e.strictMode {
+			return &SealedExpansionResult{
+				Outcome:      OutcomeBlocked,
+				BlockedError: fmt.Errorf("STRICT: cannot expand %s - for_each is unknown", address),
+			}
+		}
+
+		// Permissive: symbolic bucket, NOT instances
+		return &SealedExpansionResult{
+			Outcome:            OutcomeSymbolic,
+			SymbolicReason:     "for_each is unknown",
+			SymbolicExpression: "for_each = <unknown>",
+			Warnings:           []string{fmt.Sprintf("%s: for_each cannot be determined pre-apply", address)},
+		}
+	}
+
+	if len(keys) == 0 {
+		return &SealedExpansionResult{
+			Outcome: OutcomeEmpty,
+		}
+	}
+
+	// Create instances
+	instances := make([]*AssetInstance, len(keys))
+	for i, key := range keys {
+		instances[i] = &AssetInstance{
+			Key: InstanceKey{Type: KeyTypeString, StrValue: key},
+			Metadata: InstanceMetadata{
+				ExpansionType: ExpansionForEach,
+				IsKnown:       true,
+			},
+		}
+	}
+
+	return &SealedExpansionResult{
+		Outcome:   OutcomeExpanded,
+		Instances: instances,
+	}
+}
+
+// HasInstances returns true if expansion produced instances
+func (r *SealedExpansionResult) HasInstances() bool {
+	return r.Outcome == OutcomeExpanded && len(r.Instances) > 0
+}
+
+// IsSymbolic returns true if expansion resulted in symbolic bucket
+func (r *SealedExpansionResult) IsSymbolic() bool {
+	return r.Outcome == OutcomeSymbolic
+}
+
+// IsBlocked returns true if expansion was blocked
+func (r *SealedExpansionResult) IsBlocked() bool {
+	return r.Outcome == OutcomeBlocked
+}
+
+// BLOCKED: Legacy permissive functions that created instances for unknown
+
+// DefaultCountOnUnknown is REMOVED - this was epistemically dishonest
+var DefaultCountOnUnknown = func() {
+	panic("REMOVED: DefaultCountOnUnknown - unknown cardinality cannot have a default")
+}
+
+// AssumeOneInstance is REMOVED - assuming 1 for unknown is a lie
+var AssumeOneInstance = func() {
+	panic("REMOVED: AssumeOneInstance - unknown cardinality must use SymbolicCost")
+}
+
+// ExpandWithWarning is REMOVED - warnings don't make lies true
+var ExpandWithWarning = func() {
+	panic("REMOVED: ExpandWithWarning - unknown cardinality must block or emit SymbolicCost")
 }
 
 ################################################################################
@@ -11078,6 +11800,237 @@ func (e *ConcurrentExecutor) ExecuteWithProgress(ctx context.Context, graph *Inf
 }
 
 ################################################################################
+# FILE: :\good projects\cost estimation\core\graph\cost_lineage.go
+# TYPE: go
+# SIZE: 6382 bytes
+################################################################################
+// Package graph - Single authoritative CostGraph constructor
+// This is the ONLY way to create a cost graph.
+// All other paths are BLOCKED.
+package graph
+
+import (
+	"fmt"
+
+	"terraform-cost/core/determinism"
+)
+
+// AuthoritativeCostGraph is a cost graph that MUST derive from dependency graph
+type AuthoritativeCostGraph struct {
+	// REQUIRED source graphs
+	depGraph   *CanonicalDependencyGraph
+	assetGraph *EnforcedAssetGraph
+
+	// Cost units with mandatory lineage
+	units map[string]*AuthoritativeCostUnit
+
+	// Symbolic buckets (for unknown cardinality)
+	symbolicBuckets []*SymbolicBucket
+
+	// State
+	sealed bool
+}
+
+// AuthoritativeCostUnit is a cost unit with MANDATORY lineage
+type AuthoritativeCostUnit struct {
+	ID      string
+	Lineage *MandatoryLineage
+
+	MonthlyCost determinism.Money
+	HourlyCost  determinism.Money
+	Confidence  float64
+
+	Components []*AuthoritativeCostComponent
+}
+
+// MandatoryLineage is REQUIRED for every cost unit
+type MandatoryLineage struct {
+	AssetID        string
+	InstanceID     string
+	DependencyPath []DependencyEdge
+	ProviderKey    string
+}
+
+// Validate returns error if lineage is incomplete
+func (l *MandatoryLineage) Validate() error {
+	if l.AssetID == "" {
+		return fmt.Errorf("AssetID is empty")
+	}
+	if len(l.DependencyPath) == 0 {
+		return fmt.Errorf("DependencyPath is empty for %s", l.AssetID)
+	}
+	return nil
+}
+
+// MustBeValid panics if invalid
+func (l *MandatoryLineage) MustBeValid() {
+	if err := l.Validate(); err != nil {
+		panic("COST UNIT WITHOUT DEPENDENCY LINEAGE: " + err.Error())
+	}
+}
+
+// AuthoritativeCostComponent is a component
+type AuthoritativeCostComponent struct {
+	Name        string
+	MonthlyCost determinism.Money
+	HourlyCost  determinism.Money
+	RateKey     string
+	Confidence  float64
+}
+
+// SymbolicBucket for unknown cardinality
+type SymbolicBucket struct {
+	AssetID     string
+	Reason      string
+	Expression  string
+	LowerBound  *determinism.Money
+	UpperBound  *determinism.Money
+	IsUnbounded bool
+}
+
+// BuildAuthoritativeCostGraph is the SINGLE AUTHORITATIVE CONSTRUCTOR
+// This is the ONLY way to create a cost graph.
+func BuildAuthoritativeCostGraph(
+	depGraph *CanonicalDependencyGraph,
+	assetGraph *EnforcedAssetGraph,
+) (*AuthoritativeCostGraph, error) {
+	// INVARIANT: depGraph is required
+	if depGraph == nil {
+		return nil, fmt.Errorf("INVARIANT VIOLATED: depGraph is nil")
+	}
+
+	// INVARIANT: assetGraph is required
+	if assetGraph == nil {
+		return nil, fmt.Errorf("INVARIANT VIOLATED: assetGraph is nil")
+	}
+
+	// INVARIANT: depGraph must be sealed
+	if !depGraph.IsSealed() {
+		return nil, fmt.Errorf("INVARIANT VIOLATED: depGraph is not sealed")
+	}
+
+	// INVARIANT: depGraph must be transitively closed
+	if !depGraph.IsTransitivelyClosed() {
+		return nil, fmt.Errorf("INVARIANT VIOLATED: dependency graph is not transitively closed")
+	}
+
+	return &AuthoritativeCostGraph{
+		depGraph:        depGraph,
+		assetGraph:      assetGraph,
+		units:           make(map[string]*AuthoritativeCostUnit),
+		symbolicBuckets: []*SymbolicBucket{},
+		sealed:          false,
+	}, nil
+}
+
+// AddUnit adds a cost unit with MANDATORY lineage validation
+func (g *AuthoritativeCostGraph) AddUnit(unit *AuthoritativeCostUnit) error {
+	if g.sealed {
+		return fmt.Errorf("cannot add to sealed graph")
+	}
+	if unit.Lineage == nil {
+		panic("COST UNIT WITHOUT LINEAGE - this is a bug")
+	}
+	unit.Lineage.MustBeValid()
+
+	g.units[unit.ID] = unit
+	return nil
+}
+
+// AddSymbolicBucket adds a symbolic cost for unknown cardinality
+func (g *AuthoritativeCostGraph) AddSymbolicBucket(bucket *SymbolicBucket) {
+	if g.sealed {
+		panic("cannot add to sealed graph")
+	}
+	g.symbolicBuckets = append(g.symbolicBuckets, bucket)
+}
+
+// Seal seals the graph
+func (g *AuthoritativeCostGraph) Seal() {
+	g.sealed = true
+}
+
+// IsSealed returns seal state
+func (g *AuthoritativeCostGraph) IsSealed() bool {
+	return g.sealed
+}
+
+// GetDependencyGraph returns the dependency graph
+func (g *AuthoritativeCostGraph) GetDependencyGraph() *CanonicalDependencyGraph {
+	return g.depGraph
+}
+
+// GetAssetGraph returns the asset graph
+func (g *AuthoritativeCostGraph) GetAssetGraph() *EnforcedAssetGraph {
+	return g.assetGraph
+}
+
+// AllUnits returns all cost units
+func (g *AuthoritativeCostGraph) AllUnits() []*AuthoritativeCostUnit {
+	units := make([]*AuthoritativeCostUnit, 0, len(g.units))
+	for _, u := range g.units {
+		units = append(units, u)
+	}
+	return units
+}
+
+// GetSymbolicBuckets returns symbolic buckets
+func (g *AuthoritativeCostGraph) GetSymbolicBuckets() []*SymbolicBucket {
+	return g.symbolicBuckets
+}
+
+// HasSymbolicCosts returns true if there are symbolic costs
+func (g *AuthoritativeCostGraph) HasSymbolicCosts() bool {
+	return len(g.symbolicBuckets) > 0
+}
+
+// GetAffectedByChange returns cost units affected by dependency changes
+func (g *AuthoritativeCostGraph) GetAffectedByChange(changedNodeIDs []DependencyNodeID) []*AuthoritativeCostUnit {
+	affected := make(map[string]*AuthoritativeCostUnit)
+
+	for _, nodeID := range changedNodeIDs {
+		// Get transitive dependents
+		dependents := g.depGraph.GetTransitiveDependents(nodeID)
+		allAffected := append([]DependencyNodeID{nodeID}, dependents...)
+
+		// Find cost units with these nodes in their path
+		for _, unit := range g.units {
+			for _, edge := range unit.Lineage.DependencyPath {
+				for _, affectedID := range allAffected {
+					if edge.From == affectedID || edge.To == affectedID {
+						affected[unit.ID] = unit
+						break
+					}
+				}
+			}
+		}
+	}
+
+	result := make([]*AuthoritativeCostUnit, 0, len(affected))
+	for _, u := range affected {
+		result = append(result, u)
+	}
+	return result
+}
+
+// BLOCKED CONSTRUCTORS - these panic immediately
+
+// BuildCostGraphFromAssets is BLOCKED
+func BuildCostGraphFromAssets(assets interface{}) {
+	BlockBypassAttempt("BuildCostGraphFromAssets - use BuildAuthoritativeCostGraph instead")
+}
+
+// BuildCostGraphFromInstances is BLOCKED
+func BuildCostGraphFromInstances(instances interface{}) {
+	BlockBypassAttempt("BuildCostGraphFromInstances - use BuildAuthoritativeCostGraph instead")
+}
+
+// NewCostGraphDirect is BLOCKED
+func NewCostGraphDirect() {
+	BlockBypassAttempt("NewCostGraphDirect - use BuildAuthoritativeCostGraph instead")
+}
+
+################################################################################
 # FILE: :\good projects\cost estimation\core\graph\dependency_cost.go
 # TYPE: go
 # SIZE: 7926 bytes
@@ -12102,6 +13055,216 @@ func (g *EnforcedCostGraph) GetMinConfidence() float64 {
 }
 
 ################################################################################
+# FILE: :\good projects\cost estimation\core\graph\epistemic_cardinality.go
+# TYPE: go
+# SIZE: 6198 bytes
+################################################################################
+// Package graph - Epistemic cardinality enforcement
+// Unknown cardinality NEVER produces numeric costs.
+// This is epistemic honesty, not a feature.
+package graph
+
+import (
+	"fmt"
+
+	"terraform-cost/core/determinism"
+)
+
+// ErrUnknownCardinalityStrict is returned in strict mode
+var ErrUnknownCardinalityStrict = fmt.Errorf("STRICT MODE: unknown cardinality - estimation blocked")
+
+// Cardinality represents cardinality knowledge state
+type Cardinality int
+
+const (
+	CardinalityKnownValue   Cardinality = iota // Cardinality is known
+	CardinalityUnknownValue                    // Cardinality is unknowable pre-apply
+	CardinalityRangeValue                      // Cardinality is a range
+)
+
+// String returns name
+func (c Cardinality) String() string {
+	names := []string{"known", "unknown", "range"}
+	if int(c) < len(names) {
+		return names[c]
+	}
+	return "invalid"
+}
+
+// IsUnknown returns true if cardinality is unknown
+func (c Cardinality) IsUnknown() bool {
+	return c == CardinalityUnknownValue || c == CardinalityRangeValue
+}
+
+// GuardExpansion is the SINGLE gate for all expansion
+// All expansion paths MUST call this
+func GuardExpansion(cardinality Cardinality) error {
+	if cardinality == CardinalityUnknownValue {
+		return ErrUnknownCardinalityStrict
+	}
+	return nil
+}
+
+// GuardExpansionWithMode checks expansion with mode awareness
+func GuardExpansionWithMode(cardinality Cardinality, strictMode bool) (bool, error) {
+	if cardinality != CardinalityUnknownValue {
+		return true, nil // OK to expand
+	}
+
+	if strictMode {
+		return false, ErrUnknownCardinalityStrict
+	}
+
+	// Permissive: no expansion, but no error - use symbolic instead
+	return false, nil
+}
+
+// SymbolicCostOutput is the ONLY valid output for unknown cardinality
+type SymbolicCostOutput struct {
+	AssetAddress string
+	Reason       string
+	Cardinality  Cardinality
+	Expression   string      // The expression that is unknown
+	LowerBound   *determinism.Money
+	UpperBound   *determinism.Money
+	IsUnbounded  bool
+}
+
+// ToJSON returns JSON-safe output
+func (s *SymbolicCostOutput) ToJSON() map[string]interface{} {
+	result := map[string]interface{}{
+		"cost":        "unknown",
+		"reason":      s.Reason,
+		"cardinality": s.Cardinality.String(),
+	}
+	if s.Expression != "" {
+		result["expression"] = s.Expression
+	}
+	if s.LowerBound != nil {
+		result["lower_bound"] = s.LowerBound.String()
+	}
+	if s.UpperBound != nil {
+		result["upper_bound"] = s.UpperBound.String()
+	}
+	if s.IsUnbounded {
+		result["is_unbounded"] = true
+	}
+	return result
+}
+
+// ToCLI returns CLI-friendly output
+func (s *SymbolicCostOutput) ToCLI() string {
+	return fmt.Sprintf("UNKNOWN (%s)", s.Reason)
+}
+
+// CardinalityChecker checks cardinality for common unknown sources
+type CardinalityChecker struct {
+	unknownSources []string
+}
+
+// NewCardinalityChecker creates a checker
+func NewCardinalityChecker() *CardinalityChecker {
+	return &CardinalityChecker{
+		unknownSources: []string{},
+	}
+}
+
+// CheckForEach checks for_each cardinality
+func (c *CardinalityChecker) CheckForEach(expression string, keys interface{}) Cardinality {
+	// Unknown sources
+	if isDataSourceReference(expression) {
+		c.unknownSources = append(c.unknownSources, "data source: "+expression)
+		return CardinalityUnknownValue
+	}
+	if isModuleOutputReference(expression) {
+		c.unknownSources = append(c.unknownSources, "module output: "+expression)
+		return CardinalityUnknownValue
+	}
+	if containsImpureFunction(expression) {
+		c.unknownSources = append(c.unknownSources, "impure function in: "+expression)
+		return CardinalityUnknownValue
+	}
+	if keys == nil {
+		c.unknownSources = append(c.unknownSources, "nil keys: "+expression)
+		return CardinalityUnknownValue
+	}
+
+	return CardinalityKnownValue
+}
+
+// CheckCount checks count cardinality
+func (c *CardinalityChecker) CheckCount(expression string, count interface{}) Cardinality {
+	if isDataSourceReference(expression) {
+		c.unknownSources = append(c.unknownSources, "data source: "+expression)
+		return CardinalityUnknownValue
+	}
+	if isModuleOutputReference(expression) {
+		c.unknownSources = append(c.unknownSources, "module output: "+expression)
+		return CardinalityUnknownValue
+	}
+	if count == nil {
+		c.unknownSources = append(c.unknownSources, "nil count: "+expression)
+		return CardinalityUnknownValue
+	}
+
+	return CardinalityKnownValue
+}
+
+// GetUnknownSources returns sources of unknown cardinality
+func (c *CardinalityChecker) GetUnknownSources() []string {
+	return c.unknownSources
+}
+
+func isDataSourceReference(expr string) bool {
+	return len(expr) > 5 && expr[:5] == "data."
+}
+
+func isModuleOutputReference(expr string) bool {
+	return len(expr) > 7 && expr[:7] == "module."
+}
+
+func containsImpureFunction(expr string) bool {
+	impureFunctions := []string{"fileset", "file", "templatefile", "timestamp", "uuid"}
+	for _, fn := range impureFunctions {
+		if containsSubstring(expr, fn+"(") {
+			return true
+		}
+	}
+	return false
+}
+
+func containsSubstring(s, substr string) bool {
+	for i := 0; i <= len(s)-len(substr); i++ {
+		if s[i:i+len(substr)] == substr {
+			return true
+		}
+	}
+	return false
+}
+
+// BLOCKED: Placeholder expansion functions
+
+// CreatePlaceholderInstances is BLOCKED - use SymbolicCostOutput instead
+func CreatePlaceholderInstances(address string, count int) {
+	BlockBypassAttempt("CreatePlaceholderInstances - unknown cardinality must use SymbolicCostOutput")
+}
+
+// CreateSyntheticCount is BLOCKED - unknown means unknown
+func CreateSyntheticCount(address string) {
+	BlockBypassAttempt("CreateSyntheticCount - unknown cardinality cannot have synthetic count")
+}
+
+// DefaultToOne is BLOCKED - defaulting to 1 is epistemically dishonest  
+func DefaultToOne(address string) {
+	BlockBypassAttempt("DefaultToOne - unknown cardinality cannot default to 1")
+}
+
+// DegradeConfidenceInsteadOfBlocking is BLOCKED - confidence degradation is not a substitute
+func DegradeConfidenceInsteadOfBlocking(address string) {
+	BlockBypassAttempt("DegradeConfidenceInsteadOfBlocking - unknown cardinality must block or use symbolic")
+}
+
+################################################################################
 # FILE: :\good projects\cost estimation\core\graph\expansion_guard.go
 # TYPE: go
 # SIZE: 3210 bytes
@@ -13062,6 +14225,179 @@ func TestConfidencePessimistic(t *testing.T) {
 	}()
 
 	_ = checker.AssertConfidencePessimistic(0.8, []float64{0.9, 0.7, 0.5})
+}
+
+################################################################################
+# FILE: :\good projects\cost estimation\core\graph\no_placeholder.go
+# TYPE: go
+# SIZE: 5313 bytes
+################################################################################
+// Package graph - Placeholder expansion removal
+// This file REMOVES all placeholder expansion.
+// Unknown cardinality = symbolic cost, NEVER instances.
+package graph
+
+import (
+	"fmt"
+
+	"terraform-cost/core/determinism"
+)
+
+// ExpansionResult is the result of attempting expansion
+type ExpansionResult struct {
+	// Success case
+	Instances []string // Only populated if cardinality is known
+
+	// Failure case (unknown cardinality)
+	IsSymbolic bool
+	Symbolic   *SymbolicCostOutput
+
+	// Blocked in strict mode
+	BlockedError error
+}
+
+// StrictExpansionGate is the ONLY way to expand resources
+// Placeholder expansion does not exist
+type StrictExpansionGate struct {
+	strictMode bool
+	symbolic   []*SymbolicCostOutput
+}
+
+// NewStrictExpansionGate creates a gate
+func NewStrictExpansionGate(strictMode bool) *StrictExpansionGate {
+	return &StrictExpansionGate{
+		strictMode: strictMode,
+		symbolic:   []*SymbolicCostOutput{},
+	}
+}
+
+// TryExpand attempts expansion - returns symbolic if unknown
+// NEVER creates placeholder instances
+func (g *StrictExpansionGate) TryExpand(address string, cardinality Cardinality, count int, keys []string) *ExpansionResult {
+	result := &ExpansionResult{}
+
+	if cardinality == CardinalityKnownValue {
+		// Known cardinality - expand normally
+		if len(keys) > 0 {
+			// for_each
+			result.Instances = make([]string, len(keys))
+			for i, key := range keys {
+				result.Instances[i] = fmt.Sprintf("%s[%q]", address, key)
+			}
+		} else if count >= 0 {
+			// count
+			result.Instances = make([]string, count)
+			for i := 0; i < count; i++ {
+				result.Instances[i] = fmt.Sprintf("%s[%d]", address, i)
+			}
+		} else {
+			// No count/for_each - single instance
+			result.Instances = []string{address}
+		}
+		return result
+	}
+
+	// Unknown cardinality - NEVER expand
+	result.IsSymbolic = true
+	result.Symbolic = &SymbolicCostOutput{
+		AssetAddress: address,
+		Reason:       fmt.Sprintf("cardinality is %s", cardinality),
+		Cardinality:  cardinality,
+		IsUnbounded:  cardinality == CardinalityUnknownValue,
+	}
+	g.symbolic = append(g.symbolic, result.Symbolic)
+
+	if g.strictMode {
+		result.BlockedError = fmt.Errorf("STRICT MODE: cannot expand %s - cardinality unknown", address)
+	}
+
+	return result
+}
+
+// TryExpandForEach attempts for_each expansion
+func (g *StrictExpansionGate) TryExpandForEach(address string, expression string, keys interface{}) *ExpansionResult {
+	// Check cardinality
+	checker := NewCardinalityChecker()
+	cardinality := checker.CheckForEach(expression, keys)
+
+	if keySlice, ok := keys.([]string); ok && cardinality == CardinalityKnownValue {
+		return g.TryExpand(address, cardinality, 0, keySlice)
+	}
+
+	return g.TryExpand(address, cardinality, 0, nil)
+}
+
+// TryExpandCount attempts count expansion
+func (g *StrictExpansionGate) TryExpandCount(address string, expression string, count interface{}) *ExpansionResult {
+	// Check cardinality
+	checker := NewCardinalityChecker()
+	cardinality := checker.CheckCount(expression, count)
+
+	if countInt, ok := count.(int); ok && cardinality == CardinalityKnownValue {
+		return g.TryExpand(address, cardinality, countInt, nil)
+	}
+
+	return g.TryExpand(address, CardinalityUnknownValue, 0, nil)
+}
+
+// GetSymbolicCosts returns all symbolic costs
+func (g *StrictExpansionGate) GetSymbolicCosts() []*SymbolicCostOutput {
+	return g.symbolic
+}
+
+// HasSymbolicCosts returns true if any expansion resulted in symbolic cost
+func (g *StrictExpansionGate) HasSymbolicCosts() bool {
+	return len(g.symbolic) > 0
+}
+
+// SymbolicCostBudget represents a budget for symbolic costs
+type SymbolicCostBudget struct {
+	Reason      string
+	LowerBound  determinism.Money
+	UpperBound  *determinism.Money // nil = unbounded
+	Expression  string
+	Cardinality Cardinality
+}
+
+// ToOutput converts to output format
+func (b *SymbolicCostBudget) ToOutput() map[string]interface{} {
+	result := map[string]interface{}{
+		"type":        "symbolic",
+		"reason":      b.Reason,
+		"cardinality": b.Cardinality.String(),
+	}
+	if b.Expression != "" {
+		result["expression"] = b.Expression
+	}
+	result["lower_bound"] = b.LowerBound.String()
+	if b.UpperBound != nil {
+		result["upper_bound"] = b.UpperBound.String()
+	} else {
+		result["upper_bound"] = "unbounded"
+	}
+	return result
+}
+
+// BLOCKED PLACEHOLDERS - These panic to prevent accidental use
+
+// CreatePlaceholderInstance is REMOVED - use TryExpand instead
+func CreatePlaceholderInstance(address string) {
+	panic("REMOVED: CreatePlaceholderInstance - placeholder expansion no longer exists")
+}
+
+// ExpandWithDefaultCount is REMOVED - defaults are epistemically dishonest
+func ExpandWithDefaultCount(address string, defaultCount int) {
+	panic("REMOVED: ExpandWithDefaultCount - unknown cardinality must use SymbolicCost")
+}
+
+// InferCardinalityFromUsage is REMOVED - inference is not knowledge
+func InferCardinalityFromUsage(address string) {
+	panic("REMOVED: InferCardinalityFromUsage - cardinality must be explicitly known")
+}
+
+// RetainCardinalityFromState is REMOVED - state cardinality may have changed
+func RetainCardinalityFromState(address string) {
+	panic("REMOVED: RetainCardinalityFromState - state is not authoritative for pre-apply estimation")
 }
 
 ################################################################################
@@ -18011,6 +19347,153 @@ func (fp *FrozenProvider) String() string {
 }
 
 ################################################################################
+# FILE: :\good projects\cost estimation\core\pricing\pricing_test.go
+# TYPE: go
+# SIZE: 4422 bytes
+################################################################################
+// Package pricing - Pricing invariant tests
+// These tests PROVE the invariants are real by intentionally violating them.
+package pricing
+
+import (
+	"testing"
+)
+
+// TestPricingBeforeFinalizationPanics proves pricing cannot occur before finalization
+func TestPricingBeforeFinalizationPanics(t *testing.T) {
+	defer func() {
+		r := recover()
+		if r == nil {
+			t.Fatal("Expected panic when pricing before finalization, but no panic occurred")
+		}
+		msg, ok := r.(string)
+		if !ok {
+			t.Fatalf("Expected string panic, got %T: %v", r, r)
+		}
+		if len(msg) < 10 {
+			t.Fatalf("Panic message too short: %s", msg)
+		}
+		t.Logf("Correctly panicked: %s", msg)
+	}()
+
+	// Create gate but DO NOT freeze it
+	gate := NewPricingGate()
+	gate.FreezeProvider("aws", "prod", "us-east-1", "123456789")
+	// gate.Freeze() - intentionally NOT called
+
+	// This MUST panic
+	gate.AssertCanPrice()
+}
+
+// TestRateKeyWithoutAliasPanics proves alias is mandatory
+func TestRateKeyWithoutAliasPanics(t *testing.T) {
+	defer func() {
+		r := recover()
+		if r == nil {
+			t.Fatal("Expected panic for RateKey without finalized provider, but no panic occurred")
+		}
+		t.Logf("Correctly panicked: %v", r)
+	}()
+
+	// Create unfinalized provider
+	unfinalizedProvider := &unfinalizedProviderMock{}
+
+	// This MUST panic
+	_ = NewRateKeyStrict(unfinalizedProvider, "ec2", "us-east-1", nil)
+}
+
+// unfinalizedProviderMock is a mock that is NOT finalized
+type unfinalizedProviderMock struct{}
+
+func (m *unfinalizedProviderMock) Provider() string  { return "aws" }
+func (m *unfinalizedProviderMock) Alias() string     { return "" }
+func (m *unfinalizedProviderMock) IsFinalized() bool { return false }
+
+// TestPricingGateFreezeWorks proves freezing works correctly
+func TestPricingGateFreezeWorks(t *testing.T) {
+	gate := NewPricingGate()
+	gate.FreezeProvider("aws", "prod", "us-east-1", "123456789")
+	gate.Freeze()
+
+	// This should NOT panic
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("Unexpected panic after proper freezing: %v", r)
+		}
+	}()
+
+	gate.AssertCanPrice()
+	provider := gate.MustGetProvider("aws", "prod")
+	if provider.Provider != "aws" {
+		t.Errorf("Expected provider 'aws', got '%s'", provider.Provider)
+	}
+	if provider.Alias != "prod" {
+		t.Errorf("Expected alias 'prod', got '%s'", provider.Alias)
+	}
+}
+
+// TestRateKeyIncludesAlias proves alias is embedded in rate key
+func TestRateKeyIncludesAlias(t *testing.T) {
+	provider := NewFinalizedProvider("aws", "prod", "us-east-1", "123456789")
+	rateKey := NewRateKeyStrict(provider, "ec2", "us-east-1", nil)
+
+	key := rateKey.Key()
+	if key == "" {
+		t.Fatal("RateKey.Key() returned empty string")
+	}
+
+	// Key should include alias
+	providerKey := rateKey.ProviderFullKey()
+	if providerKey != "aws.prod" {
+		t.Errorf("Expected ProviderFullKey 'aws.prod', got '%s'", providerKey)
+	}
+
+	t.Logf("RateKey: %s, ProviderFullKey: %s", key, providerKey)
+}
+
+// TestScopedPricingSnapshot proves snapshots are alias-scoped
+func TestScopedPricingSnapshot(t *testing.T) {
+	// Create two snapshots for different aliases
+	snapshotProd := NewScopedPricingSnapshot("aws.prod", "us-east-1")
+	snapshotDev := NewScopedPricingSnapshot("aws.dev", "us-east-1")
+
+	// Add same rate key to both
+	snapshotProd.AddRate("aws.prod:us-east-1:ec2", ScopedRate{
+		Key:      "aws.prod:us-east-1:ec2",
+		Price:    "0.10",
+		Currency: "USD",
+		Unit:     "hour",
+	})
+	snapshotDev.AddRate("aws.dev:us-east-1:ec2", ScopedRate{
+		Key:      "aws.dev:us-east-1:ec2",
+		Price:    "0.05",
+		Currency: "USD",
+		Unit:     "hour",
+	})
+
+	// Verify isolation
+	providerProd := NewFinalizedProvider("aws", "prod", "us-east-1", "123456789")
+	providerDev := NewFinalizedProvider("aws", "dev", "us-east-1", "987654321")
+
+	rateKeyProd := NewRateKeyStrict(providerProd, "ec2", "us-east-1", nil)
+	rateKeyDev := NewRateKeyStrict(providerDev, "ec2", "us-east-1", nil)
+
+	// Prod snapshot should not return dev rate
+	_, found := snapshotProd.GetRate(rateKeyDev)
+	if found {
+		t.Error("Prod snapshot should not return dev rate - snapshots not properly isolated")
+	}
+
+	// Dev snapshot should not return prod rate
+	_, found = snapshotDev.GetRate(rateKeyProd)
+	if found {
+		t.Error("Dev snapshot should not return prod rate - snapshots not properly isolated")
+	}
+
+	t.Log("Pricing snapshots are correctly alias-scoped")
+}
+
+################################################################################
 # FILE: :\good projects\cost estimation\core\pricing\resolver.go
 # TYPE: go
 # SIZE: 3323 bytes
@@ -18545,6 +20028,219 @@ func (s UsageSource) String() string {
 	default:
 		return "unknown"
 	}
+}
+
+################################################################################
+# FILE: :\good projects\cost estimation\core\pricing\strict_rate_key.go
+# TYPE: go
+# SIZE: 5250 bytes
+################################################################################
+// Package pricing - RateKey constructor enforcement
+// RateKeys can ONLY be created via constructor - no struct literals allowed.
+// This ensures provider alias is always present.
+package pricing
+
+import (
+	"fmt"
+	"strings"
+)
+
+// RateKeyStrict is a rate key that can ONLY be created via constructor
+type RateKeyStrict struct {
+	provider  string
+	alias     string
+	region    string
+	service   string
+	sku       string
+	attrs     map[string]string
+	validated bool
+}
+
+// NewRateKeyStrict creates a rate key with REQUIRED provider identity
+// Panics if provider is not finalized
+func NewRateKeyStrict(provider ProviderIdentity, service, region string, attrs map[string]string) *RateKeyStrict {
+	if !provider.IsFinalized() {
+		panic("INVARIANT VIOLATED: pricing requested before provider finalization")
+	}
+
+	key := &RateKeyStrict{
+		provider:  provider.Provider(),
+		alias:     provider.Alias(),
+		region:    region,
+		service:   service,
+		attrs:     attrs,
+		validated: true,
+	}
+
+	return key
+}
+
+// ProviderIdentity represents a finalized provider
+type ProviderIdentity interface {
+	Provider() string
+	Alias() string
+	IsFinalized() bool
+}
+
+// FinalizedProvider is a provider that has been frozen
+type FinalizedProvider struct {
+	provider  string
+	alias     string
+	region    string
+	account   string
+	finalized bool
+}
+
+// NewFinalizedProvider creates a finalized provider
+func NewFinalizedProvider(provider, alias, region, account string) *FinalizedProvider {
+	return &FinalizedProvider{
+		provider:  provider,
+		alias:     alias,
+		region:    region,
+		account:   account,
+		finalized: true,
+	}
+}
+
+// Provider returns the provider name
+func (p *FinalizedProvider) Provider() string { return p.provider }
+
+// Alias returns the alias
+func (p *FinalizedProvider) Alias() string { return p.alias }
+
+// Region returns the region
+func (p *FinalizedProvider) Region() string { return p.region }
+
+// Account returns the account
+func (p *FinalizedProvider) Account() string { return p.account }
+
+// IsFinalized returns true if finalized
+func (p *FinalizedProvider) IsFinalized() bool { return p.finalized }
+
+// FullKey returns the full provider key (provider.alias)
+func (p *FinalizedProvider) FullKey() string {
+	if p.alias == "" || p.alias == "default" {
+		return p.provider
+	}
+	return p.provider + "." + p.alias
+}
+
+// Key returns the lookup key for this rate
+func (k *RateKeyStrict) Key() string {
+	if !k.validated {
+		panic("INVARIANT VIOLATED: using unvalidated RateKey")
+	}
+
+	parts := []string{k.provider}
+	if k.alias != "" && k.alias != "default" {
+		parts = append(parts, k.alias)
+	}
+	parts = append(parts, k.region, k.service)
+	if k.sku != "" {
+		parts = append(parts, k.sku)
+	}
+
+	return strings.Join(parts, ":")
+}
+
+// WithSKU adds SKU to the key
+func (k *RateKeyStrict) WithSKU(sku string) *RateKeyStrict {
+	k.sku = sku
+	return k
+}
+
+// WithAttr adds an attribute
+func (k *RateKeyStrict) WithAttr(key, value string) *RateKeyStrict {
+	if k.attrs == nil {
+		k.attrs = make(map[string]string)
+	}
+	k.attrs[key] = value
+	return k
+}
+
+// String returns string representation
+func (k *RateKeyStrict) String() string {
+	return k.Key()
+}
+
+// ProviderFullKey returns provider.alias
+func (k *RateKeyStrict) ProviderFullKey() string {
+	if k.alias == "" || k.alias == "default" {
+		return k.provider
+	}
+	return k.provider + "." + k.alias
+}
+
+// ValidateProviderFinalization validates that provider is finalized
+func ValidateProviderFinalization(provider ProviderIdentity) error {
+	if provider == nil {
+		return fmt.Errorf("provider is nil")
+	}
+	if !provider.IsFinalized() {
+		return fmt.Errorf("provider %s is not finalized", provider.Provider())
+	}
+	return nil
+}
+
+// MustBeFinalized panics if provider is not finalized
+func MustBeFinalized(provider ProviderIdentity) {
+	if err := ValidateProviderFinalization(provider); err != nil {
+		panic("INVARIANT VIOLATED: " + err.Error())
+	}
+}
+
+// PricingSnapshot must be scoped by provider + alias + region
+type ScopedPricingSnapshot struct {
+	// Scope
+	ProviderKey string // provider.alias
+	Region      string
+
+	// Rates
+	rates map[string]ScopedRate
+
+	// Metadata
+	Version     string
+	EffectiveAt string
+	ContentHash string
+}
+
+// ScopedRate is a rate scoped to provider + alias + region
+type ScopedRate struct {
+	Key      string
+	Price    string // decimal
+	Currency string
+	Unit     string
+}
+
+// NewScopedPricingSnapshot creates a scoped snapshot
+func NewScopedPricingSnapshot(providerKey, region string) *ScopedPricingSnapshot {
+	return &ScopedPricingSnapshot{
+		ProviderKey: providerKey,
+		Region:      region,
+		rates:       make(map[string]ScopedRate),
+	}
+}
+
+// AddRate adds a rate
+func (s *ScopedPricingSnapshot) AddRate(key string, rate ScopedRate) {
+	s.rates[key] = rate
+}
+
+// GetRate returns a rate
+func (s *ScopedPricingSnapshot) GetRate(key *RateKeyStrict) (*ScopedRate, bool) {
+	// Validate scope
+	if key.ProviderFullKey() != s.ProviderKey {
+		return nil, false
+	}
+	if key.region != s.Region {
+		return nil, false
+	}
+
+	rate, ok := s.rates[key.Key()]
+	if !ok {
+		return nil, false
+	}
+	return &rate, true
 }
 
 ################################################################################
@@ -29453,11 +31149,11 @@ resource "aws_s3_bucket_replication_configuration" "primary_to_west" {
                                 SUMMARY
 ================================================================================
 
-Total Files Combined: 150
-Generated: 2026-01-16 14:06:12
+Total Files Combined: 159
+Generated: 2026-01-16 19:09:36
 Project: cost estimation
 
-Files by Type:  .go : 98 files
+Files by Type:  .go : 107 files
   .tf : 46 files
   .md : 1 files
   .mod : 1 files
