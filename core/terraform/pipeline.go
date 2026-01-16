@@ -225,6 +225,7 @@ type ProviderConfig struct {
 	Type   string
 	Alias  string
 	Region string
+	Module string              // Module where defined
 	Config map[string]any
 }
 

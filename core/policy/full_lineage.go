@@ -24,6 +24,9 @@ type FullLineageContext struct {
 	ConfidenceByInstance map[model.InstanceID]float64
 	ConfidenceByComponent map[string]float64
 
+	// Low confidence items
+	LowConfidenceItems []LowConfidenceItem
+
 	// Unknown tracking
 	Unknowns []UnknownInfo
 	UnknownsByInstance map[model.InstanceID][]UnknownInfo

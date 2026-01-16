@@ -3,7 +3,7 @@
 #                    TERRAFORM COST ESTIMATION SYSTEM                          #
 #                         Combined Source Code                                 #
 #                                                                              #
-#                    Generated: 2026-01-16 00:49:23                          #
+#                    Generated: 2026-01-16 12:19:35                          #
 #                                                                              #
 ################################################################################
 
@@ -17,6 +17,7 @@ cost estimation/
 |   |-- git/
 |   |-- terraform/
 |   |   |-- hcl/
+|   |   |   |-- cty_safe.go
 |   |   |   +-- scanner.go
 |   |   +-- plan/
 |   +-- terragrunt/
@@ -50,12 +51,17 @@ cost estimation/
 |   |-- asset/
 |   |   |-- builder.go
 |   |   +-- registry.go
+|   |-- confidence/
+|   |   +-- tracker.go
 |   |-- cost/
+|   |   |-- confidence.go
 |   |   +-- engine.go
 |   |-- detection/
 |   |   +-- detector.go
 |   |-- determinism/
 |   |   +-- stable.go
+|   |-- diff/
+|   |   +-- differ.go
 |   |-- engine/
 |   |   +-- engine.go
 |   |-- expansion/
@@ -66,26 +72,33 @@ cost estimation/
 |   |   |-- reference.go
 |   |   +-- value.go
 |   |-- model/
-|   |   +-- definition.go
+|   |   |-- definition.go
+|   |   |-- enforced_identity.go
+|   |   +-- identity.go
 |   |-- output/
 |   |   |-- formats/
 |   |   +-- formatter.go
 |   |-- policy/
 |   |   |-- deep_policy.go
 |   |   |-- evaluator.go
+|   |   |-- explanation.go
 |   |   +-- full_lineage.go
 |   |-- pricing/
 |   |   |-- enforcer.go
+|   |   |-- immutable_store.go
 |   |   |-- resolver.go
 |   |   +-- snapshot.go
 |   |-- scanner/
 |   |   |-- registry.go
 |   |   +-- scanner.go
 |   |-- terraform/
+|   |   |-- data_barrier.go
 |   |   |-- dependencies.go
 |   |   |-- dynamic.go
 |   |   |-- pipeline.go
 |   |   |-- provider.go
+|   |   |-- provider_binding.go
+|   |   |-- provider_context.go
 |   |   |-- strict_unknown.go
 |   |   +-- unknown.go
 |   |-- types/
@@ -96,8 +109,10 @@ cost estimation/
 |   |   |-- types.go
 |   |   +-- usage.go
 |   +-- usage/
+|       |-- assumptions.go
 |       |-- estimator.go
-|       +-- registry.go
+|       |-- registry.go
+|       +-- strict_defaults.go
 |-- examples/
 |   +-- aws-simple/
 |       +-- main.tf
@@ -119,31 +134,57 @@ cost estimation/
 |   |   +-- snapshots/
 |   +-- terraform/
 |       |-- bad_configs/
+|       |   |-- circular_dependency.tf
+|       |   |-- duplicate_resource.tf
+|       |   |-- invalid_for_each.tf
 |       |   |-- missing_required.tf
-|       |   +-- syntax_error.tf
+|       |   |-- syntax_error.tf
+|       |   +-- type_mismatch.tf
 |       |-- basic/
+|       |   |-- high_cost.tf
+|       |   |-- mixed_resources.tf
 |       |   |-- multiple_resources.tf
 |       |   +-- single_resource.tf
 |       |-- dynamic_blocks/
+|       |   |-- conditional_dynamic.tf
+|       |   |-- multiple_dynamic.tf
 |       |   |-- nested_dynamic.tf
 |       |   +-- single_dynamic.tf
 |       |-- edge_cases/
 |       |   |-- circular_reference.tf
+|       |   |-- complex_locals.tf
 |       |   |-- conditional_resource.tf
+|       |   |-- data_source_dependency.tf
+|       |   |-- lifecycle.tf
+|       |   |-- moved_import.tf
+|       |   |-- null_optional.tf
 |       |   |-- self_reference.tf
-|       |   +-- unknown_count.tf
+|       |   |-- sensitive_values.tf
+|       |   |-- splat_expression.tf
+|       |   |-- terraform_functions.tf
+|       |   |-- unknown_count.tf
+|       |   +-- workspaces.tf
 |       |-- expansion/
+|       |   |-- complex_for_each.tf
+|       |   |-- count_from_length.tf
 |       |   |-- count_variable.tf
 |       |   |-- count_zero.tf
+|       |   |-- for_each_fileset.tf
 |       |   |-- for_each_map.tf
 |       |   |-- for_each_set.tf
-|       |   +-- nested_count_for_each.tf
+|       |   |-- for_each_toset.tf
+|       |   |-- nested_count_for_each.tf
+|       |   +-- triple_nested.tf
 |       |-- modules/
 |       |   |-- local_module.tf
+|       |   |-- module_count.tf
+|       |   |-- module_with_outputs.tf
 |       |   +-- nested_modules.tf
 |       +-- providers/
 |           |-- alias_basic.tf
-|           +-- alias_module_inherit.tf
+|           |-- alias_module_inherit.tf
+|           |-- multi_region_modules.tf
+|           +-- multiple_same_type.tf
 |-- .gitignore
 |-- combine-code.ps1
 |-- docker-compose.yml
@@ -1394,11 +1435,289 @@ func truncate(s string, maxLen int) string {
 // type CIAdapter struct { ... }
 
 ################################################################################
+# FILE: :\good projects\cost estimation\adapters\terraform\hcl\cty_safe.go
+# TYPE: go
+# SIZE: 5911 bytes
+################################################################################
+// Package hcl - Safe CTY value conversion
+// CTY values are NEVER blindly passed through.
+// Unknown values MUST be explicitly handled.
+package hcl
+
+import (
+	"fmt"
+
+	"github.com/zclconf/go-cty/cty"
+)
+
+// SafeValue represents a safely-converted CTY value
+type SafeValue struct {
+	// The Go value (if known)
+	Value interface{}
+
+	// Is this value known?
+	IsKnown bool
+
+	// Is this value null?
+	IsNull bool
+
+	// Type information
+	Type SafeValueType
+
+	// Original CTY type name
+	CtyType string
+
+	// Why is this unknown?
+	UnknownReason string
+
+	// Confidence impact for using this value
+	ConfidenceImpact float64
+}
+
+// SafeValueType indicates the type of value
+type SafeValueType int
+
+const (
+	SafeTypeUnknown SafeValueType = iota
+	SafeTypeNull
+	SafeTypeString
+	SafeTypeNumber
+	SafeTypeBool
+	SafeTypeList
+	SafeTypeMap
+	SafeTypeTuple
+	SafeTypeObject
+)
+
+// String returns the type name
+func (t SafeValueType) String() string {
+	switch t {
+	case SafeTypeString:
+		return "string"
+	case SafeTypeNumber:
+		return "number"
+	case SafeTypeBool:
+		return "bool"
+	case SafeTypeList:
+		return "list"
+	case SafeTypeMap:
+		return "map"
+	case SafeTypeTuple:
+		return "tuple"
+	case SafeTypeObject:
+		return "object"
+	case SafeTypeNull:
+		return "null"
+	default:
+		return "unknown"
+	}
+}
+
+// CtyToSafe safely converts a cty.Value to a SafeValue
+// This NEVER loses type information or unknown status
+func CtyToSafe(val cty.Value) SafeValue {
+	result := SafeValue{
+		CtyType: val.Type().FriendlyName(),
+	}
+
+	// Check for unknown FIRST - this is critical
+	if !val.IsKnown() {
+		result.IsKnown = false
+		result.Type = SafeTypeUnknown
+		result.UnknownReason = "value not yet known (computed at apply time)"
+		result.ConfidenceImpact = 0.3 // Significant impact
+		return result
+	}
+
+	// Check for null
+	if val.IsNull() {
+		result.IsNull = true
+		result.IsKnown = true
+		result.Type = SafeTypeNull
+		result.Value = nil
+		return result
+	}
+
+	result.IsKnown = true
+
+	// Convert based on type
+	switch {
+	case val.Type() == cty.String:
+		result.Type = SafeTypeString
+		result.Value = val.AsString()
+
+	case val.Type() == cty.Number:
+		result.Type = SafeTypeNumber
+		f, _ := val.AsBigFloat().Float64()
+		result.Value = f
+
+	case val.Type() == cty.Bool:
+		result.Type = SafeTypeBool
+		result.Value = val.True()
+
+	case val.Type().IsListType() || val.Type().IsSetType():
+		result.Type = SafeTypeList
+		result.Value = convertList(val)
+
+	case val.Type().IsTupleType():
+		result.Type = SafeTypeTuple
+		result.Value = convertTuple(val)
+
+	case val.Type().IsMapType():
+		result.Type = SafeTypeMap
+		result.Value = convertMap(val)
+
+	case val.Type().IsObjectType():
+		result.Type = SafeTypeObject
+		result.Value = convertObject(val)
+
+	default:
+		// Unknown type - mark as unknown
+		result.IsKnown = false
+		result.Type = SafeTypeUnknown
+		result.UnknownReason = fmt.Sprintf("unhandled CTY type: %s", val.Type().FriendlyName())
+		result.ConfidenceImpact = 0.2
+	}
+
+	return result
+}
+
+func convertList(val cty.Value) []interface{} {
+	if !val.CanIterateElements() {
+		return nil
+	}
+
+	result := make([]interface{}, 0, val.LengthInt())
+	iter := val.ElementIterator()
+	for iter.Next() {
+		_, v := iter.Element()
+		safe := CtyToSafe(v)
+		if safe.IsKnown && !safe.IsNull {
+			result = append(result, safe.Value)
+		} else {
+			// Include placeholder for unknown elements
+			result = append(result, nil)
+		}
+	}
+	return result
+}
+
+func convertTuple(val cty.Value) []interface{} {
+	return convertList(val) // Same logic
+}
+
+func convertMap(val cty.Value) map[string]interface{} {
+	if !val.CanIterateElements() {
+		return nil
+	}
+
+	result := make(map[string]interface{})
+	iter := val.ElementIterator()
+	for iter.Next() {
+		k, v := iter.Element()
+		safe := CtyToSafe(v)
+		if safe.IsKnown && !safe.IsNull {
+			result[k.AsString()] = safe.Value
+		} else {
+			result[k.AsString()] = nil
+		}
+	}
+	return result
+}
+
+func convertObject(val cty.Value) map[string]interface{} {
+	return convertMap(val) // Same logic for objects
+}
+
+// AsString returns the value as a string, or empty if not a string
+func (v SafeValue) AsString() string {
+	if !v.IsKnown || v.IsNull || v.Type != SafeTypeString {
+		return ""
+	}
+	if s, ok := v.Value.(string); ok {
+		return s
+	}
+	return ""
+}
+
+// AsFloat returns the value as a float64, or 0 if not a number
+func (v SafeValue) AsFloat() float64 {
+	if !v.IsKnown || v.IsNull || v.Type != SafeTypeNumber {
+		return 0
+	}
+	if f, ok := v.Value.(float64); ok {
+		return f
+	}
+	return 0
+}
+
+// AsInt returns the value as an int
+func (v SafeValue) AsInt() int {
+	return int(v.AsFloat())
+}
+
+// AsBool returns the value as a bool
+func (v SafeValue) AsBool() bool {
+	if !v.IsKnown || v.IsNull || v.Type != SafeTypeBool {
+		return false
+	}
+	if b, ok := v.Value.(bool); ok {
+		return b
+	}
+	return false
+}
+
+// AsList returns the value as a slice
+func (v SafeValue) AsList() []interface{} {
+	if !v.IsKnown || v.IsNull {
+		return nil
+	}
+	if l, ok := v.Value.([]interface{}); ok {
+		return l
+	}
+	return nil
+}
+
+// AsMap returns the value as a map
+func (v SafeValue) AsMap() map[string]interface{} {
+	if !v.IsKnown || v.IsNull {
+		return nil
+	}
+	if m, ok := v.Value.(map[string]interface{}); ok {
+		return m
+	}
+	return nil
+}
+
+// MustBeKnown returns an error if the value is unknown
+func (v SafeValue) MustBeKnown(context string) error {
+	if !v.IsKnown {
+		return &UnknownValueError{
+			Context: context,
+			Reason:  v.UnknownReason,
+		}
+	}
+	return nil
+}
+
+// UnknownValueError indicates a value that should be known is unknown
+type UnknownValueError struct {
+	Context string
+	Reason  string
+}
+
+func (e *UnknownValueError) Error() string {
+	return fmt.Sprintf("unknown value in %s: %s", e.Context, e.Reason)
+}
+
+################################################################################
 # FILE: :\good projects\cost estimation\adapters\terraform\hcl\scanner.go
 # TYPE: go
-# SIZE: 7554 bytes
+# SIZE: 12019 bytes
 ################################################################################
-// Package hcl provides Terraform HCL parsing.
+// Package hcl provides Terraform HCL parsing with DEFERRED evaluation.
+// Expressions are NOT evaluated immediately - they are captured as unevaluated
+// and resolved only after variables, locals, and references are available.
 package hcl
 
 import (
@@ -1410,12 +1729,15 @@ import (
 
 	"github.com/hashicorp/hcl/v2"
 	"github.com/hashicorp/hcl/v2/hclparse"
+	"github.com/hashicorp/hcl/v2/hclsyntax"
 
 	"terraform-cost/core/scanner"
 	"terraform-cost/core/types"
 )
 
 // Scanner implements the scanner.Scanner interface for Terraform HCL
+// CRITICAL: This scanner does NOT evaluate expressions.
+// It captures expressions as unevaluated for later resolution.
 type Scanner struct {
 	parser *hclparse.Parser
 }
@@ -1454,7 +1776,7 @@ func (s *Scanner) CanScan(ctx context.Context, input *types.ProjectInput) (bool,
 	return hasTfFiles, nil
 }
 
-// Scan parses HCL files and returns raw assets
+// Scan parses HCL files and returns raw assets with UNEVALUATED expressions
 func (s *Scanner) Scan(ctx context.Context, input *types.ProjectInput) (*scanner.ScanResult, error) {
 	result := &scanner.ScanResult{
 		Assets:    make([]types.RawAsset, 0),
@@ -1480,7 +1802,7 @@ func (s *Scanner) Scan(ctx context.Context, input *types.ProjectInput) (*scanner
 		return nil, fmt.Errorf("failed to walk directory: %w", err)
 	}
 
-	// Parse each file
+	// Parse each file - DO NOT EVALUATE
 	for _, file := range tfFiles {
 		assets, modules, warnings, errs := s.parseFile(ctx, file, input.Path)
 		result.Assets = append(result.Assets, assets...)
@@ -1547,17 +1869,17 @@ func (s *Scanner) parseFile(ctx context.Context, file, basePath string) ([]types
 	for _, block := range content.Blocks {
 		switch block.Type {
 		case "resource":
-			asset := s.parseResource(block, relPath, false)
+			asset := s.parseResourceDeferred(block, relPath, false)
 			if asset != nil {
 				assets = append(assets, *asset)
 			}
 		case "data":
-			asset := s.parseResource(block, relPath, true)
+			asset := s.parseResourceDeferred(block, relPath, true)
 			if asset != nil {
 				assets = append(assets, *asset)
 			}
 		case "module":
-			mod := s.parseModule(block)
+			mod := s.parseModuleDeferred(block)
 			if mod != nil {
 				modules = append(modules, *mod)
 			}
@@ -1567,7 +1889,8 @@ func (s *Scanner) parseFile(ctx context.Context, file, basePath string) ([]types
 	return assets, modules, warnings, errors
 }
 
-func (s *Scanner) parseResource(block *hcl.Block, file string, isDataSource bool) *types.RawAsset {
+// parseResourceDeferred captures expressions WITHOUT evaluating them
+func (s *Scanner) parseResourceDeferred(block *hcl.Block, file string, isDataSource bool) *types.RawAsset {
 	if len(block.Labels) < 2 {
 		return nil
 	}
@@ -1585,8 +1908,8 @@ func (s *Scanner) parseResource(block *hcl.Block, file string, isDataSource bool
 		provider = types.ProviderGCP
 	}
 
-	// Extract attributes from block body
-	attrs := s.extractAttributes(block.Body)
+	// Extract attributes as UNEVALUATED expressions
+	attrs := s.extractAttributesDeferred(block.Body)
 
 	address := types.ResourceAddress(fmt.Sprintf("%s.%s", resourceType, resourceName))
 	if isDataSource {
@@ -1610,25 +1933,29 @@ func (s *Scanner) parseResource(block *hcl.Block, file string, isDataSource bool
 	}
 }
 
-func (s *Scanner) parseModule(block *hcl.Block) *scanner.ModuleReference {
+func (s *Scanner) parseModuleDeferred(block *hcl.Block) *scanner.ModuleReference {
 	if len(block.Labels) < 1 {
 		return nil
 	}
 
 	name := block.Labels[0]
-	attrs := s.extractAttributes(block.Body)
+	attrs := s.extractAttributesDeferred(block.Body)
 
 	source := ""
 	if src := attrs.Get("source"); src != nil {
-		if srcStr, ok := src.(string); ok {
-			source = srcStr
+		if attr, ok := src.(types.Attribute); ok && !attr.IsComputed && !attr.IsUnknown {
+			if srcStr, ok := attr.Value.(string); ok {
+				source = srcStr
+			}
 		}
 	}
 
 	version := ""
 	if ver := attrs.Get("version"); ver != nil {
-		if verStr, ok := ver.(string); ok {
-			version = verStr
+		if attr, ok := ver.(types.Attribute); ok && !attr.IsComputed && !attr.IsUnknown {
+			if verStr, ok := attr.Value.(string); ok {
+				version = verStr
+			}
 		}
 	}
 
@@ -1639,29 +1966,151 @@ func (s *Scanner) parseModule(block *hcl.Block) *scanner.ModuleReference {
 	}
 }
 
-func (s *Scanner) extractAttributes(body hcl.Body) types.Attributes {
+// extractAttributesDeferred captures expressions WITHOUT evaluating them
+// This is the CRITICAL fix - we do NOT call attr.Expr.Value(nil)
+func (s *Scanner) extractAttributesDeferred(body hcl.Body) types.Attributes {
 	attrs := make(types.Attributes)
 
 	// Get all attributes from the body
 	content, _, _ := body.PartialContent(&hcl.BodySchema{})
-	
+
 	for name, attr := range content.Attributes {
-		val, diags := attr.Expr.Value(nil)
-		if diags.HasErrors() {
-			// Mark as computed if we can't evaluate
-			attrs[name] = types.Attribute{
-				Value:      nil,
-				IsComputed: true,
+		// Analyze the expression to determine if it needs context
+		exprInfo := s.analyzeExpression(attr.Expr)
+
+		if exprInfo.IsLiteral {
+			// Safe to evaluate literals immediately
+			val, diags := attr.Expr.Value(nil)
+			if !diags.HasErrors() {
+				attrs[name] = types.Attribute{
+					Value:      s.ctyToGo(val),
+					IsComputed: false,
+					IsUnknown:  false,
+				}
+				continue
 			}
-			continue
 		}
 
+		// Expression requires context - mark as unevaluated
 		attrs[name] = types.Attribute{
-			Value: s.ctyToGo(val),
+			Value:             nil,
+			IsComputed:        exprInfo.RequiresContext,
+			IsUnknown:         exprInfo.HasUnknownRefs,
+			Expression:        s.expressionToString(attr.Expr),
+			ExpressionType:    exprInfo.Type,
+			References:        exprInfo.References,
+			ConfidenceImpact:  exprInfo.ConfidenceImpact,
 		}
 	}
 
 	return attrs
+}
+
+// ExpressionInfo describes an unevaluated expression
+type ExpressionInfo struct {
+	IsLiteral        bool
+	RequiresContext  bool
+	HasUnknownRefs   bool
+	Type             string   // "literal", "variable", "local", "reference", "function", "conditional"
+	References       []string // Referenced addresses
+	ConfidenceImpact float64  // How much this reduces confidence (0.0 - 1.0)
+}
+
+// analyzeExpression determines what kind of expression this is
+func (s *Scanner) analyzeExpression(expr hcl.Expression) ExpressionInfo {
+	info := ExpressionInfo{
+		IsLiteral:        true,
+		RequiresContext:  false,
+		HasUnknownRefs:   false,
+		Type:             "literal",
+		References:       []string{},
+		ConfidenceImpact: 0.0,
+	}
+
+	// Get all variable references
+	refs := expr.Variables()
+	if len(refs) > 0 {
+		info.IsLiteral = false
+		info.RequiresContext = true
+		info.ConfidenceImpact = 0.1 // Base impact for having references
+
+		for _, ref := range refs {
+			refStr := formatTraversal(ref)
+			info.References = append(info.References, refStr)
+
+			// Classify reference type
+			if len(ref) > 0 {
+				root := ref.RootName()
+				switch root {
+				case "var":
+					info.Type = "variable"
+					info.ConfidenceImpact += 0.1 // Variable adds uncertainty
+				case "local":
+					info.Type = "local"
+					// Locals are resolvable
+				case "count":
+					info.Type = "count_reference"
+					info.ConfidenceImpact += 0.2 // Count adds more uncertainty
+				case "each":
+					info.Type = "for_each_reference"
+					info.ConfidenceImpact += 0.2
+				case "data":
+					info.Type = "data_source"
+					info.HasUnknownRefs = true // Data sources are runtime
+					info.ConfidenceImpact += 0.3
+				default:
+					// Resource reference
+					info.Type = "resource_reference"
+					info.HasUnknownRefs = true
+					info.ConfidenceImpact += 0.3
+				}
+			}
+		}
+	}
+
+	// Check for function calls
+	if synExpr, ok := expr.(*hclsyntax.FunctionCallExpr); ok {
+		info.IsLiteral = false
+		info.RequiresContext = true
+		info.Type = "function:" + synExpr.Name
+		info.ConfidenceImpact += 0.1
+	}
+
+	// Check for conditional
+	if _, ok := expr.(*hclsyntax.ConditionalExpr); ok {
+		info.IsLiteral = false
+		info.RequiresContext = true
+		info.Type = "conditional"
+		info.ConfidenceImpact += 0.15
+	}
+
+	// Cap confidence impact
+	if info.ConfidenceImpact > 0.5 {
+		info.ConfidenceImpact = 0.5
+	}
+
+	return info
+}
+
+func formatTraversal(traversal hcl.Traversal) string {
+	parts := make([]string, 0, len(traversal))
+	for _, t := range traversal {
+		switch tt := t.(type) {
+		case hcl.TraverseRoot:
+			parts = append(parts, tt.Name)
+		case hcl.TraverseAttr:
+			parts = append(parts, "."+tt.Name)
+		case hcl.TraverseIndex:
+			parts = append(parts, "[...]")
+		}
+	}
+	return strings.Join(parts, "")
+}
+
+func (s *Scanner) expressionToString(expr hcl.Expression) string {
+	// Get the source range and extract the text
+	rng := expr.Range()
+	return fmt.Sprintf("<%s:%d-%d>", rng.Filename, rng.Start.Line, rng.End.Line)
 }
 
 func (s *Scanner) ctyToGo(val interface{}) interface{} {
@@ -4479,6 +4928,775 @@ func GetDefaultBuilderRegistry() *DefaultBuilderRegistry {
 }
 
 ################################################################################
+# FILE: :\good projects\cost estimation\core\confidence\tracker.go
+# TYPE: go
+# SIZE: 11833 bytes
+################################################################################
+// Package confidence provides aggressive confidence propagation rules.
+// Every unknown COMPOUNDS confidence loss. No hiding uncertainty.
+package confidence
+
+import (
+	"fmt"
+	"math"
+	"strings"
+
+	"terraform-cost/core/determinism"
+)
+
+// DecayRule defines how confidence decays
+type DecayRule struct {
+	Name        string
+	BaseFactor  float64 // Base multiplier (e.g., 0.8 = 20% reduction)
+	Compounds   bool    // Does this compound with other decays?
+	MinConfidence float64 // Floor (never go below this)
+}
+
+// StandardDecayRules are the default decay rules
+var StandardDecayRules = map[string]*DecayRule{
+	"unknown_value": {
+		Name:        "unknown_value",
+		BaseFactor:  0.7, // Each unknown reduces by 30%
+		Compounds:   true,
+		MinConfidence: 0.1,
+	},
+	"unknown_count": {
+		Name:        "unknown_count",
+		BaseFactor:  0.5, // Unknown count is severe - 50% reduction
+		Compounds:   true,
+		MinConfidence: 0.1,
+	},
+	"unknown_for_each": {
+		Name:        "unknown_for_each",
+		BaseFactor:  0.5, // Unknown for_each is severe
+		Compounds:   true,
+		MinConfidence: 0.1,
+	},
+	"unknown_usage": {
+		Name:        "unknown_usage",
+		BaseFactor:  0.6, // Unknown usage is 40% reduction
+		Compounds:   true,
+		MinConfidence: 0.2,
+	},
+	"missing_rate": {
+		Name:        "missing_rate",
+		BaseFactor:  0.3, // Missing rate is very severe
+		Compounds:   true,
+		MinConfidence: 0.05,
+	},
+	"default_usage": {
+		Name:        "default_usage",
+		BaseFactor:  0.8, // Using defaults is 20% reduction
+		Compounds:   true,
+		MinConfidence: 0.3,
+	},
+	"stale_snapshot": {
+		Name:        "stale_snapshot",
+		BaseFactor:  0.9, // Stale snapshot is 10% reduction
+		Compounds:   false,
+		MinConfidence: 0.5,
+	},
+}
+
+// ConfidenceTracker tracks confidence with full reasoning
+type ConfidenceTracker struct {
+	initialConfidence float64
+	currentConfidence float64
+	factors          []ConfidenceDecay
+	compoundCount    int
+}
+
+// ConfidenceDecay records a single confidence reduction
+type ConfidenceDecay struct {
+	Rule        string
+	Reason      string
+	Factor      float64
+	AppliedAt   float64 // Confidence before this decay
+	ResultedIn  float64 // Confidence after this decay
+	WasCompounded bool
+}
+
+// NewConfidenceTracker creates a tracker starting at full confidence
+func NewConfidenceTracker() *ConfidenceTracker {
+	return &ConfidenceTracker{
+		initialConfidence: 1.0,
+		currentConfidence: 1.0,
+		factors:           []ConfidenceDecay{},
+	}
+}
+
+// Apply applies a decay rule
+func (t *ConfidenceTracker) Apply(ruleName, reason string) {
+	rule, ok := StandardDecayRules[ruleName]
+	if !ok {
+		// Unknown rule - use moderate decay
+		rule = &DecayRule{
+			Name:       ruleName,
+			BaseFactor: 0.8,
+			Compounds:  true,
+			MinConfidence: 0.1,
+		}
+	}
+
+	before := t.currentConfidence
+
+	// Calculate decay factor
+	factor := rule.BaseFactor
+
+	// Compound decay: each subsequent unknown has increasing impact
+	if rule.Compounds && t.compoundCount > 0 {
+		// Each compound increases decay: 0.7 â†’ 0.6 â†’ 0.5 â†’ ...
+		compoundPenalty := math.Pow(0.9, float64(t.compoundCount))
+		factor *= compoundPenalty
+	}
+
+	// Apply decay
+	t.currentConfidence *= factor
+
+	// Enforce floor
+	if t.currentConfidence < rule.MinConfidence {
+		t.currentConfidence = rule.MinConfidence
+	}
+
+	// Record
+	t.factors = append(t.factors, ConfidenceDecay{
+		Rule:        ruleName,
+		Reason:      reason,
+		Factor:      factor,
+		AppliedAt:   before,
+		ResultedIn:  t.currentConfidence,
+		WasCompounded: rule.Compounds && t.compoundCount > 0,
+	})
+
+	if rule.Compounds {
+		t.compoundCount++
+	}
+}
+
+// ApplyMultiple applies multiple decays for compound unknown scenarios
+func (t *ConfidenceTracker) ApplyMultiple(rules []string, reason string) {
+	for _, rule := range rules {
+		t.Apply(rule, reason)
+	}
+}
+
+// Current returns the current confidence
+func (t *ConfidenceTracker) Current() float64 {
+	return t.currentConfidence
+}
+
+// Factors returns all decay factors
+func (t *ConfidenceTracker) Factors() []ConfidenceDecay {
+	return t.factors
+}
+
+// TotalDecay returns how much confidence was lost
+func (t *ConfidenceTracker) TotalDecay() float64 {
+	return t.initialConfidence - t.currentConfidence
+}
+
+// Level returns human-readable confidence level
+func (t *ConfidenceTracker) Level() string {
+	switch {
+	case t.currentConfidence >= 0.9:
+		return "high"
+	case t.currentConfidence >= 0.7:
+		return "medium"
+	case t.currentConfidence >= 0.5:
+		return "low"
+	case t.currentConfidence >= 0.3:
+		return "very_low"
+	default:
+		return "unreliable"
+	}
+}
+
+// Explain returns human-readable explanation
+func (t *ConfidenceTracker) Explain() string {
+	if len(t.factors) == 0 {
+		return "Full confidence - no uncertainties"
+	}
+
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("Confidence: %.0f%% (%s)\n", t.currentConfidence*100, t.Level()))
+	sb.WriteString("Decay factors:\n")
+
+	for i, f := range t.factors {
+		compound := ""
+		if f.WasCompounded {
+			compound = " [compounded]"
+		}
+		sb.WriteString(fmt.Sprintf("  %d. %s: %.0f%% â†’ %.0f%% (%s)%s\n",
+			i+1, f.Rule, f.AppliedAt*100, f.ResultedIn*100, f.Reason, compound))
+	}
+
+	return sb.String()
+}
+
+// ConfidenceBoundValue is a value with confidence metadata
+type ConfidenceBoundValue struct {
+	Value      interface{}
+	Confidence float64
+	Tracker    *ConfidenceTracker
+	IsUnknown  bool
+}
+
+// NewKnownValue creates a known value with full confidence
+func NewKnownValue(v interface{}) *ConfidenceBoundValue {
+	return &ConfidenceBoundValue{
+		Value:      v,
+		Confidence: 1.0,
+		Tracker:    NewConfidenceTracker(),
+		IsUnknown:  false,
+	}
+}
+
+// NewUnknownValue creates an unknown value with degraded confidence
+func NewUnknownValue(reason string) *ConfidenceBoundValue {
+	tracker := NewConfidenceTracker()
+	tracker.Apply("unknown_value", reason)
+	return &ConfidenceBoundValue{
+		Value:      nil,
+		Confidence: tracker.Current(),
+		Tracker:    tracker,
+		IsUnknown:  true,
+	}
+}
+
+// ConfidenceAwareMath does arithmetic that propagates confidence
+type ConfidenceAwareMath struct{}
+
+// Multiply multiplies values, compounding confidence
+func (ConfidenceAwareMath) Multiply(a, b *ConfidenceBoundValue) *ConfidenceBoundValue {
+	// If either is unknown, result is unknown with compounded confidence
+	if a.IsUnknown || b.IsUnknown {
+		tracker := NewConfidenceTracker()
+
+		if a.IsUnknown {
+			tracker.Apply("unknown_value", "left operand unknown")
+		}
+		if b.IsUnknown {
+			tracker.Apply("unknown_value", "right operand unknown")
+		}
+
+		return &ConfidenceBoundValue{
+			Value:      nil,
+			Confidence: tracker.Current(),
+			Tracker:    tracker,
+			IsUnknown:  true,
+		}
+	}
+
+	// Both known - combine confidences multiplicatively
+	aVal, aOk := toFloat64(a.Value)
+	bVal, bOk := toFloat64(b.Value)
+
+	if !aOk || !bOk {
+		tracker := NewConfidenceTracker()
+		tracker.Apply("unknown_value", "non-numeric operand")
+		return &ConfidenceBoundValue{
+			Value:      nil,
+			Confidence: tracker.Current(),
+			Tracker:    tracker,
+			IsUnknown:  true,
+		}
+	}
+
+	// Result confidence is product of input confidences
+	resultConfidence := a.Confidence * b.Confidence
+
+	return &ConfidenceBoundValue{
+		Value:      aVal * bVal,
+		Confidence: resultConfidence,
+		Tracker:    combineTrackers(a.Tracker, b.Tracker),
+		IsUnknown:  false,
+	}
+}
+
+// Add adds values, using minimum confidence
+func (ConfidenceAwareMath) Add(a, b *ConfidenceBoundValue) *ConfidenceBoundValue {
+	if a.IsUnknown && b.IsUnknown {
+		tracker := NewConfidenceTracker()
+		tracker.ApplyMultiple([]string{"unknown_value", "unknown_value"}, "both operands unknown")
+		return &ConfidenceBoundValue{
+			Value:      nil,
+			Confidence: tracker.Current(),
+			Tracker:    tracker,
+			IsUnknown:  true,
+		}
+	}
+
+	if a.IsUnknown {
+		// Use b's value but with reduced confidence
+		tracker := NewConfidenceTracker()
+		tracker.Apply("unknown_value", "left operand unknown")
+		return &ConfidenceBoundValue{
+			Value:      b.Value,
+			Confidence: math.Min(b.Confidence, tracker.Current()),
+			Tracker:    tracker,
+			IsUnknown:  false,
+		}
+	}
+
+	if b.IsUnknown {
+		tracker := NewConfidenceTracker()
+		tracker.Apply("unknown_value", "right operand unknown")
+		return &ConfidenceBoundValue{
+			Value:      a.Value,
+			Confidence: math.Min(a.Confidence, tracker.Current()),
+			Tracker:    tracker,
+			IsUnknown:  false,
+		}
+	}
+
+	// Both known
+	aVal, aOk := toFloat64(a.Value)
+	bVal, bOk := toFloat64(b.Value)
+
+	if !aOk || !bOk {
+		return NewUnknownValue("non-numeric operand")
+	}
+
+	return &ConfidenceBoundValue{
+		Value:      aVal + bVal,
+		Confidence: math.Min(a.Confidence, b.Confidence),
+		Tracker:    combineTrackers(a.Tracker, b.Tracker),
+		IsUnknown:  false,
+	}
+}
+
+// ConfidenceBoundMoney is money with confidence
+type ConfidenceBoundMoney struct {
+	Amount     determinism.Money
+	Confidence float64
+	Tracker    *ConfidenceTracker
+}
+
+// NewConfidenceBoundMoney creates money with full confidence
+func NewConfidenceBoundMoney(amount determinism.Money) *ConfidenceBoundMoney {
+	return &ConfidenceBoundMoney{
+		Amount:     amount,
+		Confidence: 1.0,
+		Tracker:    NewConfidenceTracker(),
+	}
+}
+
+// Degrade reduces confidence with a reason
+func (m *ConfidenceBoundMoney) Degrade(rule, reason string) {
+	m.Tracker.Apply(rule, reason)
+	m.Confidence = m.Tracker.Current()
+}
+
+// Add adds two money values, taking minimum confidence
+func (m *ConfidenceBoundMoney) Add(other *ConfidenceBoundMoney) *ConfidenceBoundMoney {
+	return &ConfidenceBoundMoney{
+		Amount:     m.Amount.Add(other.Amount),
+		Confidence: math.Min(m.Confidence, other.Confidence),
+		Tracker:    combineTrackers(m.Tracker, other.Tracker),
+	}
+}
+
+// Multiply multiplies money by a factor, compounding confidence
+func (m *ConfidenceBoundMoney) Multiply(factor *ConfidenceBoundValue) *ConfidenceBoundMoney {
+	if factor.IsUnknown {
+		tracker := NewConfidenceTracker()
+		tracker.Apply("unknown_usage", "multiplier unknown")
+		return &ConfidenceBoundMoney{
+			Amount:     m.Amount, // Keep original as estimate
+			Confidence: m.Confidence * tracker.Current(),
+			Tracker:    combineTrackers(m.Tracker, tracker),
+		}
+	}
+
+	factorVal, ok := toFloat64(factor.Value)
+	if !ok {
+		factorVal = 1.0 // Default to 1 if can't convert
+	}
+
+	return &ConfidenceBoundMoney{
+		Amount:     m.Amount.MulFloat(factorVal),
+		Confidence: m.Confidence * factor.Confidence,
+		Tracker:    combineTrackers(m.Tracker, factor.Tracker),
+	}
+}
+
+// Explain returns the confidence explanation
+func (m *ConfidenceBoundMoney) Explain() string {
+	return fmt.Sprintf("$%s (confidence: %.0f%% - %s)\n%s",
+		m.Amount.String(), m.Confidence*100, m.Tracker.Level(), m.Tracker.Explain())
+}
+
+func toFloat64(v interface{}) (float64, bool) {
+	switch n := v.(type) {
+	case float64:
+		return n, true
+	case float32:
+		return float64(n), true
+	case int:
+		return float64(n), true
+	case int64:
+		return float64(n), true
+	default:
+		return 0, false
+	}
+}
+
+func combineTrackers(a, b *ConfidenceTracker) *ConfidenceTracker {
+	combined := NewConfidenceTracker()
+	if a != nil {
+		for _, f := range a.factors {
+			combined.factors = append(combined.factors, f)
+		}
+		combined.compoundCount += a.compoundCount
+	}
+	if b != nil {
+		for _, f := range b.factors {
+			combined.factors = append(combined.factors, f)
+		}
+		combined.compoundCount += b.compoundCount
+	}
+	
+	// Recalculate current confidence
+	combined.currentConfidence = 1.0
+	for _, f := range combined.factors {
+		combined.currentConfidence *= f.Factor
+	}
+	if combined.currentConfidence < 0.05 {
+		combined.currentConfidence = 0.05
+	}
+	
+	return combined
+}
+
+################################################################################
+# FILE: :\good projects\cost estimation\core\cost\confidence.go
+# TYPE: go
+# SIZE: 8567 bytes
+################################################################################
+// Package cost - Confidence-degrading cost calculations
+// Every cost unit MUST carry confidence and degradation reasons.
+package cost
+
+import (
+	"fmt"
+
+	"terraform-cost/core/determinism"
+	"terraform-cost/core/model"
+	"terraform-cost/core/pricing"
+)
+
+// ConfidenceBoundCost is a cost value that ALWAYS carries confidence.
+// No cost can exist without explicit confidence tracking.
+type ConfidenceBoundCost struct {
+	// The cost value
+	Monthly determinism.Money
+	Hourly  determinism.Money
+
+	// Confidence (0.0 - 1.0)
+	Confidence float64
+
+	// Why confidence is what it is
+	Factors []ConfidenceFactor
+
+	// Is this degraded from full confidence?
+	IsDegraded bool
+
+	// Snapshot reference (for traceability)
+	SnapshotID pricing.SnapshotID
+}
+
+// ConfidenceFactor explains one contribution to confidence
+type ConfidenceFactor struct {
+	Source     string  // What affected confidence
+	Reason     string  // Why
+	Impact     float64 // How much (0.0-1.0, where 1.0 removes all confidence)
+	IsUnknown  bool    // Is this due to an unknown value?
+	Component  string  // Which component?
+}
+
+// NewConfidenceBoundCost creates a new cost with full confidence
+func NewConfidenceBoundCost(monthly, hourly determinism.Money, snapshotID pricing.SnapshotID) *ConfidenceBoundCost {
+	return &ConfidenceBoundCost{
+		Monthly:    monthly,
+		Hourly:     hourly,
+		Confidence: 1.0,
+		Factors:    []ConfidenceFactor{},
+		IsDegraded: false,
+		SnapshotID: snapshotID,
+	}
+}
+
+// Zero creates a zero cost
+func ZeroCost(snapshotID pricing.SnapshotID) *ConfidenceBoundCost {
+	return &ConfidenceBoundCost{
+		Monthly:    determinism.Zero("USD"),
+		Hourly:     determinism.Zero("USD"),
+		Confidence: 1.0,
+		SnapshotID: snapshotID,
+	}
+}
+
+// DegradeForUnknown reduces confidence due to an unknown value
+func (c *ConfidenceBoundCost) DegradeForUnknown(source, reason string, impact float64, component string) {
+	c.Confidence *= (1.0 - impact)
+	c.IsDegraded = true
+	c.Factors = append(c.Factors, ConfidenceFactor{
+		Source:    source,
+		Reason:    reason,
+		Impact:    impact,
+		IsUnknown: true,
+		Component: component,
+	})
+}
+
+// DegradeForMissing reduces confidence due to missing data
+func (c *ConfidenceBoundCost) DegradeForMissing(source, reason string, impact float64, component string) {
+	c.Confidence *= (1.0 - impact)
+	c.IsDegraded = true
+	c.Factors = append(c.Factors, ConfidenceFactor{
+		Source:    source,
+		Reason:    reason,
+		Impact:    impact,
+		IsUnknown: false,
+		Component: component,
+	})
+}
+
+// Add adds two costs, combining confidence
+func (c *ConfidenceBoundCost) Add(other *ConfidenceBoundCost) *ConfidenceBoundCost {
+	return &ConfidenceBoundCost{
+		Monthly:    c.Monthly.Add(other.Monthly),
+		Hourly:     c.Hourly.Add(other.Hourly),
+		Confidence: c.Confidence * other.Confidence, // Compound confidence
+		Factors:    append(c.Factors, other.Factors...),
+		IsDegraded: c.IsDegraded || other.IsDegraded,
+		SnapshotID: c.SnapshotID,
+	}
+}
+
+// ConfidenceLevel returns a human-readable confidence level
+func (c *ConfidenceBoundCost) ConfidenceLevel() string {
+	switch {
+	case c.Confidence >= 0.9:
+		return "high"
+	case c.Confidence >= 0.7:
+		return "medium"
+	case c.Confidence >= 0.5:
+		return "low"
+	default:
+		return "very_low"
+	}
+}
+
+// UnknownDrivenDegradation tracks degradation from unknown values
+type UnknownDrivenDegradation struct {
+	// Instance affected
+	InstanceID model.InstanceID
+	Address    model.CanonicalAddress
+
+	// What was unknown
+	UnknownAttribute string
+	UnknownReason    string
+
+	// Impact on cost
+	ConfidenceImpact float64
+	CostImpact       *CostImpactEstimate
+}
+
+// CostImpactEstimate estimates how much an unknown affects cost
+type CostImpactEstimate struct {
+	// Range of possible costs
+	MinCost determinism.Money
+	MaxCost determinism.Money
+
+	// Most likely cost
+	LikelyCost determinism.Money
+
+	// How we estimated
+	Method string
+}
+
+// CostWithProvenance is a cost with full provenance chain
+type CostWithProvenance struct {
+	// The cost
+	Cost *ConfidenceBoundCost
+
+	// Instance identity
+	Identity *model.InstanceIdentity
+
+	// Component name
+	Component string
+
+	// Rate used
+	Rate *RateProvenance
+
+	// Usage applied
+	Usage *UsageProvenance
+
+	// Formula
+	Formula *FormulaProvenance
+}
+
+// RateProvenance tracks which rate was used
+type RateProvenance struct {
+	RateID       pricing.RateID
+	RateKey      pricing.RateKey
+	Price        string
+	Unit         string
+	Currency     string
+	WasFound     bool
+	MissingReason string
+}
+
+// UsageProvenance tracks where usage came from
+type UsageProvenance struct {
+	Value       float64
+	Unit        string
+	Source      UsageSource
+	Confidence  float64
+	WasUnknown  bool
+	Assumptions []string
+}
+
+// UsageSource indicates usage data origin
+type UsageSource int
+
+const (
+	UsageSourceDefault UsageSource = iota
+	UsageSourceOverride
+	UsageSourceProfile
+	UsageSourceHistorical
+	UsageSourceUnknown
+)
+
+// FormulaProvenance tracks how cost was calculated
+type FormulaProvenance struct {
+	Name       string
+	Expression string
+	Inputs     map[string]FormulaInput
+	Output     string
+}
+
+// FormulaInput is a formula input with source
+type FormulaInput struct {
+	Value      string
+	Source     string // "rate", "usage", "constant"
+	Confidence float64
+}
+
+// InstanceCostResult is the complete result for one instance
+type InstanceCostResult struct {
+	// Identity
+	Identity *model.InstanceIdentity
+
+	// Total cost with confidence
+	Total *ConfidenceBoundCost
+
+	// Per-component costs
+	Components []*CostWithProvenance
+
+	// All degradation factors
+	Degradations []*UnknownDrivenDegradation
+
+	// Summary
+	IsFullConfidence bool
+	DegradedCount    int
+	UnknownCount     int
+}
+
+// NewInstanceCostResult creates a new result
+func NewInstanceCostResult(identity *model.InstanceIdentity, snapshotID pricing.SnapshotID) *InstanceCostResult {
+	return &InstanceCostResult{
+		Identity:         identity,
+		Total:            ZeroCost(snapshotID),
+		Components:       []*CostWithProvenance{},
+		Degradations:     []*UnknownDrivenDegradation{},
+		IsFullConfidence: true,
+	}
+}
+
+// AddComponent adds a component cost
+func (r *InstanceCostResult) AddComponent(comp *CostWithProvenance) {
+	r.Components = append(r.Components, comp)
+	r.Total = r.Total.Add(comp.Cost)
+
+	if comp.Cost.IsDegraded {
+		r.IsFullConfidence = false
+		r.DegradedCount++
+	}
+
+	if comp.Usage != nil && comp.Usage.WasUnknown {
+		r.UnknownCount++
+		r.Degradations = append(r.Degradations, &UnknownDrivenDegradation{
+			InstanceID:       r.Identity.ID,
+			Address:          r.Identity.Canonical,
+			UnknownAttribute: fmt.Sprintf("%s.usage", comp.Component),
+			UnknownReason:    "usage value was unknown",
+			ConfidenceImpact: 1.0 - comp.Cost.Confidence,
+		})
+	}
+}
+
+// AggregatedCostResult is the complete estimation result
+type AggregatedCostResult struct {
+	// Instance results
+	Instances []*InstanceCostResult
+
+	// Totals with confidence
+	TotalMonthly    determinism.Money
+	TotalHourly     determinism.Money
+	TotalConfidence float64
+
+	// Aggregated degradation info
+	TotalDegraded  int
+	TotalUnknowns  int
+	DegradedCost   determinism.Money // Amount of cost that's degraded
+
+	// Snapshot
+	SnapshotID pricing.SnapshotID
+}
+
+// NewAggregatedCostResult creates a new aggregated result
+func NewAggregatedCostResult(snapshotID pricing.SnapshotID) *AggregatedCostResult {
+	return &AggregatedCostResult{
+		Instances:       []*InstanceCostResult{},
+		TotalMonthly:    determinism.Zero("USD"),
+		TotalHourly:     determinism.Zero("USD"),
+		TotalConfidence: 1.0,
+		DegradedCost:    determinism.Zero("USD"),
+		SnapshotID:      snapshotID,
+	}
+}
+
+// Add adds an instance result
+func (r *AggregatedCostResult) Add(inst *InstanceCostResult) {
+	r.Instances = append(r.Instances, inst)
+	r.TotalMonthly = r.TotalMonthly.Add(inst.Total.Monthly)
+	r.TotalHourly = r.TotalHourly.Add(inst.Total.Hourly)
+	r.TotalConfidence *= inst.Total.Confidence
+
+	if !inst.IsFullConfidence {
+		r.TotalDegraded++
+		r.DegradedCost = r.DegradedCost.Add(inst.Total.Monthly)
+	}
+	r.TotalUnknowns += inst.UnknownCount
+}
+
+// ConfidenceLevel returns overall confidence level
+func (r *AggregatedCostResult) ConfidenceLevel() string {
+	switch {
+	case r.TotalConfidence >= 0.9:
+		return "high"
+	case r.TotalConfidence >= 0.7:
+		return "medium"
+	case r.TotalConfidence >= 0.5:
+		return "low"
+	default:
+		return "very_low"
+	}
+}
+
+################################################################################
 # FILE: :\good projects\cost estimation\core\cost\engine.go
 # TYPE: go
 # SIZE: 2177 bytes
@@ -4906,6 +6124,421 @@ func RangeMapSorted[K comparable, V any](m map[K]V, fn func(K, V) bool) {
 			break
 		}
 	}
+}
+
+################################################################################
+# FILE: :\good projects\cost estimation\core\diff\differ.go
+# TYPE: go
+# SIZE: 11083 bytes
+################################################################################
+// Package diff provides instance-level cost diffing.
+// Compares two cost estimation results at the instance level.
+package diff
+
+import (
+	"sort"
+
+	"terraform-cost/core/cost"
+	"terraform-cost/core/determinism"
+	"terraform-cost/core/model"
+)
+
+// DiffResult is the complete diff between two estimation results
+type DiffResult struct {
+	// Overall summary
+	TotalBefore    determinism.Money
+	TotalAfter     determinism.Money
+	TotalDelta     determinism.Money
+	DeltaPercent   float64
+
+	// Instance-level changes
+	Added      []*InstanceDiff
+	Removed    []*InstanceDiff
+	Changed    []*InstanceDiff
+	Unchanged  []*InstanceDiff
+
+	// Counts
+	AddedCount    int
+	RemovedCount  int
+	ChangedCount  int
+	UnchangedCount int
+
+	// Confidence impact
+	ConfidenceBefore float64
+	ConfidenceAfter  float64
+}
+
+// InstanceDiff describes changes to a single instance
+type InstanceDiff struct {
+	// Identity
+	Identity *model.InstanceIdentity
+	Address  model.CanonicalAddress
+
+	// Change type
+	ChangeType ChangeType
+
+	// Costs
+	Before *cost.ConfidenceBoundCost
+	After  *cost.ConfidenceBoundCost
+	Delta  determinism.Money
+
+	// Component-level changes
+	ComponentDiffs []*ComponentDiff
+
+	// What drove the change
+	ChangeReasons []ChangeReason
+}
+
+// ChangeType indicates the type of change
+type ChangeType int
+
+const (
+	ChangeAdded    ChangeType = iota // New instance
+	ChangeRemoved                     // Instance removed
+	ChangeModified                    // Instance cost changed
+	ChangeUnchanged                   // No cost change
+)
+
+// String returns the change type name
+func (c ChangeType) String() string {
+	switch c {
+	case ChangeAdded:
+		return "added"
+	case ChangeRemoved:
+		return "removed"
+	case ChangeModified:
+		return "modified"
+	case ChangeUnchanged:
+		return "unchanged"
+	default:
+		return "unknown"
+	}
+}
+
+// ComponentDiff describes changes to a cost component
+type ComponentDiff struct {
+	ComponentName string
+	ChangeType    ChangeType
+
+	Before *cost.CostWithProvenance
+	After  *cost.CostWithProvenance
+	Delta  determinism.Money
+
+	// What changed
+	RateChanged   bool
+	UsageChanged  bool
+	OldRate       string
+	NewRate       string
+	OldUsage      float64
+	NewUsage      float64
+}
+
+// ChangeReason explains why a cost changed
+type ChangeReason struct {
+	Category string // "rate", "usage", "quantity", "configuration"
+	What     string // What changed
+	Impact   determinism.Money
+}
+
+// Differ computes diffs between estimation results
+type Differ struct {
+	// Threshold for "unchanged" (e.g., 0.01 = 1%)
+	ChangeThreshold float64
+}
+
+// NewDiffer creates a new differ
+func NewDiffer(changeThreshold float64) *Differ {
+	if changeThreshold <= 0 {
+		changeThreshold = 0.001 // 0.1% default
+	}
+	return &Differ{ChangeThreshold: changeThreshold}
+}
+
+// Diff computes the diff between before and after
+func (d *Differ) Diff(before, after *cost.AggregatedCostResult) *DiffResult {
+	result := &DiffResult{
+		TotalBefore:      before.TotalMonthly,
+		TotalAfter:       after.TotalMonthly,
+		ConfidenceBefore: before.TotalConfidence,
+		ConfidenceAfter:  after.TotalConfidence,
+		Added:            []*InstanceDiff{},
+		Removed:          []*InstanceDiff{},
+		Changed:          []*InstanceDiff{},
+		Unchanged:        []*InstanceDiff{},
+	}
+
+	// Calculate delta
+	result.TotalDelta = after.TotalMonthly.Sub(before.TotalMonthly)
+	if !before.TotalMonthly.IsZero() {
+		result.DeltaPercent = (after.TotalMonthly.Float64() - before.TotalMonthly.Float64()) / before.TotalMonthly.Float64() * 100
+	}
+
+	// Index before instances
+	beforeMap := make(map[model.CanonicalAddress]*cost.InstanceCostResult)
+	for _, inst := range before.Instances {
+		beforeMap[inst.Identity.Canonical] = inst
+	}
+
+	// Index after instances
+	afterMap := make(map[model.CanonicalAddress]*cost.InstanceCostResult)
+	for _, inst := range after.Instances {
+		afterMap[inst.Identity.Canonical] = inst
+	}
+
+	// Find added, changed, unchanged
+	for addr, afterInst := range afterMap {
+		beforeInst, existed := beforeMap[addr]
+
+		if !existed {
+			// Added
+			diff := d.createInstanceDiff(nil, afterInst, ChangeAdded)
+			result.Added = append(result.Added, diff)
+			result.AddedCount++
+		} else {
+			// Existed before - check if changed
+			diff := d.compareInstances(beforeInst, afterInst)
+			if diff.ChangeType == ChangeModified {
+				result.Changed = append(result.Changed, diff)
+				result.ChangedCount++
+			} else {
+				result.Unchanged = append(result.Unchanged, diff)
+				result.UnchangedCount++
+			}
+		}
+	}
+
+	// Find removed
+	for addr, beforeInst := range beforeMap {
+		if _, exists := afterMap[addr]; !exists {
+			diff := d.createInstanceDiff(beforeInst, nil, ChangeRemoved)
+			result.Removed = append(result.Removed, diff)
+			result.RemovedCount++
+		}
+	}
+
+	// Sort all lists by address for determinism
+	d.sortDiffs(result.Added)
+	d.sortDiffs(result.Removed)
+	d.sortDiffs(result.Changed)
+	d.sortDiffs(result.Unchanged)
+
+	return result
+}
+
+func (d *Differ) createInstanceDiff(before, after *cost.InstanceCostResult, changeType ChangeType) *InstanceDiff {
+	diff := &InstanceDiff{
+		ChangeType:     changeType,
+		ComponentDiffs: []*ComponentDiff{},
+		ChangeReasons:  []ChangeReason{},
+	}
+
+	switch changeType {
+	case ChangeAdded:
+		diff.Identity = after.Identity
+		diff.Address = after.Identity.Canonical
+		diff.After = after.Total
+		diff.Delta = after.Total.Monthly
+		diff.ChangeReasons = append(diff.ChangeReasons, ChangeReason{
+			Category: "quantity",
+			What:     "new instance",
+			Impact:   after.Total.Monthly,
+		})
+
+	case ChangeRemoved:
+		diff.Identity = before.Identity
+		diff.Address = before.Identity.Canonical
+		diff.Before = before.Total
+		diff.Delta = determinism.Zero("USD").Sub(before.Total.Monthly)
+		diff.ChangeReasons = append(diff.ChangeReasons, ChangeReason{
+			Category: "quantity",
+			What:     "instance removed",
+			Impact:   diff.Delta,
+		})
+	}
+
+	return diff
+}
+
+func (d *Differ) compareInstances(before, after *cost.InstanceCostResult) *InstanceDiff {
+	diff := &InstanceDiff{
+		Identity:       after.Identity,
+		Address:        after.Identity.Canonical,
+		Before:         before.Total,
+		After:          after.Total,
+		Delta:          after.Total.Monthly.Sub(before.Total.Monthly),
+		ComponentDiffs: []*ComponentDiff{},
+		ChangeReasons:  []ChangeReason{},
+	}
+
+	// Check if cost changed significantly
+	beforeCost := before.Total.Monthly.Float64()
+	afterCost := after.Total.Monthly.Float64()
+
+	if beforeCost == 0 && afterCost == 0 {
+		diff.ChangeType = ChangeUnchanged
+		return diff
+	}
+
+	var percentChange float64
+	if beforeCost > 0 {
+		percentChange = (afterCost - beforeCost) / beforeCost
+	} else {
+		percentChange = 1.0 // Infinite increase from 0
+	}
+
+	if abs(percentChange) <= d.ChangeThreshold {
+		diff.ChangeType = ChangeUnchanged
+		return diff
+	}
+
+	diff.ChangeType = ChangeModified
+
+	// Compare components
+	beforeComponents := make(map[string]*cost.CostWithProvenance)
+	for _, c := range before.Components {
+		beforeComponents[c.Component] = c
+	}
+
+	for _, afterComp := range after.Components {
+		beforeComp, existed := beforeComponents[afterComp.Component]
+
+		compDiff := &ComponentDiff{
+			ComponentName: afterComp.Component,
+			After:         afterComp,
+		}
+
+		if !existed {
+			compDiff.ChangeType = ChangeAdded
+			compDiff.Delta = afterComp.Cost.Monthly
+			diff.ChangeReasons = append(diff.ChangeReasons, ChangeReason{
+				Category: "configuration",
+				What:     "new component: " + afterComp.Component,
+				Impact:   afterComp.Cost.Monthly,
+			})
+		} else {
+			compDiff.Before = beforeComp
+			compDiff.Delta = afterComp.Cost.Monthly.Sub(beforeComp.Cost.Monthly)
+
+			if !compDiff.Delta.IsZero() {
+				compDiff.ChangeType = ChangeModified
+
+				// What changed?
+				if beforeComp.Rate != nil && afterComp.Rate != nil {
+					if beforeComp.Rate.Price != afterComp.Rate.Price {
+						compDiff.RateChanged = true
+						compDiff.OldRate = beforeComp.Rate.Price
+						compDiff.NewRate = afterComp.Rate.Price
+						diff.ChangeReasons = append(diff.ChangeReasons, ChangeReason{
+							Category: "rate",
+							What:     afterComp.Component + " rate changed",
+							Impact:   compDiff.Delta,
+						})
+					}
+				}
+
+				if beforeComp.Usage != nil && afterComp.Usage != nil {
+					if beforeComp.Usage.Value != afterComp.Usage.Value {
+						compDiff.UsageChanged = true
+						compDiff.OldUsage = beforeComp.Usage.Value
+						compDiff.NewUsage = afterComp.Usage.Value
+						diff.ChangeReasons = append(diff.ChangeReasons, ChangeReason{
+							Category: "usage",
+							What:     afterComp.Component + " usage changed",
+							Impact:   compDiff.Delta,
+						})
+					}
+				}
+			} else {
+				compDiff.ChangeType = ChangeUnchanged
+			}
+		}
+
+		diff.ComponentDiffs = append(diff.ComponentDiffs, compDiff)
+	}
+
+	// Check for removed components
+	for name, beforeComp := range beforeComponents {
+		found := false
+		for _, afterComp := range after.Components {
+			if afterComp.Component == name {
+				found = true
+				break
+			}
+		}
+		if !found {
+			compDiff := &ComponentDiff{
+				ComponentName: name,
+				ChangeType:    ChangeRemoved,
+				Before:        beforeComp,
+				Delta:         determinism.Zero("USD").Sub(beforeComp.Cost.Monthly),
+			}
+			diff.ComponentDiffs = append(diff.ComponentDiffs, compDiff)
+			diff.ChangeReasons = append(diff.ChangeReasons, ChangeReason{
+				Category: "configuration",
+				What:     "component removed: " + name,
+				Impact:   compDiff.Delta,
+			})
+		}
+	}
+
+	return diff
+}
+
+func (d *Differ) sortDiffs(diffs []*InstanceDiff) {
+	sort.Slice(diffs, func(i, j int) bool {
+		return diffs[i].Address < diffs[j].Address
+	})
+}
+
+func abs(x float64) float64 {
+	if x < 0 {
+		return -x
+	}
+	return x
+}
+
+// DiffSummary provides a human-readable summary
+func (r *DiffResult) Summary() string {
+	var summary string
+
+	// Overall change
+	if r.TotalDelta.IsZero() {
+		summary = "No cost change\n"
+	} else if r.TotalDelta.IsNegative() {
+		summary = "Cost decreased by " + r.TotalDelta.String() + "\n"
+	} else {
+		summary = "Cost increased by " + r.TotalDelta.String() + "\n"
+	}
+
+	// Instance changes
+	if r.AddedCount > 0 {
+		summary += "  + " + string(rune('0'+r.AddedCount)) + " instances added\n"
+	}
+	if r.RemovedCount > 0 {
+		summary += "  - " + string(rune('0'+r.RemovedCount)) + " instances removed\n"
+	}
+	if r.ChangedCount > 0 {
+		summary += "  ~ " + string(rune('0'+r.ChangedCount)) + " instances changed\n"
+	}
+
+	return summary
+}
+
+// TopChanges returns the instances with largest cost impact
+func (r *DiffResult) TopChanges(n int) []*InstanceDiff {
+	all := append(r.Added, r.Removed...)
+	all = append(all, r.Changed...)
+
+	sort.Slice(all, func(i, j int) bool {
+		iAbs := abs(all[i].Delta.Float64())
+		jAbs := abs(all[j].Delta.Float64())
+		return iAbs > jAbs
+	})
+
+	if n > len(all) {
+		n = len(all)
+	}
+	return all[:n]
 }
 
 ################################################################################
@@ -7614,6 +9247,649 @@ func (g *InstanceGraph) Size() int {
 }
 
 ################################################################################
+# FILE: :\good projects\cost estimation\core\model\enforced_identity.go
+# TYPE: go
+# SIZE: 8026 bytes
+################################################################################
+// Package model - Enforced canonical identity
+// A single canonical format used EVERYWHERE.
+package model
+
+import (
+	"errors"
+	"fmt"
+	"regexp"
+	"strconv"
+	"strings"
+)
+
+// ErrInvalidAddress is returned when an address cannot be parsed
+var ErrInvalidAddress = errors.New("invalid resource address")
+
+// CanonicalFormat is the ONLY accepted identity format.
+// Pattern: [module.name:]...<type>.<name>[<key_type>=<key>]
+//
+// Examples:
+//   aws_instance.web                           - single resource
+//   aws_instance.web[count=0]                  - count expansion
+//   aws_instance.web[for_each=prod]            - for_each expansion
+//   module.vpc:aws_subnet.main[count=0]        - in module
+//   module.vpc:module.db:aws_rds.main          - nested modules
+const canonicalPattern = `^((?:module\.[a-zA-Z_][a-zA-Z0-9_]*:)*)?([a-zA-Z_][a-zA-Z0-9_]*)\.([a-zA-Z_][a-zA-Z0-9_\-]*)(\[(count|for_each)=([^\]]+)\])?$`
+
+var canonicalRegex = regexp.MustCompile(canonicalPattern)
+
+// EnforcedCanonicalAddress is a validated canonical address.
+// Once created, it is guaranteed to be in the correct format.
+type EnforcedCanonicalAddress struct {
+	raw          string
+	modulePath   []string
+	resourceType string
+	resourceName string
+	keyType      KeyType
+	keyValue     string
+	intKey       int
+}
+
+// NewEnforcedAddress creates and validates a canonical address
+func NewEnforcedAddress(addr string) (*EnforcedCanonicalAddress, error) {
+	// First try to parse as canonical
+	if match := canonicalRegex.FindStringSubmatch(addr); match != nil {
+		return parseCanonicalMatch(addr, match)
+	}
+
+	// Try to normalize from Terraform format
+	return normalizeFromTerraform(addr)
+}
+
+// MustNewEnforcedAddress creates an address or panics
+func MustNewEnforcedAddress(addr string) *EnforcedCanonicalAddress {
+	a, err := NewEnforcedAddress(addr)
+	if err != nil {
+		panic(fmt.Sprintf("invalid address %q: %v", addr, err))
+	}
+	return a
+}
+
+func parseCanonicalMatch(addr string, match []string) (*EnforcedCanonicalAddress, error) {
+	a := &EnforcedCanonicalAddress{raw: addr}
+
+	// Parse module path
+	if match[1] != "" {
+		modulePart := strings.TrimSuffix(match[1], ":")
+		for _, part := range strings.Split(modulePart, ":") {
+			if strings.HasPrefix(part, "module.") {
+				a.modulePath = append(a.modulePath, strings.TrimPrefix(part, "module."))
+			}
+		}
+	}
+
+	a.resourceType = match[2]
+	a.resourceName = match[3]
+
+	// Parse key
+	if match[4] != "" {
+		keyTypeStr := match[5]
+		keyVal := match[6]
+
+		if keyTypeStr == "count" {
+			a.keyType = KeyTypeInt
+			n, err := strconv.Atoi(keyVal)
+			if err != nil {
+				return nil, fmt.Errorf("invalid count value: %s", keyVal)
+			}
+			a.intKey = n
+			a.keyValue = keyVal
+		} else if keyTypeStr == "for_each" {
+			a.keyType = KeyTypeString
+			a.keyValue = keyVal
+		}
+	} else {
+		a.keyType = KeyTypeNone
+	}
+
+	return a, nil
+}
+
+func normalizeFromTerraform(addr string) (*EnforcedCanonicalAddress, error) {
+	a := &EnforcedCanonicalAddress{}
+
+	// Handle module path
+	remaining := addr
+	for strings.HasPrefix(remaining, "module.") {
+		remaining = strings.TrimPrefix(remaining, "module.")
+		dotIdx := strings.Index(remaining, ".")
+		if dotIdx == -1 {
+			return nil, ErrInvalidAddress
+		}
+		a.modulePath = append(a.modulePath, remaining[:dotIdx])
+		remaining = remaining[dotIdx+1:]
+	}
+
+	// Parse resource type.name[key]
+	bracketIdx := strings.Index(remaining, "[")
+	resourcePart := remaining
+	keyPart := ""
+	if bracketIdx != -1 {
+		resourcePart = remaining[:bracketIdx]
+		keyPart = remaining[bracketIdx:]
+	}
+
+	// Split type.name
+	dotIdx := strings.LastIndex(resourcePart, ".")
+	if dotIdx == -1 {
+		return nil, ErrInvalidAddress
+	}
+	a.resourceType = resourcePart[:dotIdx]
+	a.resourceName = resourcePart[dotIdx+1:]
+
+	// Parse key
+	if keyPart != "" {
+		// Remove brackets
+		keyPart = strings.TrimPrefix(keyPart, "[")
+		keyPart = strings.TrimSuffix(keyPart, "]")
+
+		// Check if it's a number (count) or string (for_each)
+		if n, err := strconv.Atoi(keyPart); err == nil {
+			a.keyType = KeyTypeInt
+			a.intKey = n
+			a.keyValue = keyPart
+		} else {
+			a.keyType = KeyTypeString
+			// Remove quotes if present
+			a.keyValue = strings.Trim(keyPart, "\"'")
+		}
+	}
+
+	// Build canonical form
+	a.raw = a.String()
+	return a, nil
+}
+
+// String returns the canonical string representation
+func (a *EnforcedCanonicalAddress) String() string {
+	if a.raw != "" {
+		return a.raw
+	}
+
+	var sb strings.Builder
+
+	// Module path
+	for _, mod := range a.modulePath {
+		sb.WriteString("module.")
+		sb.WriteString(mod)
+		sb.WriteString(":")
+	}
+
+	// Resource
+	sb.WriteString(a.resourceType)
+	sb.WriteString(".")
+	sb.WriteString(a.resourceName)
+
+	// Key
+	switch a.keyType {
+	case KeyTypeInt:
+		sb.WriteString("[count=")
+		sb.WriteString(strconv.Itoa(a.intKey))
+		sb.WriteString("]")
+	case KeyTypeString:
+		sb.WriteString("[for_each=")
+		sb.WriteString(a.keyValue)
+		sb.WriteString("]")
+	}
+
+	return sb.String()
+}
+
+// ModulePath returns the module path components
+func (a *EnforcedCanonicalAddress) ModulePath() []string {
+	return a.modulePath
+}
+
+// ResourceType returns the resource type
+func (a *EnforcedCanonicalAddress) ResourceType() string {
+	return a.resourceType
+}
+
+// ResourceName returns the resource name
+func (a *EnforcedCanonicalAddress) ResourceName() string {
+	return a.resourceName
+}
+
+// Key returns the expansion key
+func (a *EnforcedCanonicalAddress) Key() InstanceKey {
+	return InstanceKey{
+		Type:     a.keyType,
+		IntValue: a.intKey,
+		StrValue: a.keyValue,
+	}
+}
+
+// IsInModule returns true if the resource is inside a module
+func (a *EnforcedCanonicalAddress) IsInModule() bool {
+	return len(a.modulePath) > 0
+}
+
+// BaseAddress returns the address without the expansion key
+func (a *EnforcedCanonicalAddress) BaseAddress() string {
+	var sb strings.Builder
+	for _, mod := range a.modulePath {
+		sb.WriteString("module.")
+		sb.WriteString(mod)
+		sb.WriteString(":")
+	}
+	sb.WriteString(a.resourceType)
+	sb.WriteString(".")
+	sb.WriteString(a.resourceName)
+	return sb.String()
+}
+
+// WithKey returns a new address with a different key
+func (a *EnforcedCanonicalAddress) WithKey(keyType KeyType, value interface{}) *EnforcedCanonicalAddress {
+	newAddr := &EnforcedCanonicalAddress{
+		modulePath:   a.modulePath,
+		resourceType: a.resourceType,
+		resourceName: a.resourceName,
+		keyType:      keyType,
+	}
+
+	switch keyType {
+	case KeyTypeInt:
+		newAddr.intKey = value.(int)
+		newAddr.keyValue = strconv.Itoa(value.(int))
+	case KeyTypeString:
+		newAddr.keyValue = value.(string)
+	}
+
+	newAddr.raw = newAddr.String()
+	return newAddr
+}
+
+// Equals compares two addresses
+func (a *EnforcedCanonicalAddress) Equals(other *EnforcedCanonicalAddress) bool {
+	return a.String() == other.String()
+}
+
+// CanonicalAddressRegistry ensures unique addresses
+type CanonicalAddressRegistry struct {
+	addresses map[string]*EnforcedCanonicalAddress
+}
+
+// NewCanonicalAddressRegistry creates a new registry
+func NewCanonicalAddressRegistry() *CanonicalAddressRegistry {
+	return &CanonicalAddressRegistry{
+		addresses: make(map[string]*EnforcedCanonicalAddress),
+	}
+}
+
+// Register adds an address, returning error if duplicate
+func (r *CanonicalAddressRegistry) Register(addr *EnforcedCanonicalAddress) error {
+	key := addr.String()
+	if _, exists := r.addresses[key]; exists {
+		return fmt.Errorf("duplicate address: %s", key)
+	}
+	r.addresses[key] = addr
+	return nil
+}
+
+// Get retrieves an address by string
+func (r *CanonicalAddressRegistry) Get(addr string) *EnforcedCanonicalAddress {
+	return r.addresses[addr]
+}
+
+// All returns all registered addresses
+func (r *CanonicalAddressRegistry) All() []*EnforcedCanonicalAddress {
+	result := make([]*EnforcedCanonicalAddress, 0, len(r.addresses))
+	for _, a := range r.addresses {
+		result = append(result, a)
+	}
+	return result
+}
+
+################################################################################
+# FILE: :\good projects\cost estimation\core\model\identity.go
+# TYPE: go
+# SIZE: 9029 bytes
+################################################################################
+// Package model - Canonical instance identity
+// Instance identity is NORMALIZED everywhere: cost lineage, policy, diffing, output.
+package model
+
+import (
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
+	"regexp"
+	"sort"
+	"strings"
+)
+
+// CanonicalAddress is a normalized, stable instance identity.
+// Format: module.path:resource_type.name[key_type=key_value]
+// Examples:
+//   aws_instance.web                           (single instance)
+//   aws_instance.web[count=0]                  (count expansion)
+//   aws_instance.web[for_each=prod]            (for_each expansion)
+//   module.app:aws_instance.web[count=0]      (in module)
+//   module.app:module.db:aws_rds_instance.main (nested modules)
+type CanonicalAddress string
+
+// AddressBuilder constructs canonical addresses
+type AddressBuilder struct {
+	modulePath   []string
+	resourceType string
+	resourceName string
+	keyType      string
+	keyValue     string
+}
+
+// NewAddressBuilder creates a new builder
+func NewAddressBuilder() *AddressBuilder {
+	return &AddressBuilder{}
+}
+
+// InModule adds a module to the path
+func (b *AddressBuilder) InModule(name string) *AddressBuilder {
+	b.modulePath = append(b.modulePath, name)
+	return b
+}
+
+// Resource sets the resource type and name
+func (b *AddressBuilder) Resource(resourceType, name string) *AddressBuilder {
+	b.resourceType = resourceType
+	b.resourceName = name
+	return b
+}
+
+// WithCount sets a count key
+func (b *AddressBuilder) WithCount(index int) *AddressBuilder {
+	b.keyType = "count"
+	b.keyValue = fmt.Sprintf("%d", index)
+	return b
+}
+
+// WithForEach sets a for_each key
+func (b *AddressBuilder) WithForEach(key string) *AddressBuilder {
+	b.keyType = "for_each"
+	b.keyValue = key
+	return b
+}
+
+// Build creates the canonical address
+func (b *AddressBuilder) Build() CanonicalAddress {
+	var sb strings.Builder
+
+	// Module path
+	for i, mod := range b.modulePath {
+		if i > 0 {
+			sb.WriteString(":")
+		}
+		sb.WriteString("module.")
+		sb.WriteString(mod)
+	}
+
+	// Separator if we have modules
+	if len(b.modulePath) > 0 {
+		sb.WriteString(":")
+	}
+
+	// Resource
+	sb.WriteString(b.resourceType)
+	sb.WriteString(".")
+	sb.WriteString(b.resourceName)
+
+	// Key
+	if b.keyType != "" {
+		sb.WriteString("[")
+		sb.WriteString(b.keyType)
+		sb.WriteString("=")
+		sb.WriteString(b.keyValue)
+		sb.WriteString("]")
+	}
+
+	return CanonicalAddress(sb.String())
+}
+
+// ParseAddress parses any address format into canonical form
+func ParseAddress(addr string) (CanonicalAddress, error) {
+	// Already canonical?
+	if isCanonical(addr) {
+		return CanonicalAddress(addr), nil
+	}
+
+	// Parse Terraform-style address
+	builder := NewAddressBuilder()
+
+	// Split into parts
+	parts := strings.Split(addr, ".")
+
+	i := 0
+	// Collect module path
+	for i < len(parts)-2 {
+		if parts[i] == "module" {
+			builder.InModule(parts[i+1])
+			i += 2
+		} else {
+			break
+		}
+	}
+
+	// Resource type and name
+	if i+1 >= len(parts) {
+		return "", fmt.Errorf("invalid address: %s", addr)
+	}
+
+	resourceType := parts[i]
+	resourceName := parts[i+1]
+
+	// Check for index in resource name
+	if idx := strings.Index(resourceName, "["); idx != -1 {
+		keyPart := resourceName[idx+1 : len(resourceName)-1]
+		resourceName = resourceName[:idx]
+
+		// Parse key
+		if num, err := fmt.Sscanf(keyPart, "%d", new(int)); err == nil && num == 1 {
+			var index int
+			fmt.Sscanf(keyPart, "%d", &index)
+			builder.WithCount(index)
+		} else {
+			// Remove quotes if present
+			keyPart = strings.Trim(keyPart, "\"")
+			builder.WithForEach(keyPart)
+		}
+	}
+
+	builder.Resource(resourceType, resourceName)
+	return builder.Build(), nil
+}
+
+// isCanonical checks if address is already in canonical form
+func isCanonical(addr string) bool {
+	// Canonical format uses [key_type=value] not [index] or ["key"]
+	return strings.Contains(addr, "[count=") || strings.Contains(addr, "[for_each=")
+}
+
+// StableID generates a hash-based ID from a canonical address
+func (a CanonicalAddress) StableID() InstanceID {
+	h := sha256.New()
+	h.Write([]byte(a))
+	return InstanceID(hex.EncodeToString(h.Sum(nil))[:16])
+}
+
+// ModulePath returns the module path component
+func (a CanonicalAddress) ModulePath() string {
+	s := string(a)
+	idx := strings.LastIndex(s, ":")
+	if idx == -1 {
+		return ""
+	}
+	return s[:idx]
+}
+
+// ResourceAddress returns just the resource part
+func (a CanonicalAddress) ResourceAddress() string {
+	s := string(a)
+	idx := strings.LastIndex(s, ":")
+	if idx == -1 {
+		return s
+	}
+	return s[idx+1:]
+}
+
+// BaseAddress returns the address without the key
+func (a CanonicalAddress) BaseAddress() string {
+	s := string(a)
+	idx := strings.Index(s, "[")
+	if idx == -1 {
+		return s
+	}
+	return s[:idx]
+}
+
+// Key returns the key part, if any
+func (a CanonicalAddress) Key() (keyType, keyValue string) {
+	s := string(a)
+	re := regexp.MustCompile(`\[(count|for_each)=([^\]]+)\]`)
+	matches := re.FindStringSubmatch(s)
+	if len(matches) == 3 {
+		return matches[1], matches[2]
+	}
+	return "", ""
+}
+
+// String implements Stringer
+func (a CanonicalAddress) String() string {
+	return string(a)
+}
+
+// InstanceIdentity provides complete identity information
+type InstanceIdentity struct {
+	// Canonical address (normalized)
+	Canonical CanonicalAddress
+
+	// Stable ID (hash-based)
+	ID InstanceID
+
+	// Components
+	ModulePath   string
+	ResourceType string
+	ResourceName string
+	KeyType      string // "count" or "for_each" or ""
+	KeyValue     string
+
+	// Parent definition
+	DefinitionID DefinitionID
+
+	// For nested expansion tracking
+	ParentKey    *InstanceIdentity
+}
+
+// NewInstanceIdentity creates identity from an instance
+func NewInstanceIdentity(inst *AssetInstance) *InstanceIdentity {
+	canonical, _ := ParseAddress(string(inst.Address))
+
+	keyType, keyValue := "", ""
+	switch inst.Key.Type {
+	case KeyTypeInt:
+		keyType = "count"
+		keyValue = fmt.Sprintf("%d", inst.Key.IntValue)
+	case KeyTypeString:
+		keyType = "for_each"
+		keyValue = inst.Key.StrValue
+	}
+
+	parts := strings.Split(canonical.BaseAddress(), ".")
+	resourceType, resourceName := "", ""
+	if len(parts) >= 2 {
+		// Find last two parts that aren't module names
+		for i := len(parts) - 2; i >= 0; i-- {
+			if parts[i] != "module" {
+				resourceType = parts[i]
+				resourceName = parts[i+1]
+				break
+			}
+		}
+	}
+
+	return &InstanceIdentity{
+		Canonical:    canonical,
+		ID:           canonical.StableID(),
+		ModulePath:   canonical.ModulePath(),
+		ResourceType: resourceType,
+		ResourceName: resourceName,
+		KeyType:      keyType,
+		KeyValue:     keyValue,
+		DefinitionID: inst.DefinitionID,
+	}
+}
+
+// IdentityIndex indexes instances by various identity components
+type IdentityIndex struct {
+	byCanonical    map[CanonicalAddress]*InstanceIdentity
+	byID           map[InstanceID]*InstanceIdentity
+	byModule       map[string][]*InstanceIdentity
+	byResourceType map[string][]*InstanceIdentity
+	byDefinition   map[DefinitionID][]*InstanceIdentity
+}
+
+// NewIdentityIndex creates an empty index
+func NewIdentityIndex() *IdentityIndex {
+	return &IdentityIndex{
+		byCanonical:    make(map[CanonicalAddress]*InstanceIdentity),
+		byID:           make(map[InstanceID]*InstanceIdentity),
+		byModule:       make(map[string][]*InstanceIdentity),
+		byResourceType: make(map[string][]*InstanceIdentity),
+		byDefinition:   make(map[DefinitionID][]*InstanceIdentity),
+	}
+}
+
+// Add adds an identity to the index
+func (idx *IdentityIndex) Add(id *InstanceIdentity) {
+	idx.byCanonical[id.Canonical] = id
+	idx.byID[id.ID] = id
+	idx.byModule[id.ModulePath] = append(idx.byModule[id.ModulePath], id)
+	idx.byResourceType[id.ResourceType] = append(idx.byResourceType[id.ResourceType], id)
+	idx.byDefinition[id.DefinitionID] = append(idx.byDefinition[id.DefinitionID], id)
+}
+
+// ByCanonical looks up by canonical address
+func (idx *IdentityIndex) ByCanonical(addr CanonicalAddress) *InstanceIdentity {
+	return idx.byCanonical[addr]
+}
+
+// ByID looks up by ID
+func (idx *IdentityIndex) ByID(id InstanceID) *InstanceIdentity {
+	return idx.byID[id]
+}
+
+// ByModule returns all instances in a module
+func (idx *IdentityIndex) ByModule(path string) []*InstanceIdentity {
+	result := idx.byModule[path]
+	sort.Slice(result, func(i, j int) bool {
+		return result[i].Canonical < result[j].Canonical
+	})
+	return result
+}
+
+// ByResourceType returns all instances of a type
+func (idx *IdentityIndex) ByResourceType(t string) []*InstanceIdentity {
+	result := idx.byResourceType[t]
+	sort.Slice(result, func(i, j int) bool {
+		return result[i].Canonical < result[j].Canonical
+	})
+	return result
+}
+
+// ByDefinition returns all instances from a definition
+func (idx *IdentityIndex) ByDefinition(id DefinitionID) []*InstanceIdentity {
+	result := idx.byDefinition[id]
+	sort.Slice(result, func(i, j int) bool {
+		return result[i].Canonical < result[j].Canonical
+	})
+	return result
+}
+
+################################################################################
 # FILE: :\good projects\cost estimation\core\output\formatter.go
 # TYPE: go
 # SIZE: 4597 bytes
@@ -8400,9 +10676,422 @@ type RuleConfig struct {
 }
 
 ################################################################################
+# FILE: :\good projects\cost estimation\core\policy\explanation.go
+# TYPE: go
+# SIZE: 11794 bytes
+################################################################################
+// Package policy - Explainable policy results
+// Policies explain WHY they failed, not just THAT they failed.
+package policy
+
+import (
+	"fmt"
+	"sort"
+	"strings"
+
+	"terraform-cost/core/determinism"
+	"terraform-cost/core/model"
+)
+
+// ExplainedResult is a policy result with full explanation
+type ExplainedResult struct {
+	PolicyName string
+	Passed     bool
+
+	// Short summary
+	Summary string
+
+	// Detailed explanation
+	Explanation *PolicyExplanation
+
+	// Recommendations
+	Recommendations []Recommendation
+}
+
+// PolicyExplanation provides deep explanation of policy outcome
+type PolicyExplanation struct {
+	// What the policy checks
+	PolicyDescription string
+
+	// What threshold/limit was applied
+	Threshold *ThresholdInfo
+
+	// What was analyzed
+	AnalyzedScope AnalysisScope
+
+	// What caused the violation (if failed)
+	Violations []ViolationDetail
+
+	// What contributed most to the outcome
+	TopContributors []Contributor
+
+	// Confidence considerations
+	ConfidenceImpact *ConfidenceImpactInfo
+}
+
+// ThresholdInfo describes policy thresholds
+type ThresholdInfo struct {
+	Name      string // e.g., "monthly_budget"
+	Value     string // e.g., "$1000.00"
+	Actual    string // e.g., "$1234.56"
+	Exceeded  bool
+	ExcessBy  string // e.g., "$234.56 (23.5%)"
+}
+
+// AnalysisScope describes what was analyzed
+type AnalysisScope struct {
+	TotalInstances   int
+	TotalComponents  int
+	AnalyzedTypes    []string
+	ExcludedTypes    []string
+	TimeRange        string // if applicable
+}
+
+// ViolationDetail explains a specific violation
+type ViolationDetail struct {
+	// What violated
+	InstanceAddress model.CanonicalAddress
+	Component       string
+
+	// Why it violated
+	Reason string
+
+	// How much impact
+	CostImpact determinism.Money
+
+	// What would fix it
+	SuggestedFix string
+
+	// Related lineage
+	FormulaUsed   string
+	RateUsed      string
+	UsageAssumed  string
+}
+
+// Contributor identifies what contributed to outcome
+type Contributor struct {
+	Category string // "instance", "component", "rate", "usage"
+	Name     string
+	Impact   determinism.Money
+	Percent  float64
+	Reason   string
+}
+
+// ConfidenceImpactInfo describes how confidence affected the policy
+type ConfidenceImpactInfo struct {
+	OverallConfidence float64
+	LowConfidenceItems int
+	AffectedByUnknowns bool
+	UnknownCount       int
+	Caveat             string // e.g., "Result may change when unknowns resolve"
+}
+
+// Recommendation is a suggested action
+type Recommendation struct {
+	Priority    int    // 1=critical, 2=high, 3=medium
+	Action      string
+	Rationale   string
+	EstimatedSavings *determinism.Money
+}
+
+// ExplainablePolicy is a policy that provides explanations
+type ExplainablePolicy interface {
+	Name() string
+	Description() string
+	EvaluateWithExplanation(ctx *FullLineageContext) (*ExplainedResult, error)
+}
+
+// ExplainedBudgetPolicy is a budget policy with explanations
+type ExplainedBudgetPolicy struct {
+	name          string
+	description   string
+	monthlyBudget determinism.Money
+	warnThreshold float64
+}
+
+// NewExplainedBudgetPolicy creates an explainable budget policy
+func NewExplainedBudgetPolicy(name string, budget determinism.Money, warnAt float64) *ExplainedBudgetPolicy {
+	return &ExplainedBudgetPolicy{
+		name:          name,
+		description:   fmt.Sprintf("Ensures monthly costs stay within $%s budget", budget.String()),
+		monthlyBudget: budget,
+		warnThreshold: warnAt,
+	}
+}
+
+func (p *ExplainedBudgetPolicy) Name() string        { return p.name }
+func (p *ExplainedBudgetPolicy) Description() string { return p.description }
+
+func (p *ExplainedBudgetPolicy) EvaluateWithExplanation(ctx *FullLineageContext) (*ExplainedResult, error) {
+	result := &ExplainedResult{
+		PolicyName: p.name,
+		Passed:     true,
+		Explanation: &PolicyExplanation{
+			PolicyDescription: p.description,
+			AnalyzedScope: AnalysisScope{
+				TotalInstances: len(ctx.Instances),
+			},
+		},
+	}
+
+	// Count components
+	for _, inst := range ctx.Instances {
+		result.Explanation.AnalyzedScope.TotalComponents += len(inst.Components)
+	}
+
+	// Set threshold info
+	result.Explanation.Threshold = &ThresholdInfo{
+		Name:   "monthly_budget",
+		Value:  "$" + p.monthlyBudget.String(),
+		Actual: "$" + ctx.TotalMonthlyCost.String(),
+	}
+
+	// Check budget
+	if ctx.TotalMonthlyCost.Cmp(p.monthlyBudget) > 0 {
+		result.Passed = false
+		excess := ctx.TotalMonthlyCost.Sub(p.monthlyBudget)
+		percent := (ctx.TotalMonthlyCost.Float64() / p.monthlyBudget.Float64() - 1) * 100
+
+		result.Summary = fmt.Sprintf("Monthly cost $%s exceeds budget $%s by $%s (%.1f%%)",
+			ctx.TotalMonthlyCost.String(), p.monthlyBudget.String(), excess.String(), percent)
+
+		result.Explanation.Threshold.Exceeded = true
+		result.Explanation.Threshold.ExcessBy = fmt.Sprintf("$%s (%.1f%%)", excess.String(), percent)
+
+		// Find top contributors
+		result.Explanation.TopContributors = p.findTopContributors(ctx, 5)
+		result.Explanation.Violations = p.buildViolations(ctx, excess)
+
+		// Add recommendations
+		result.Recommendations = p.generateRecommendations(ctx, excess)
+	} else {
+		percent := ctx.TotalMonthlyCost.Float64() / p.monthlyBudget.Float64() * 100
+		result.Summary = fmt.Sprintf("Monthly cost $%s is within budget $%s (%.1f%% utilized)",
+			ctx.TotalMonthlyCost.String(), p.monthlyBudget.String(), percent)
+
+		// Warn if close to threshold
+		if percent >= p.warnThreshold*100 {
+			result.Recommendations = append(result.Recommendations, Recommendation{
+				Priority:  3,
+				Action:    "Monitor cost growth",
+				Rationale: fmt.Sprintf("Currently at %.1f%% of budget", percent),
+			})
+		}
+	}
+
+	// Add confidence impact
+	result.Explanation.ConfidenceImpact = &ConfidenceImpactInfo{
+		OverallConfidence: ctx.OverallConfidence,
+		LowConfidenceItems: len(ctx.LowConfidenceItems),
+		UnknownCount:       len(ctx.Unknowns),
+	}
+
+	if ctx.OverallConfidence < 0.9 {
+		result.Explanation.ConfidenceImpact.Caveat = 
+			"Cost estimate has reduced confidence; actual costs may vary"
+	}
+	if len(ctx.Unknowns) > 0 {
+		result.Explanation.ConfidenceImpact.AffectedByUnknowns = true
+	}
+
+	return result, nil
+}
+
+func (p *ExplainedBudgetPolicy) findTopContributors(ctx *FullLineageContext, n int) []Contributor {
+	type item struct {
+		addr model.CanonicalAddress
+		cost determinism.Money
+	}
+
+	var items []item
+	for _, inst := range ctx.Instances {
+		items = append(items, item{
+			addr: model.CanonicalAddress(inst.Address),
+			cost: inst.MonthlyCost,
+		})
+	}
+
+	sort.Slice(items, func(i, j int) bool {
+		return items[i].cost.Cmp(items[j].cost) > 0
+	})
+
+	if n > len(items) {
+		n = len(items)
+	}
+
+	contributors := make([]Contributor, n)
+	for i := 0; i < n; i++ {
+		percent := items[i].cost.Float64() / ctx.TotalMonthlyCost.Float64() * 100
+		contributors[i] = Contributor{
+			Category: "instance",
+			Name:     string(items[i].addr),
+			Impact:   items[i].cost,
+			Percent:  percent,
+			Reason:   fmt.Sprintf("%.1f%% of total cost", percent),
+		}
+	}
+
+	return contributors
+}
+
+func (p *ExplainedBudgetPolicy) buildViolations(ctx *FullLineageContext, excess determinism.Money) []ViolationDetail {
+	var violations []ViolationDetail
+
+	// Find top 3 cost drivers as "violations"
+	type item struct {
+		inst *InstanceLineage
+		cost determinism.Money
+	}
+
+	var items []item
+	for _, inst := range ctx.Instances {
+		items = append(items, item{inst: inst, cost: inst.MonthlyCost})
+	}
+
+	sort.Slice(items, func(i, j int) bool {
+		return items[i].cost.Cmp(items[j].cost) > 0
+	})
+
+	n := 3
+	if n > len(items) {
+		n = len(items)
+	}
+
+	for i := 0; i < n; i++ {
+		inst := items[i].inst
+		violations = append(violations, ViolationDetail{
+			InstanceAddress: model.CanonicalAddress(inst.Address),
+			Reason:          fmt.Sprintf("High cost: $%s/month", inst.MonthlyCost.String()),
+			CostImpact:      inst.MonthlyCost,
+			SuggestedFix:    p.suggestFix(inst),
+		})
+	}
+
+	return violations
+}
+
+func (p *ExplainedBudgetPolicy) suggestFix(inst *InstanceLineage) string {
+	// Generate context-aware suggestions
+	resourceType := strings.Split(string(inst.Address), ".")[0]
+
+	switch {
+	case strings.Contains(resourceType, "instance"):
+		return "Consider using a smaller instance type or Spot instances"
+	case strings.Contains(resourceType, "db") || strings.Contains(resourceType, "rds"):
+		return "Consider Reserved Instances or Aurora Serverless"
+	case strings.Contains(resourceType, "nat"):
+		return "Consider VPC endpoints to reduce NAT traffic"
+	case strings.Contains(resourceType, "lb"):
+		return "Review target groups and consider consolidation"
+	default:
+		return "Review configuration for cost optimization"
+	}
+}
+
+func (p *ExplainedBudgetPolicy) generateRecommendations(ctx *FullLineageContext, excess determinism.Money) []Recommendation {
+	var recs []Recommendation
+
+	recs = append(recs, Recommendation{
+		Priority:  1,
+		Action:    "Review top cost contributors",
+		Rationale: "Focus on highest-cost instances for maximum impact",
+	})
+
+	// If many low confidence items
+	if len(ctx.LowConfidenceItems) > len(ctx.Instances)/4 {
+		recs = append(recs, Recommendation{
+			Priority:  2,
+			Action:    "Provide usage overrides for low-confidence components",
+			Rationale: fmt.Sprintf("%d components have uncertain cost estimates", len(ctx.LowConfidenceItems)),
+		})
+	}
+
+	// If unknowns present
+	if len(ctx.Unknowns) > 0 {
+		recs = append(recs, Recommendation{
+			Priority:  2,
+			Action:    "Resolve unknown Terraform values",
+			Rationale: fmt.Sprintf("%d unknown values may affect final cost", len(ctx.Unknowns)),
+		})
+	}
+
+	return recs
+}
+
+// FormatExplanation returns a human-readable explanation
+func FormatExplanation(result *ExplainedResult) string {
+	var sb strings.Builder
+
+	// Header
+	status := "âœ“ PASS"
+	if !result.Passed {
+		status = "âœ— FAIL"
+	}
+	sb.WriteString(fmt.Sprintf("Policy: %s [%s]\n", result.PolicyName, status))
+	sb.WriteString(fmt.Sprintf("Summary: %s\n\n", result.Summary))
+
+	if result.Explanation == nil {
+		return sb.String()
+	}
+
+	// Threshold
+	if t := result.Explanation.Threshold; t != nil {
+		sb.WriteString("Threshold:\n")
+		sb.WriteString(fmt.Sprintf("  %s: %s (actual: %s)\n", t.Name, t.Value, t.Actual))
+		if t.Exceeded {
+			sb.WriteString(fmt.Sprintf("  EXCEEDED by: %s\n", t.ExcessBy))
+		}
+		sb.WriteString("\n")
+	}
+
+	// Top contributors
+	if len(result.Explanation.TopContributors) > 0 {
+		sb.WriteString("Top Cost Contributors:\n")
+		for i, c := range result.Explanation.TopContributors {
+			sb.WriteString(fmt.Sprintf("  %d. %s: $%s (%.1f%%)\n", i+1, c.Name, c.Impact.String(), c.Percent))
+		}
+		sb.WriteString("\n")
+	}
+
+	// Violations
+	if len(result.Explanation.Violations) > 0 {
+		sb.WriteString("Violations:\n")
+		for _, v := range result.Explanation.Violations {
+			sb.WriteString(fmt.Sprintf("  â€¢ %s\n", v.InstanceAddress))
+			sb.WriteString(fmt.Sprintf("    Reason: %s\n", v.Reason))
+			sb.WriteString(fmt.Sprintf("    Suggestion: %s\n", v.SuggestedFix))
+		}
+		sb.WriteString("\n")
+	}
+
+	// Recommendations
+	if len(result.Recommendations) > 0 {
+		sb.WriteString("Recommendations:\n")
+		for _, r := range result.Recommendations {
+			priority := "!"
+			if r.Priority == 1 {
+				priority = "!!!"
+			} else if r.Priority == 2 {
+				priority = "!!"
+			}
+			sb.WriteString(fmt.Sprintf("  [%s] %s\n", priority, r.Action))
+			sb.WriteString(fmt.Sprintf("       %s\n", r.Rationale))
+		}
+		sb.WriteString("\n")
+	}
+
+	// Confidence caveat
+	if c := result.Explanation.ConfidenceImpact; c != nil && c.Caveat != "" {
+		sb.WriteString(fmt.Sprintf("Note: %s\n", c.Caveat))
+	}
+
+	return sb.String()
+}
+
+################################################################################
 # FILE: :\good projects\cost estimation\core\policy\full_lineage.go
 # TYPE: go
-# SIZE: 9983 bytes
+# SIZE: 10052 bytes
 ################################################################################
 // Package policy - Full lineage access for policies
 // Policies can see the COMPLETE derivation chain.
@@ -8429,6 +11118,9 @@ type FullLineageContext struct {
 	OverallConfidence    float64
 	ConfidenceByInstance map[model.InstanceID]float64
 	ConfidenceByComponent map[string]float64
+
+	// Low confidence items
+	LowConfidenceItems []LowConfidenceItem
 
 	// Unknown tracking
 	Unknowns []UnknownInfo
@@ -9113,6 +11805,335 @@ func (s *InMemorySnapshotStore) Store(ctx context.Context, snapshot *PricingSnap
 		s.latest[key] = snapshot
 	}
 	return nil
+}
+
+################################################################################
+# FILE: :\good projects\cost estimation\core\pricing\immutable_store.go
+# TYPE: go
+# SIZE: 8980 bytes
+################################################################################
+// Package pricing - Immutable snapshot storage
+// Snapshots are write-once, content-hashed, and versioned.
+// No silent updates. Ever.
+package pricing
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"sync"
+	"time"
+)
+
+// ImmutabilityError is returned when attempting to violate immutability
+var ErrImmutabilityViolation = errors.New("immutability violation: snapshot cannot be modified")
+
+// ErrHashMismatch is returned when stored hash doesn't match computed hash
+var ErrHashMismatch = errors.New("snapshot hash mismatch: data may be corrupted")
+
+// ImmutableSnapshotStore is a storage layer that ENFORCES immutability.
+// Once a snapshot is written, it can NEVER be overwritten.
+type ImmutableSnapshotStore struct {
+	mu       sync.RWMutex
+	basePath string
+
+	// In-memory index
+	index map[SnapshotID]*SnapshotMetadata
+
+	// Latest per provider:region
+	latest map[string]SnapshotID
+}
+
+// SnapshotMetadata is stored alongside each snapshot
+type SnapshotMetadata struct {
+	ID          SnapshotID `json:"id"`
+	ContentHash string     `json:"content_hash"`
+	CreatedAt   time.Time  `json:"created_at"`
+	EffectiveAt time.Time  `json:"effective_at"`
+	Provider    string     `json:"provider"`
+	Region      string     `json:"region"`
+	Version     int        `json:"version"`
+	Size        int64      `json:"size"`
+	FilePath    string     `json:"file_path"`
+}
+
+// NewImmutableSnapshotStore creates a new immutable store
+func NewImmutableSnapshotStore(basePath string) (*ImmutableSnapshotStore, error) {
+	if err := os.MkdirAll(basePath, 0755); err != nil {
+		return nil, fmt.Errorf("failed to create snapshot directory: %w", err)
+	}
+
+	store := &ImmutableSnapshotStore{
+		basePath: basePath,
+		index:    make(map[SnapshotID]*SnapshotMetadata),
+		latest:   make(map[string]SnapshotID),
+	}
+
+	// Load existing index
+	if err := store.loadIndex(); err != nil {
+		// Index doesn't exist yet - that's OK
+	}
+
+	return store, nil
+}
+
+// Store writes a snapshot - FAILS if already exists
+func (s *ImmutableSnapshotStore) Store(ctx context.Context, snapshot *PricingSnapshot) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// Check if already exists
+	if _, exists := s.index[snapshot.ID]; exists {
+		return ErrImmutabilityViolation
+	}
+
+	// Compute content hash
+	data, err := s.serialize(snapshot)
+	if err != nil {
+		return fmt.Errorf("failed to serialize snapshot: %w", err)
+	}
+
+	computedHash := sha256.Sum256(data)
+	hashStr := hex.EncodeToString(computedHash[:])
+
+	// Verify against snapshot's hash
+	if hashStr != snapshot.ContentHash.Hex() {
+		return ErrHashMismatch
+	}
+
+	// Write to file
+	filename := fmt.Sprintf("%s_%s.json", snapshot.ID, hashStr[:8])
+	filePath := filepath.Join(s.basePath, filename)
+
+	// Check file doesn't already exist (belt and suspenders)
+	if _, err := os.Stat(filePath); err == nil {
+		return ErrImmutabilityViolation
+	}
+
+	// Write file
+	if err := os.WriteFile(filePath, data, 0444); err != nil { // Read-only!
+		return fmt.Errorf("failed to write snapshot: %w", err)
+	}
+
+	// Update index
+	meta := &SnapshotMetadata{
+		ID:          snapshot.ID,
+		ContentHash: hashStr,
+		CreatedAt:   snapshot.CreatedAt,
+		EffectiveAt: snapshot.EffectiveAt,
+		Provider:    snapshot.Provider,
+		Region:      snapshot.Region,
+		Version:     1, // First version
+		Size:        int64(len(data)),
+		FilePath:    filePath,
+	}
+
+	s.index[snapshot.ID] = meta
+
+	// Update latest
+	key := snapshot.Provider + ":" + snapshot.Region
+	if current, ok := s.latest[key]; !ok {
+		s.latest[key] = snapshot.ID
+	} else {
+		// Only update if newer
+		if currentMeta := s.index[current]; currentMeta.CreatedAt.Before(snapshot.CreatedAt) {
+			s.latest[key] = snapshot.ID
+		}
+	}
+
+	// Persist index
+	return s.saveIndex()
+}
+
+// Get retrieves a snapshot by ID - verifies hash
+func (s *ImmutableSnapshotStore) Get(ctx context.Context, id SnapshotID) (*PricingSnapshot, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	meta, ok := s.index[id]
+	if !ok {
+		return nil, ErrNoSnapshot
+	}
+
+	// Read file
+	data, err := os.ReadFile(meta.FilePath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read snapshot: %w", err)
+	}
+
+	// Verify hash
+	computedHash := sha256.Sum256(data)
+	hashStr := hex.EncodeToString(computedHash[:])
+	if hashStr != meta.ContentHash {
+		return nil, ErrHashMismatch
+	}
+
+	// Deserialize
+	return s.deserialize(data)
+}
+
+// GetLatest retrieves the latest snapshot for provider/region
+func (s *ImmutableSnapshotStore) GetLatest(ctx context.Context, provider, region string) (*PricingSnapshot, error) {
+	s.mu.RLock()
+	key := provider + ":" + region
+	id, ok := s.latest[key]
+	s.mu.RUnlock()
+
+	if !ok {
+		return nil, ErrNoSnapshot
+	}
+
+	return s.Get(ctx, id)
+}
+
+// ListVersions returns all versions for a provider/region
+func (s *ImmutableSnapshotStore) ListVersions(provider, region string) []*SnapshotMetadata {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	var result []*SnapshotMetadata
+	for _, meta := range s.index {
+		if meta.Provider == provider && meta.Region == region {
+			result = append(result, meta)
+		}
+	}
+	return result
+}
+
+// VerifyIntegrity checks all stored snapshots
+func (s *ImmutableSnapshotStore) VerifyIntegrity() ([]string, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	var corrupted []string
+
+	for id, meta := range s.index {
+		data, err := os.ReadFile(meta.FilePath)
+		if err != nil {
+			corrupted = append(corrupted, fmt.Sprintf("%s: file missing", id))
+			continue
+		}
+
+		computedHash := sha256.Sum256(data)
+		hashStr := hex.EncodeToString(computedHash[:])
+		if hashStr != meta.ContentHash {
+			corrupted = append(corrupted, fmt.Sprintf("%s: hash mismatch", id))
+		}
+	}
+
+	return corrupted, nil
+}
+
+func (s *ImmutableSnapshotStore) serialize(snapshot *PricingSnapshot) ([]byte, error) {
+	// Create a serializable version
+	type serializableSnapshot struct {
+		ID          SnapshotID         `json:"id"`
+		ContentHash string             `json:"content_hash"`
+		CreatedAt   time.Time          `json:"created_at"`
+		EffectiveAt time.Time          `json:"effective_at"`
+		Provider    string             `json:"provider"`
+		Region      string             `json:"region"`
+		Rates       []RateEntry        `json:"rates"`
+		Coverage    SnapshotCoverage   `json:"coverage"`
+	}
+
+	ss := serializableSnapshot{
+		ID:          snapshot.ID,
+		ContentHash: snapshot.ContentHash.Hex(),
+		CreatedAt:   snapshot.CreatedAt,
+		EffectiveAt: snapshot.EffectiveAt,
+		Provider:    snapshot.Provider,
+		Region:      snapshot.Region,
+		Rates:       snapshot.Rates(),
+		Coverage:    snapshot.Coverage,
+	}
+
+	return json.MarshalIndent(ss, "", "  ")
+}
+
+func (s *ImmutableSnapshotStore) deserialize(data []byte) (*PricingSnapshot, error) {
+	type serializableSnapshot struct {
+		ID          SnapshotID         `json:"id"`
+		ContentHash string             `json:"content_hash"`
+		CreatedAt   time.Time          `json:"created_at"`
+		EffectiveAt time.Time          `json:"effective_at"`
+		Provider    string             `json:"provider"`
+		Region      string             `json:"region"`
+		Rates       []RateEntry        `json:"rates"`
+		Coverage    SnapshotCoverage   `json:"coverage"`
+	}
+
+	var ss serializableSnapshot
+	if err := json.Unmarshal(data, &ss); err != nil {
+		return nil, err
+	}
+
+	// Rebuild snapshot using builder
+	builder := NewSnapshotBuilder(ss.Provider, ss.Region).
+		WithEffectiveAt(ss.EffectiveAt)
+
+	for _, rate := range ss.Rates {
+		builder.AddRate(rate.Key, rate.Price, rate.Unit, rate.Currency)
+	}
+
+	snapshot := builder.Build()
+	return snapshot, nil
+}
+
+func (s *ImmutableSnapshotStore) loadIndex() error {
+	indexPath := filepath.Join(s.basePath, "index.json")
+	data, err := os.ReadFile(indexPath)
+	if err != nil {
+		return err
+	}
+
+	type indexFile struct {
+		Snapshots map[SnapshotID]*SnapshotMetadata `json:"snapshots"`
+		Latest    map[string]SnapshotID            `json:"latest"`
+	}
+
+	var idx indexFile
+	if err := json.Unmarshal(data, &idx); err != nil {
+		return err
+	}
+
+	s.index = idx.Snapshots
+	s.latest = idx.Latest
+	return nil
+}
+
+func (s *ImmutableSnapshotStore) saveIndex() error {
+	indexPath := filepath.Join(s.basePath, "index.json")
+
+	type indexFile struct {
+		Snapshots map[SnapshotID]*SnapshotMetadata `json:"snapshots"`
+		Latest    map[string]SnapshotID            `json:"latest"`
+		UpdatedAt time.Time                        `json:"updated_at"`
+	}
+
+	idx := indexFile{
+		Snapshots: s.index,
+		Latest:    s.latest,
+		UpdatedAt: time.Now().UTC(),
+	}
+
+	data, err := json.MarshalIndent(idx, "", "  ")
+	if err != nil {
+		return err
+	}
+
+	// Write atomically using temp file
+	tempPath := indexPath + ".tmp"
+	if err := os.WriteFile(tempPath, data, 0644); err != nil {
+		return err
+	}
+
+	return os.Rename(tempPath, indexPath)
 }
 
 ################################################################################
@@ -9885,6 +12906,280 @@ func (r *ScanResult) HasWarnings() bool {
 }
 
 ################################################################################
+# FILE: :\good projects\cost estimation\core\terraform\data_barrier.go
+# TYPE: go
+# SIZE: 8072 bytes
+################################################################################
+// Package terraform - Data source estimation barriers
+// Data sources create HARD uncertainty. They cannot be estimated deterministically.
+package terraform
+
+import (
+	"fmt"
+	"strings"
+
+	"terraform-cost/core/confidence"
+)
+
+// DataSourceBarrier enforces estimation rules for data sources
+type DataSourceBarrier struct {
+	// Data sources that are inherently unpriceable
+	unpriceable map[string]bool
+
+	// Attributes that when sourced from data, block pricing
+	blockingAttributes map[string][]string
+
+	// Confidence impacts per data source type
+	confidenceImpacts map[string]float64
+}
+
+// NewDataSourceBarrier creates a new barrier
+func NewDataSourceBarrier() *DataSourceBarrier {
+	return &DataSourceBarrier{
+		unpriceable: map[string]bool{
+			"aws_ami":                true, // Runtime lookup
+			"aws_availability_zones": true, // Runtime lookup
+			"aws_caller_identity":    true, // Runtime lookup
+			"aws_region":             true, // Runtime lookup
+			"aws_vpc":                true, // External resource
+			"aws_subnet":             true, // External resource
+			"aws_security_group":     true, // External resource
+			"aws_iam_role":           true, // External resource
+		},
+		blockingAttributes: map[string][]string{
+			"aws_instance": {"ami", "subnet_id"},
+			"aws_db_instance": {"db_subnet_group_name"},
+			"aws_lambda_function": {"role"},
+			"aws_ecs_service": {"cluster"},
+		},
+		confidenceImpacts: map[string]float64{
+			"aws_ami":                0.25, // AMI affects pricing
+			"aws_availability_zones": 0.10, // AZ is minor
+			"aws_caller_identity":    0.05, // No pricing impact
+			"aws_vpc":                0.15, // VPC affects networking
+			"aws_subnet":             0.15,
+			"aws_security_group":     0.05,
+			"aws_iam_role":           0.05,
+			"default":                0.20,
+		},
+	}
+}
+
+// DataSourceReference represents a reference to a data source
+type DataSourceReference struct {
+	DataType      string // e.g., "aws_ami"
+	DataName      string // e.g., "latest"
+	Attribute     string // e.g., "id"
+	FullReference string // e.g., "data.aws_ami.latest.id"
+}
+
+// ParseDataSourceReference parses a data source reference
+func ParseDataSourceReference(ref string) (*DataSourceReference, bool) {
+	if !strings.HasPrefix(ref, "data.") {
+		return nil, false
+	}
+
+	parts := strings.Split(ref, ".")
+	if len(parts) < 3 {
+		return nil, false
+	}
+
+	result := &DataSourceReference{
+		DataType:      parts[1],
+		DataName:      parts[2],
+		FullReference: ref,
+	}
+
+	if len(parts) >= 4 {
+		result.Attribute = strings.Join(parts[3:], ".")
+	}
+
+	return result, true
+}
+
+// CanEstimate checks if an attribute can be estimated when sourced from data
+func (b *DataSourceBarrier) CanEstimate(resourceType, attribute string, dataRef *DataSourceReference) EstimationDecision {
+	decision := EstimationDecision{
+		CanEstimate:      true,
+		ConfidenceImpact: 0,
+		Reason:           "",
+		Recommendations:  []string{},
+	}
+
+	// Check if data source is inherently unpriceable
+	if b.unpriceable[dataRef.DataType] {
+		decision.ConfidenceImpact = b.getConfidenceImpact(dataRef.DataType)
+		decision.Reason = fmt.Sprintf("data source %s is resolved at runtime", dataRef.DataType)
+		decision.Recommendations = append(decision.Recommendations,
+			fmt.Sprintf("Consider providing explicit value for %s.%s", resourceType, attribute))
+	}
+
+	// Check if this attribute blocks pricing when from data
+	blockingAttrs := b.blockingAttributes[resourceType]
+	for _, blocked := range blockingAttrs {
+		if blocked == attribute {
+			decision.CanEstimate = false
+			decision.ConfidenceImpact = 0.4 // Severe
+			decision.Reason = fmt.Sprintf("attribute %s cannot be estimated from data source", attribute)
+			decision.Recommendations = append(decision.Recommendations,
+				fmt.Sprintf("Provide explicit %s value or use usage override", attribute))
+			return decision
+		}
+	}
+
+	return decision
+}
+
+// EstimationDecision is the result of checking if estimation is possible
+type EstimationDecision struct {
+	CanEstimate      bool
+	ConfidenceImpact float64
+	Reason           string
+	Recommendations  []string
+}
+
+func (b *DataSourceBarrier) getConfidenceImpact(dataType string) float64 {
+	if impact, ok := b.confidenceImpacts[dataType]; ok {
+		return impact
+	}
+	return b.confidenceImpacts["default"]
+}
+
+// ApplyDataSourceImpacts applies confidence impacts for all data source references
+func (b *DataSourceBarrier) ApplyDataSourceImpacts(
+	tracker *confidence.ConfidenceTracker,
+	resourceType string,
+	attributes map[string]interface{},
+	dataRefs map[string]*DataSourceReference,
+) []EstimationDecision {
+	var decisions []EstimationDecision
+
+	for attrName, dataRef := range dataRefs {
+		decision := b.CanEstimate(resourceType, attrName, dataRef)
+		decisions = append(decisions, decision)
+
+		if !decision.CanEstimate {
+			tracker.Apply("data_source_barrier", decision.Reason)
+		} else if decision.ConfidenceImpact > 0 {
+			tracker.Apply("data_source_uncertainty", decision.Reason)
+		}
+	}
+
+	return decisions
+}
+
+// AttributeSourceAnalyzer analyzes where attribute values come from
+type AttributeSourceAnalyzer struct {
+	barrier *DataSourceBarrier
+}
+
+// NewAttributeSourceAnalyzer creates an analyzer
+func NewAttributeSourceAnalyzer() *AttributeSourceAnalyzer {
+	return &AttributeSourceAnalyzer{
+		barrier: NewDataSourceBarrier(),
+	}
+}
+
+// AttributeSource describes where an attribute value comes from
+type AttributeSource struct {
+	// Source type
+	Type AttributeSourceType
+
+	// Reference (if from data or resource)
+	Reference string
+
+	// Is this estimable?
+	IsEstimable bool
+
+	// Confidence impact
+	ConfidenceImpact float64
+
+	// Reason if not estimable
+	Reason string
+}
+
+// AttributeSourceType indicates the source of an attribute
+type AttributeSourceType int
+
+const (
+	SourceLiteral     AttributeSourceType = iota // Hardcoded value
+	SourceVariable                                // From variable
+	SourceLocal                                   // From local
+	SourceDataSource                              // From data source
+	SourceResource                                // From another resource
+	SourceUnknown                                 // Cannot determine
+)
+
+// String returns the source type name
+func (t AttributeSourceType) String() string {
+	switch t {
+	case SourceLiteral:
+		return "literal"
+	case SourceVariable:
+		return "variable"
+	case SourceLocal:
+		return "local"
+	case SourceDataSource:
+		return "data_source"
+	case SourceResource:
+		return "resource"
+	default:
+		return "unknown"
+	}
+}
+
+// AnalyzeAttribute determines the source of an attribute value
+func (a *AttributeSourceAnalyzer) AnalyzeAttribute(resourceType, attrName, expression string, references []string) AttributeSource {
+	source := AttributeSource{
+		Type:        SourceUnknown,
+		IsEstimable: true,
+	}
+
+	// No references = literal
+	if len(references) == 0 {
+		source.Type = SourceLiteral
+		return source
+	}
+
+	// Check first reference to determine type
+	ref := references[0]
+
+	if strings.HasPrefix(ref, "var.") {
+		source.Type = SourceVariable
+		source.Reference = ref
+		source.ConfidenceImpact = 0.1 // Variables are usually known
+		return source
+	}
+
+	if strings.HasPrefix(ref, "local.") {
+		source.Type = SourceLocal
+		source.Reference = ref
+		source.ConfidenceImpact = 0.05 // Locals are resolvable
+		return source
+	}
+
+	if strings.HasPrefix(ref, "data.") {
+		source.Type = SourceDataSource
+		source.Reference = ref
+
+		dataRef, _ := ParseDataSourceReference(ref)
+		if dataRef != nil {
+			decision := a.barrier.CanEstimate(resourceType, attrName, dataRef)
+			source.IsEstimable = decision.CanEstimate
+			source.ConfidenceImpact = decision.ConfidenceImpact
+			source.Reason = decision.Reason
+		}
+		return source
+	}
+
+	// Resource reference
+	source.Type = SourceResource
+	source.Reference = ref
+	source.ConfidenceImpact = 0.15 // Resource refs are runtime
+	return source
+}
+
+################################################################################
 # FILE: :\good projects\cost estimation\core\terraform\dependencies.go
 # TYPE: go
 # SIZE: 8737 bytes
@@ -10454,7 +13749,7 @@ func (e *DynamicBlockExpander) ExpandNested(
 ################################################################################
 # FILE: :\good projects\cost estimation\core\terraform\pipeline.go
 # TYPE: go
-# SIZE: 14732 bytes
+# SIZE: 14785 bytes
 ################################################################################
 // Package terraform provides a formal evaluation pipeline with strict phase separation.
 // Phases: PARSE â†’ EVALUATE â†’ RESOLVE â†’ EXPAND â†’ BUILD
@@ -10683,6 +13978,7 @@ type ProviderConfig struct {
 	Type   string
 	Alias  string
 	Region string
+	Module string              // Module where defined
 	Config map[string]any
 }
 
@@ -11254,6 +14550,551 @@ func (r *ProviderResolver) ExtractRegion(
 
 	// Fall back to provider default
 	return r.defaultRegions[inst.Provider.Type]
+}
+
+################################################################################
+# FILE: :\good projects\cost estimation\core\terraform\provider_binding.go
+# TYPE: go
+# SIZE: 8428 bytes
+################################################################################
+// Package terraform - Module provider binding resolution
+// Provider aliases MUST propagate correctly through module boundaries.
+package terraform
+
+import (
+	"fmt"
+	"strings"
+)
+
+// ModuleProviderBinding represents how providers are passed to modules
+type ModuleProviderBinding struct {
+	// Module path (e.g., "module.vpc.module.subnet")
+	ModulePath string
+
+	// Provider mappings from parent to child
+	// Key: local provider name in module (e.g., "aws")
+	// Value: parent provider reference (e.g., "aws.us_east")
+	Bindings map[string]string
+
+	// Explicit providers block in module call
+	ExplicitProviders map[string]string
+
+	// Inherited from parent (not explicitly set)
+	InheritedProviders map[string]string
+}
+
+// ModuleProviderResolver resolves provider bindings through module chains
+type ModuleProviderResolver struct {
+	// Root provider configs
+	rootProviders map[string]*ProviderConfig
+
+	// Per-module bindings
+	moduleBindings map[string]*ModuleProviderBinding
+
+	// Resolved cache
+	resolvedCache map[string]*ProviderContext
+}
+
+// NewModuleProviderResolver creates a resolver
+func NewModuleProviderResolver() *ModuleProviderResolver {
+	return &ModuleProviderResolver{
+		rootProviders:  make(map[string]*ProviderConfig),
+		moduleBindings: make(map[string]*ModuleProviderBinding),
+		resolvedCache:  make(map[string]*ProviderContext),
+	}
+}
+
+// RegisterRootProvider registers a provider at root level
+func (r *ModuleProviderResolver) RegisterRootProvider(config *ProviderConfig) {
+	key := config.Type
+	if config.Alias != "" {
+		key = config.Type + "." + config.Alias
+	}
+	r.rootProviders[key] = config
+}
+
+// RegisterModuleCall registers a module call with its provider mappings
+func (r *ModuleProviderResolver) RegisterModuleCall(parentPath, moduleName string, providers map[string]string) {
+	childPath := moduleName
+	if parentPath != "" {
+		childPath = parentPath + "." + moduleName
+	}
+
+	binding := &ModuleProviderBinding{
+		ModulePath:         childPath,
+		Bindings:           make(map[string]string),
+		ExplicitProviders:  providers,
+		InheritedProviders: make(map[string]string),
+	}
+
+	// Process explicit providers
+	for localName, parentRef := range providers {
+		binding.Bindings[localName] = parentRef
+	}
+
+	r.moduleBindings[childPath] = binding
+}
+
+// ResolveProvider resolves the exact provider config for a resource
+// Following Terraform's provider inheritance rules exactly
+func (r *ModuleProviderResolver) ResolveProvider(modulePath, resourceType, explicitProvider string) (*ProviderContext, error) {
+	// Cache key
+	cacheKey := fmt.Sprintf("%s::%s::%s", modulePath, resourceType, explicitProvider)
+	if cached, ok := r.resolvedCache[cacheKey]; ok {
+		return cached, nil
+	}
+
+	// Extract provider type from resource
+	providerType := extractProviderTypeFromResource(resourceType)
+
+	// Determine which provider reference to resolve
+	providerRef := providerType // default
+	if explicitProvider != "" {
+		providerRef = explicitProvider
+	}
+
+	// Resolve through module chain
+	ctx, err := r.resolveProviderThroughChain(modulePath, providerRef, providerType)
+	if err != nil {
+		return nil, err
+	}
+
+	r.resolvedCache[cacheKey] = ctx
+	return ctx, nil
+}
+
+// resolveProviderThroughChain walks the module chain to find the actual provider
+func (r *ModuleProviderResolver) resolveProviderThroughChain(modulePath, providerRef, providerType string) (*ProviderContext, error) {
+	// If at root, resolve directly
+	if modulePath == "" {
+		return r.resolveAtRoot(providerRef)
+	}
+
+	// Check if this module has explicit binding for this provider
+	binding := r.moduleBindings[modulePath]
+
+	// Extract just the provider name without alias for matching
+	baseProviderName := providerType
+	if idx := strings.Index(providerRef, "."); idx != -1 {
+		baseProviderName = providerRef[:idx]
+	}
+
+	if binding != nil {
+		// Check explicit providers first
+		if parentRef, ok := binding.ExplicitProviders[baseProviderName]; ok {
+			// This module maps this provider to a parent provider
+			// Recurse to parent to resolve the actual config
+			parentPath := getParentPath(modulePath)
+			resolved, err := r.resolveProviderThroughChain(parentPath, parentRef, providerType)
+			if err != nil {
+				return nil, err
+			}
+			// Mark as inherited
+			resolved.IsInherited = true
+			resolved.DefinedInModule = parentPath
+			return resolved, nil
+		}
+
+		// Check all bindings
+		if parentRef, ok := binding.Bindings[providerRef]; ok {
+			parentPath := getParentPath(modulePath)
+			resolved, err := r.resolveProviderThroughChain(parentPath, parentRef, providerType)
+			if err != nil {
+				return nil, err
+			}
+			resolved.IsInherited = true
+			return resolved, nil
+		}
+	}
+
+	// No explicit binding - inherit from parent
+	parentPath := getParentPath(modulePath)
+	resolved, err := r.resolveProviderThroughChain(parentPath, providerRef, providerType)
+	if err != nil {
+		return nil, err
+	}
+	resolved.IsInherited = true
+	return resolved, nil
+}
+
+// resolveAtRoot resolves a provider at the root module
+func (r *ModuleProviderResolver) resolveAtRoot(providerRef string) (*ProviderContext, error) {
+	// Look for exact match
+	if config, ok := r.rootProviders[providerRef]; ok {
+		return &ProviderContext{
+			ProviderType:    config.Type,
+			Alias:           config.Alias,
+			Region:          config.Region,
+			IsInherited:     false,
+			DefinedInModule: "",
+			FullAddress:     providerRef,
+			Config:          config.Config,
+		}, nil
+	}
+
+	// Try without alias (default provider)
+	providerType := providerRef
+	if idx := strings.Index(providerRef, "."); idx != -1 {
+		providerType = providerRef[:idx]
+	}
+
+	if config, ok := r.rootProviders[providerType]; ok {
+		return &ProviderContext{
+			ProviderType:    config.Type,
+			Alias:           config.Alias,
+			Region:          config.Region,
+			IsInherited:     false,
+			DefinedInModule: "",
+			FullAddress:     providerRef,
+			Config:          config.Config,
+		}, nil
+	}
+
+	// No provider found - return error, not a guess
+	return nil, &ProviderNotFoundError{
+		ProviderRef: providerRef,
+		ModulePath:  "",
+	}
+}
+
+// ProviderNotFoundError indicates a provider could not be resolved
+type ProviderNotFoundError struct {
+	ProviderRef string
+	ModulePath  string
+}
+
+func (e *ProviderNotFoundError) Error() string {
+	if e.ModulePath == "" {
+		return fmt.Sprintf("provider %q not found in root module", e.ProviderRef)
+	}
+	return fmt.Sprintf("provider %q not found for module %q", e.ProviderRef, e.ModulePath)
+}
+
+func extractProviderTypeFromResource(resourceType string) string {
+	if idx := strings.Index(resourceType, "_"); idx != -1 {
+		return resourceType[:idx]
+	}
+	return resourceType
+}
+
+func getParentPath(modulePath string) string {
+	if idx := strings.LastIndex(modulePath, "."); idx != -1 {
+		return modulePath[:idx]
+	}
+	return ""
+}
+
+// ProviderBindingValidator validates that all resources have valid provider bindings
+type ProviderBindingValidator struct {
+	resolver *ModuleProviderResolver
+	errors   []ProviderBindingError
+}
+
+// ProviderBindingError is a provider resolution error
+type ProviderBindingError struct {
+	ResourceAddress string
+	ModulePath      string
+	ProviderRef     string
+	Reason          string
+}
+
+// NewProviderBindingValidator creates a validator
+func NewProviderBindingValidator(resolver *ModuleProviderResolver) *ProviderBindingValidator {
+	return &ProviderBindingValidator{
+		resolver: resolver,
+		errors:   []ProviderBindingError{},
+	}
+}
+
+// Validate ensures all resources in a module have valid provider bindings
+func (v *ProviderBindingValidator) Validate(resources []ResourceWithProvider) []ProviderBindingError {
+	v.errors = []ProviderBindingError{}
+
+	for _, res := range resources {
+		_, err := v.resolver.ResolveProvider(res.ModulePath, res.ResourceType, res.ExplicitProvider)
+		if err != nil {
+			v.errors = append(v.errors, ProviderBindingError{
+				ResourceAddress: res.Address,
+				ModulePath:      res.ModulePath,
+				ProviderRef:     res.ExplicitProvider,
+				Reason:          err.Error(),
+			})
+		}
+	}
+
+	return v.errors
+}
+
+// ResourceWithProvider is a resource that needs provider resolution
+type ResourceWithProvider struct {
+	Address          string
+	ModulePath       string
+	ResourceType     string
+	ExplicitProvider string
+}
+
+################################################################################
+# FILE: :\good projects\cost estimation\core\terraform\provider_context.go
+# TYPE: go
+# SIZE: 7293 bytes
+################################################################################
+// Package terraform - Provider context propagation
+// Each instance MUST know exactly which provider config applies.
+package terraform
+
+import (
+	"fmt"
+	"strings"
+
+	"terraform-cost/core/types"
+)
+
+// ProviderContext represents the resolved provider configuration for a resource
+type ProviderContext struct {
+	// Provider type (aws, google, azurerm)
+	ProviderType string
+
+	// Alias (empty for default)
+	Alias string
+
+	// Resolved region
+	Region string
+
+	// Is this inherited from module?
+	IsInherited bool
+
+	// Module path where this was defined
+	DefinedInModule string
+
+	// Full provider address
+	FullAddress string
+
+	// Additional configuration
+	Config map[string]interface{}
+}
+
+// ProviderKey returns a unique key for this provider
+func (p *ProviderContext) ProviderKey() string {
+	if p.Alias == "" {
+		return p.ProviderType
+	}
+	return p.ProviderType + "." + p.Alias
+}
+
+// ProviderRegistry tracks all provider configurations
+type ProviderRegistry struct {
+	// Provider configs by module path + alias
+	configs map[string]*ProviderConfig
+
+	// Default providers per type
+	defaults map[string]*ProviderConfig
+
+	// Module provider mappings (providers = { aws = aws.west })
+	moduleMappings map[string]map[string]string
+}
+
+// ProviderConfig is defined in pipeline.go - using that definition
+
+// NewProviderRegistry creates a new registry
+func NewProviderRegistry() *ProviderRegistry {
+	return &ProviderRegistry{
+		configs:        make(map[string]*ProviderConfig),
+		defaults:       make(map[string]*ProviderConfig),
+		moduleMappings: make(map[string]map[string]string),
+	}
+}
+
+// RegisterProvider registers a provider configuration
+func (r *ProviderRegistry) RegisterProvider(modulePath string, config *ProviderConfig) {
+	key := r.makeKey(modulePath, config.Type, config.Alias)
+	r.configs[key] = config
+
+	// Track default if no alias
+	if config.Alias == "" {
+		defaultKey := r.makeKey(modulePath, config.Type, "")
+		r.defaults[defaultKey] = config
+	}
+}
+
+// RegisterModuleMapping registers a module's provider mapping
+func (r *ProviderRegistry) RegisterModuleMapping(modulePath string, mappings map[string]string) {
+	r.moduleMappings[modulePath] = mappings
+}
+
+// ResolveForResource resolves the provider context for a resource
+func (r *ProviderRegistry) ResolveForResource(modulePath, resourceType, providerAttr string) *ProviderContext {
+	// Determine provider type from resource type
+	providerType := r.extractProviderType(resourceType)
+
+	// Check if resource has explicit provider attribute
+	if providerAttr != "" {
+		return r.resolveExplicitProvider(modulePath, providerAttr)
+	}
+
+	// Check module mappings
+	if mapping, ok := r.moduleMappings[modulePath]; ok {
+		if mapped, exists := mapping[providerType]; exists {
+			return r.resolveExplicitProvider(modulePath, mapped)
+		}
+	}
+
+	// Look for default provider in current module chain
+	return r.resolveDefaultProvider(modulePath, providerType)
+}
+
+func (r *ProviderRegistry) resolveExplicitProvider(modulePath, providerRef string) *ProviderContext {
+	// Parse provider reference (e.g., "aws.west")
+	parts := strings.SplitN(providerRef, ".", 2)
+	providerType := parts[0]
+	alias := ""
+	if len(parts) > 1 {
+		alias = parts[1]
+	}
+
+	// Search from current module up to root
+	currentPath := modulePath
+	for {
+		key := r.makeKey(currentPath, providerType, alias)
+		if config, ok := r.configs[key]; ok {
+			return &ProviderContext{
+				ProviderType:    providerType,
+				Alias:           alias,
+				Region:          config.Region,
+				IsInherited:     currentPath != modulePath,
+				DefinedInModule: currentPath,
+				FullAddress:     providerRef,
+				Config:          config.Config,
+			}
+		}
+
+		// Move up one module level
+		if currentPath == "" {
+			break
+		}
+		lastDot := strings.LastIndex(currentPath, ".")
+		if lastDot == -1 {
+			currentPath = ""
+		} else {
+			currentPath = currentPath[:lastDot]
+		}
+	}
+
+	// Provider not found - return unknown context
+	return &ProviderContext{
+		ProviderType: providerType,
+		Alias:        alias,
+		Region:       "", // UNKNOWN - will need to be resolved or flagged
+		FullAddress:  providerRef,
+	}
+}
+
+func (r *ProviderRegistry) resolveDefaultProvider(modulePath, providerType string) *ProviderContext {
+	// Search from current module up to root for default provider
+	currentPath := modulePath
+	for {
+		key := r.makeKey(currentPath, providerType, "")
+		if config, ok := r.defaults[key]; ok {
+			return &ProviderContext{
+				ProviderType:    providerType,
+				Alias:           "",
+				Region:          config.Region,
+				IsInherited:     currentPath != modulePath,
+				DefinedInModule: currentPath,
+				FullAddress:     providerType,
+				Config:          config.Config,
+			}
+		}
+
+		// Move up one module level
+		if currentPath == "" {
+			break
+		}
+		lastDot := strings.LastIndex(currentPath, ".")
+		if lastDot == -1 {
+			currentPath = ""
+		} else {
+			currentPath = currentPath[:lastDot]
+		}
+	}
+
+	// No provider found - use defaults
+	return r.createDefaultContext(providerType)
+}
+
+func (r *ProviderRegistry) createDefaultContext(providerType string) *ProviderContext {
+	// Default regions per provider
+	defaultRegions := map[string]string{
+		"aws":      "us-east-1",
+		"google":   "us-central1",
+		"azurerm":  "eastus",
+	}
+
+	region := defaultRegions[providerType]
+	if region == "" {
+		region = "unknown"
+	}
+
+	return &ProviderContext{
+		ProviderType: providerType,
+		Alias:        "",
+		Region:       region,
+		IsInherited:  false,
+		FullAddress:  providerType,
+	}
+}
+
+func (r *ProviderRegistry) extractProviderType(resourceType string) string {
+	// aws_instance -> aws
+	// google_compute_instance -> google
+	// azurerm_virtual_machine -> azurerm
+	idx := strings.Index(resourceType, "_")
+	if idx == -1 {
+		return resourceType
+	}
+	return resourceType[:idx]
+}
+
+func (r *ProviderRegistry) makeKey(modulePath, providerType, alias string) string {
+	if alias != "" {
+		return fmt.Sprintf("%s::%s.%s", modulePath, providerType, alias)
+	}
+	return fmt.Sprintf("%s::%s", modulePath, providerType)
+}
+
+// InstanceWithProvider binds an instance to its provider context
+type InstanceWithProvider struct {
+	InstanceAddress string
+	InstanceKey     interface{}
+	ProviderCtx     *ProviderContext // Resolved provider context
+
+	// For cost estimation
+	PricingRegion   types.Region   // Region for pricing lookups
+	PricingProvider types.Provider // Provider for pricing lookups
+}
+
+// ResolveRegionForPricing returns the region to use for pricing lookups
+func (i *InstanceWithProvider) ResolveRegionForPricing() types.Region {
+	if i.ProviderCtx == nil || i.ProviderCtx.Region == "" {
+		return types.Region("us-east-1") // Fallback
+	}
+	return types.Region(i.ProviderCtx.Region)
+}
+
+// GetPricingProvider returns the provider for pricing lookups
+func (i *InstanceWithProvider) GetPricingProvider() types.Provider {
+	if i.ProviderCtx == nil {
+		return types.ProviderUnknown
+	}
+	switch i.ProviderCtx.ProviderType {
+	case "aws":
+		return types.ProviderAWS
+	case "google":
+		return types.ProviderGCP
+	case "azurerm":
+		return types.ProviderAzure
+	default:
+		return types.ProviderUnknown
+	}
 }
 
 ################################################################################
@@ -12933,7 +16774,7 @@ const (
 ################################################################################
 # FILE: :\good projects\cost estimation\core\types\types.go
 # TYPE: go
-# SIZE: 2887 bytes
+# SIZE: 3456 bytes
 ################################################################################
 // Package types defines core domain types shared across all layers.
 // This package contains NO business logic - only type definitions.
@@ -12976,11 +16817,20 @@ func (r ResourceAddress) String() string {
 }
 
 // Attribute represents a resource attribute value
+// CRITICAL: Attribute may be UNEVALUATED if it depends on context
 type Attribute struct {
 	Value       interface{} `json:"value"`
 	IsComputed  bool        `json:"is_computed"`
 	IsSensitive bool        `json:"is_sensitive"`
-	Type        string      `json:"type,omitempty"`
+	IsUnknown   bool        `json:"is_unknown"` // True if value cannot be determined
+
+	// Expression tracking for deferred evaluation
+	Expression       string   `json:"expression,omitempty"`        // Source expression
+	ExpressionType   string   `json:"expression_type,omitempty"`   // "literal", "variable", "local", etc
+	References       []string `json:"references,omitempty"`        // Referenced addresses
+	ConfidenceImpact float64  `json:"confidence_impact,omitempty"` // 0.0-1.0 impact on confidence
+
+	Type string `json:"type,omitempty"`
 }
 
 // Attributes is a map of attribute names to values
@@ -13267,6 +17117,231 @@ const (
 )
 
 ################################################################################
+# FILE: :\good projects\cost estimation\core\usage\assumptions.go
+# TYPE: go
+# SIZE: 6400 bytes
+################################################################################
+// Package usage - Tracked assumptions
+// Every default MUST be recorded as an assumption and reduce confidence.
+package usage
+
+import (
+	"fmt"
+	"terraform-cost/core/confidence"
+)
+
+// Assumption represents a usage assumption made during estimation
+type Assumption struct {
+	// What was assumed
+	Component string
+	Attribute string
+
+	// What value was used
+	Value     interface{}
+	Unit      string
+
+	// Why this was assumed
+	Source    AssumptionSource
+	Reason    string
+
+	// Confidence impact
+	ConfidenceImpact float64
+
+	// Is this overrideable?
+	Overrideable     bool
+	OverrideKey      string // Key to use in usage file
+}
+
+// AssumptionSource indicates where the assumption came from
+type AssumptionSource int
+
+const (
+	AssumptionFromDefault    AssumptionSource = iota // Hardcoded default
+	AssumptionFromHeuristic                           // Calculated from other attributes
+	AssumptionFromProfile                             // Usage profile
+	AssumptionFromHistorical                          // Historical data
+)
+
+// String returns the source name
+func (s AssumptionSource) String() string {
+	switch s {
+	case AssumptionFromDefault:
+		return "default"
+	case AssumptionFromHeuristic:
+		return "heuristic"
+	case AssumptionFromProfile:
+		return "profile"
+	case AssumptionFromHistorical:
+		return "historical"
+	default:
+		return "unknown"
+	}
+}
+
+// AssumptionTracker tracks all assumptions made during estimation
+type AssumptionTracker struct {
+	assumptions []*Assumption
+	byComponent map[string][]*Assumption
+}
+
+// NewAssumptionTracker creates a new tracker
+func NewAssumptionTracker() *AssumptionTracker {
+	return &AssumptionTracker{
+		assumptions: []*Assumption{},
+		byComponent: make(map[string][]*Assumption),
+	}
+}
+
+// RecordDefault records a default value assumption
+// This ALWAYS reduces confidence
+func (t *AssumptionTracker) RecordDefault(component, attribute string, value interface{}, unit string, impact float64) *Assumption {
+	a := &Assumption{
+		Component:        component,
+		Attribute:        attribute,
+		Value:            value,
+		Unit:             unit,
+		Source:           AssumptionFromDefault,
+		Reason:           "using default value",
+		ConfidenceImpact: impact,
+		Overrideable:     true,
+		OverrideKey:      fmt.Sprintf("%s.%s", component, attribute),
+	}
+
+	t.assumptions = append(t.assumptions, a)
+	t.byComponent[component] = append(t.byComponent[component], a)
+	return a
+}
+
+// RecordHeuristic records a heuristic-based assumption
+func (t *AssumptionTracker) RecordHeuristic(component, attribute string, value interface{}, unit, reason string, impact float64) *Assumption {
+	a := &Assumption{
+		Component:        component,
+		Attribute:        attribute,
+		Value:            value,
+		Unit:             unit,
+		Source:           AssumptionFromHeuristic,
+		Reason:           reason,
+		ConfidenceImpact: impact,
+		Overrideable:     true,
+		OverrideKey:      fmt.Sprintf("%s.%s", component, attribute),
+	}
+
+	t.assumptions = append(t.assumptions, a)
+	t.byComponent[component] = append(t.byComponent[component], a)
+	return a
+}
+
+// All returns all assumptions
+func (t *AssumptionTracker) All() []*Assumption {
+	return t.assumptions
+}
+
+// ForComponent returns assumptions for a component
+func (t *AssumptionTracker) ForComponent(component string) []*Assumption {
+	return t.byComponent[component]
+}
+
+// TotalConfidenceImpact returns the total confidence impact
+func (t *AssumptionTracker) TotalConfidenceImpact() float64 {
+	total := 0.0
+	for _, a := range t.assumptions {
+		total += a.ConfidenceImpact
+	}
+	return total
+}
+
+// ApplyToTracker applies all assumptions to a confidence tracker
+func (t *AssumptionTracker) ApplyToTracker(ct *confidence.ConfidenceTracker) {
+	for _, a := range t.assumptions {
+		ct.Apply("default_usage", fmt.Sprintf("%s: %v %s", a.OverrideKey, a.Value, a.Unit))
+	}
+}
+
+// Count returns the number of assumptions
+func (t *AssumptionTracker) Count() int {
+	return len(t.assumptions)
+}
+
+// DefaultAssumptionImpacts defines standard confidence impacts
+var DefaultAssumptionImpacts = map[string]float64{
+	// Compute
+	"lambda.memory_size":         0.05,
+	"lambda.invocations":         0.20, // High impact - very variable
+	"lambda.duration":            0.15,
+	"ec2.cpu_utilization":        0.10,
+	"ec2.data_transfer_gb":       0.20,
+	"ecs.desired_count":          0.10,
+	
+	// Storage
+	"s3.storage_gb":              0.25, // High impact - very variable
+	"s3.requests":                0.20,
+	"ebs.iops":                   0.10,
+	"rds.storage_gb":             0.15,
+	
+	// Network
+	"nat.data_processed_gb":      0.25, // High impact
+	"lb.processed_bytes":         0.20,
+	"data_transfer.egress_gb":    0.25,
+	
+	// Cache
+	"elasticache.data_tiering":   0.05,
+	
+	// Default for unknown
+	"default":                    0.15,
+}
+
+// GetDefaultImpact returns the standard impact for an assumption
+func GetDefaultImpact(key string) float64 {
+	if impact, ok := DefaultAssumptionImpacts[key]; ok {
+		return impact
+	}
+	return DefaultAssumptionImpacts["default"]
+}
+
+// CommonDefaults defines common default values
+var CommonDefaults = map[string]interface{}{
+	// Lambda
+	"aws_lambda_function.memory_size":  128,
+	"aws_lambda_function.timeout":      3,
+	"aws_lambda_function.invocations":  1000000, // 1M/month
+	"aws_lambda_function.duration_ms":  100,
+
+	// EC2
+	"aws_instance.cpu_utilization":     50.0,  // %
+	"aws_instance.data_transfer_gb":    100.0, // GB/month
+
+	// ECS
+	"aws_ecs_service.desired_count":    1,
+	"aws_ecs_task.cpu_utilization":     50.0,
+
+	// S3
+	"aws_s3_bucket.storage_gb":         100.0, // GB
+	"aws_s3_bucket.put_requests":       10000,
+	"aws_s3_bucket.get_requests":       100000,
+
+	// RDS
+	"aws_db_instance.storage_gb":       20.0,
+	"aws_db_instance.iops":             1000,
+
+	// NAT
+	"aws_nat_gateway.data_processed_gb": 100.0,
+
+	// ALB
+	"aws_lb.processed_bytes":           1000000000, // 1 GB
+	"aws_lb.new_connections":           1000,
+	"aws_lb.active_connections":        100,
+}
+
+// GetDefault returns a default value for a resource attribute
+func GetDefault(resourceType, attribute string) (interface{}, bool) {
+	key := resourceType + "." + attribute
+	if val, ok := CommonDefaults[key]; ok {
+		return val, true
+	}
+	return nil, false
+}
+
+################################################################################
 # FILE: :\good projects\cost estimation\core\usage\estimator.go
 # TYPE: go
 # SIZE: 2653 bytes
@@ -13441,6 +17516,408 @@ func RegisterEstimator(estimator Estimator) error {
 // GetDefaultEstimatorRegistry returns the default registry
 func GetDefaultEstimatorRegistry() *DefaultEstimatorRegistry {
 	return defaultEstimatorRegistry
+}
+
+################################################################################
+# FILE: :\good projects\cost estimation\core\usage\strict_defaults.go
+# TYPE: go
+# SIZE: 11167 bytes
+################################################################################
+// Package usage - Strict default enforcement
+// Defaults MUST bias toward over-estimation, not under-estimation.
+// Every default MUST make users uncomfortable if they don't override.
+package usage
+
+import (
+	"fmt"
+	"terraform-cost/core/confidence"
+	"terraform-cost/core/determinism"
+)
+
+// StrictDefaultPolicy enforces that all defaults are visible and conservative
+type StrictDefaultPolicy struct {
+	// Defaults that are known to bias low
+	lowBiasDefaults map[string]DefaultRisk
+
+	// Minimum confidence impacts per category
+	minImpacts map[string]float64
+}
+
+// DefaultRisk describes the risk of a default value
+type DefaultRisk struct {
+	DefaultValue     interface{}
+	RiskLevel        RiskLevel
+	ProductionTypical interface{} // What production usually sees
+	ConfidenceImpact float64
+	Warning          string
+}
+
+// RiskLevel indicates how risky a default is
+type RiskLevel int
+
+const (
+	RiskLow    RiskLevel = iota // Default is conservative
+	RiskMedium                   // Default may underestimate
+	RiskHigh                     // Default likely underestimates
+	RiskCritical                 // Default almost certainly underestimates
+)
+
+// String returns the risk level name
+func (r RiskLevel) String() string {
+	switch r {
+	case RiskLow:
+		return "low"
+	case RiskMedium:
+		return "medium"
+	case RiskHigh:
+		return "high"
+	case RiskCritical:
+		return "critical"
+	default:
+		return "unknown"
+	}
+}
+
+// NewStrictDefaultPolicy creates a strict policy
+func NewStrictDefaultPolicy() *StrictDefaultPolicy {
+	return &StrictDefaultPolicy{
+		lowBiasDefaults: map[string]DefaultRisk{
+			// Lambda - invocations are typically MUCH higher
+			"aws_lambda_function.invocations": {
+				DefaultValue:     1000000,            // 1M
+				RiskLevel:        RiskCritical,
+				ProductionTypical: 100000000,          // 100M
+				ConfidenceImpact: 0.35,
+				Warning:          "Lambda invocations default (1M) is typically 100x lower than production",
+			},
+			"aws_lambda_function.duration_ms": {
+				DefaultValue:     100,
+				RiskLevel:        RiskHigh,
+				ProductionTypical: 500,
+				ConfidenceImpact: 0.25,
+				Warning:          "Lambda duration default (100ms) may underestimate cold starts",
+			},
+
+			// S3 - storage grows rapidly
+			"aws_s3_bucket.storage_gb": {
+				DefaultValue:     100,
+				RiskLevel:        RiskCritical,
+				ProductionTypical: 10000,             // 10TB
+				ConfidenceImpact: 0.40,
+				Warning:          "S3 storage default (100GB) is typically 100x lower than production",
+			},
+			"aws_s3_bucket.put_requests": {
+				DefaultValue:     10000,
+				RiskLevel:        RiskHigh,
+				ProductionTypical: 10000000,
+				ConfidenceImpact: 0.30,
+				Warning:          "S3 PUT requests often 1000x higher in production",
+			},
+
+			// NAT Gateway - data transfer is expensive
+			"aws_nat_gateway.data_processed_gb": {
+				DefaultValue:     100,
+				RiskLevel:        RiskCritical,
+				ProductionTypical: 5000,
+				ConfidenceImpact: 0.40,
+				Warning:          "NAT data default (100GB) is typically 50x lower - this is expensive",
+			},
+
+			// Data transfer - egress is expensive
+			"data_transfer.egress_gb": {
+				DefaultValue:     100,
+				RiskLevel:        RiskCritical,
+				ProductionTypical: 10000,
+				ConfidenceImpact: 0.45,
+				Warning:          "Egress default (100GB) is typically 100x lower in production",
+			},
+
+			// EC2 hours - assume full month
+			"aws_instance.monthly_hours": {
+				DefaultValue:     730,
+				RiskLevel:        RiskLow, // This is actually correct
+				ProductionTypical: 730,
+				ConfidenceImpact: 0.05,
+				Warning:          "",
+			},
+
+			// RDS storage
+			"aws_db_instance.storage_gb": {
+				DefaultValue:     20,
+				RiskLevel:        RiskHigh,
+				ProductionTypical: 500,
+				ConfidenceImpact: 0.30,
+				Warning:          "RDS storage default (20GB) is typically 25x lower",
+			},
+
+			// ECS
+			"aws_ecs_service.desired_count": {
+				DefaultValue:     1,
+				RiskLevel:        RiskHigh,
+				ProductionTypical: 5,
+				ConfidenceImpact: 0.25,
+				Warning:          "ECS desired_count default (1) is typically 5x lower",
+			},
+		},
+		minImpacts: map[string]float64{
+			"storage":       0.25,
+			"compute":       0.15,
+			"network":       0.30,
+			"data_transfer": 0.35,
+			"requests":      0.25,
+		},
+	}
+}
+
+// ValidateDefault checks if a default is acceptable and returns warnings
+func (p *StrictDefaultPolicy) ValidateDefault(resourceType, attribute string, value interface{}) *DefaultValidation {
+	key := resourceType + "." + attribute
+	
+	validation := &DefaultValidation{
+		Key:      key,
+		Value:    value,
+		Acceptable: true,
+		Warnings:   []string{},
+	}
+
+	if risk, ok := p.lowBiasDefaults[key]; ok {
+		validation.Risk = risk.RiskLevel
+		validation.ConfidenceImpact = risk.ConfidenceImpact
+		
+		if risk.Warning != "" {
+			validation.Warnings = append(validation.Warnings, risk.Warning)
+		}
+
+		if risk.RiskLevel >= RiskHigh {
+			validation.Acceptable = false
+			validation.Warnings = append(validation.Warnings, 
+				fmt.Sprintf("Consider using production-typical value: %v", risk.ProductionTypical))
+		}
+	}
+
+	return validation
+}
+
+// DefaultValidation is the result of validating a default
+type DefaultValidation struct {
+	Key              string
+	Value            interface{}
+	Acceptable       bool
+	Risk             RiskLevel
+	ConfidenceImpact float64
+	Warnings         []string
+}
+
+// ApplyToTracker applies the default's confidence impact
+func (v *DefaultValidation) ApplyToTracker(tracker *confidence.ConfidenceTracker) {
+	if v.ConfidenceImpact > 0 {
+		tracker.Apply("usage_default", fmt.Sprintf("%s uses default value", v.Key))
+	}
+}
+
+// StrictUsageResolver resolves usage with explicit tracking
+type StrictUsageResolver struct {
+	policy     *StrictDefaultPolicy
+	tracker    *AssumptionTracker
+	confidence *confidence.ConfidenceTracker
+	warnings   []UsageWarning
+}
+
+// UsageWarning is a warning about usage estimation
+type UsageWarning struct {
+	ResourceType string
+	Attribute    string
+	Value        interface{}
+	Risk         RiskLevel
+	Message      string
+}
+
+// NewStrictUsageResolver creates a resolver
+func NewStrictUsageResolver() *StrictUsageResolver {
+	return &StrictUsageResolver{
+		policy:     NewStrictDefaultPolicy(),
+		tracker:    NewAssumptionTracker(),
+		confidence: confidence.NewConfidenceTracker(),
+		warnings:   []UsageWarning{},
+	}
+}
+
+// ResolveUsage resolves a usage value, either from overrides or defaults
+func (r *StrictUsageResolver) ResolveUsage(
+	resourceType, attribute string,
+	override interface{},
+	defaultValue interface{},
+) *ResolvedUsage {
+	
+	result := &ResolvedUsage{
+		Attribute: attribute,
+	}
+
+	// If override provided, use it
+	if override != nil {
+		result.Value = override
+		result.Source = UsageSourceOverride
+		result.Confidence = 1.0
+		return result
+	}
+
+	// Using default - validate it
+	validation := r.policy.ValidateDefault(resourceType, attribute, defaultValue)
+	
+	result.Value = defaultValue
+	result.Source = UsageSourceDefault
+	result.Confidence = 1.0 - validation.ConfidenceImpact
+	result.Risk = validation.Risk
+	result.Warnings = validation.Warnings
+
+	// Track the assumption
+	r.tracker.RecordDefault(
+		resourceType,
+		attribute,
+		defaultValue,
+		"",
+		validation.ConfidenceImpact,
+	)
+
+	// Record warning if high risk
+	if validation.Risk >= RiskHigh {
+		r.warnings = append(r.warnings, UsageWarning{
+			ResourceType: resourceType,
+			Attribute:    attribute,
+			Value:        defaultValue,
+			Risk:         validation.Risk,
+			Message:      validation.Warnings[0],
+		})
+	}
+
+	return result
+}
+
+// ResolvedUsage is a resolved usage value
+type ResolvedUsage struct {
+	Attribute  string
+	Value      interface{}
+	Source     UsageSource
+	Confidence float64
+	Risk       RiskLevel
+	Warnings   []string
+}
+
+// UsageSource indicates where usage came from
+type UsageSource int
+
+const (
+	UsageSourceOverride   UsageSource = iota // User provided
+	UsageSourceDefault                        // Using default
+	UsageSourceHistorical                     // From historical data
+	UsageSourceInferred                       // Inferred from config
+)
+
+// AsFloat returns the value as float64
+func (u *ResolvedUsage) AsFloat() float64 {
+	switch v := u.Value.(type) {
+	case float64:
+		return v
+	case int:
+		return float64(v)
+	case int64:
+		return float64(v)
+	default:
+		return 0
+	}
+}
+
+// GetWarnings returns all warnings from resolution
+func (r *StrictUsageResolver) GetWarnings() []UsageWarning {
+	return r.warnings
+}
+
+// GetAssumptions returns all assumptions made
+func (r *StrictUsageResolver) GetAssumptions() []*Assumption {
+	return r.tracker.All()
+}
+
+// GetConfidenceTracker returns the confidence tracker
+func (r *StrictUsageResolver) GetConfidenceTracker() *confidence.ConfidenceTracker {
+	return r.confidence
+}
+
+// FormatWarnings returns human-readable warnings
+func (r *StrictUsageResolver) FormatWarnings() string {
+	if len(r.warnings) == 0 {
+		return "No usage warnings"
+	}
+
+	result := fmt.Sprintf("âš ï¸ %d Usage Warnings:\n", len(r.warnings))
+	for i, w := range r.warnings {
+		result += fmt.Sprintf("  %d. [%s] %s.%s = %v\n", 
+			i+1, w.Risk.String(), w.ResourceType, w.Attribute, w.Value)
+		result += fmt.Sprintf("     %s\n", w.Message)
+	}
+	return result
+}
+
+// CalculateTotalRisk returns aggregate risk information
+func (r *StrictUsageResolver) CalculateTotalRisk() *AggregateRisk {
+	risk := &AggregateRisk{}
+
+	for _, w := range r.warnings {
+		switch w.Risk {
+		case RiskCritical:
+			risk.CriticalCount++
+		case RiskHigh:
+			risk.HighCount++
+		case RiskMedium:
+			risk.MediumCount++
+		}
+	}
+
+	risk.ConfidenceLoss = r.tracker.TotalConfidenceImpact()
+	risk.EstimatedBias = r.estimateBias()
+
+	return risk
+}
+
+func (r *StrictUsageResolver) estimateBias() determinism.Money {
+	// Rough estimate of how much we might be underestimating
+	// This is a heuristic based on typical production vs default ratios
+	biasMultiplier := 1.0
+	for _, w := range r.warnings {
+		switch w.Risk {
+		case RiskCritical:
+			biasMultiplier *= 2.0
+		case RiskHigh:
+			biasMultiplier *= 1.5
+		case RiskMedium:
+			biasMultiplier *= 1.2
+		}
+	}
+	// Return estimate that we might be X% low
+	// This is informational only
+	return determinism.Zero("USD")
+}
+
+// AggregateRisk summarizes overall usage risk
+type AggregateRisk struct {
+	CriticalCount  int
+	HighCount      int
+	MediumCount    int
+	ConfidenceLoss float64
+	EstimatedBias  determinism.Money
+}
+
+// IsAcceptable returns true if risk is acceptable for production
+func (r *AggregateRisk) IsAcceptable() bool {
+	return r.CriticalCount == 0 && r.HighCount <= 2
+}
+
+// Summary returns a summary string
+func (r *AggregateRisk) Summary() string {
+	if r.CriticalCount == 0 && r.HighCount == 0 {
+		return "Usage defaults are acceptable"
+	}
+	return fmt.Sprintf("âš ï¸ %d critical, %d high risk defaults - estimate may be significantly low",
+		r.CriticalCount, r.HighCount)
 }
 
 ################################################################################
@@ -14049,6 +18526,77 @@ func init() {
 }
 
 ################################################################################
+# FILE: :\good projects\cost estimation\testdata\terraform\bad_configs\circular_dependency.tf
+# TYPE: hcl
+# SIZE: 606 bytes
+################################################################################
+# Bad Config: Circular dependency
+
+resource "aws_security_group" "circular_a" {
+  name   = "circular-a"
+  vpc_id = "vpc-12345678"
+
+  ingress {
+    from_port       = 80
+    to_port         = 80
+    protocol        = "tcp"
+    security_groups = [aws_security_group.circular_b.id]
+  }
+}
+
+resource "aws_security_group" "circular_b" {
+  name   = "circular-b"
+  vpc_id = "vpc-12345678"
+
+  ingress {
+    from_port       = 443
+    to_port         = 443
+    protocol        = "tcp"
+    security_groups = [aws_security_group.circular_a.id]
+  }
+}
+
+# This will cause a Terraform cycle error
+
+################################################################################
+# FILE: :\good projects\cost estimation\testdata\terraform\bad_configs\duplicate_resource.tf
+# TYPE: hcl
+# SIZE: 316 bytes
+################################################################################
+# Bad Config: Duplicate resource name
+
+resource "aws_instance" "duplicate" {
+  ami           = "ami-12345678"
+  instance_type = "t3.micro"
+}
+
+# This would be a Terraform error - duplicate resource name
+resource "aws_instance" "duplicate" {
+  ami           = "ami-87654321"
+  instance_type = "t3.small"
+}
+
+################################################################################
+# FILE: :\good projects\cost estimation\testdata\terraform\bad_configs\invalid_for_each.tf
+# TYPE: hcl
+# SIZE: 341 bytes
+################################################################################
+# Bad Config: Invalid for_each (not map or set)
+
+variable "instance_count" {
+  type    = number
+  default = 3
+}
+
+# for_each requires map or set, not number
+resource "aws_instance" "invalid_for_each" {
+  for_each = var.instance_count # ERROR: number is not valid
+
+  ami           = "ami-12345678"
+  instance_type = "t3.micro"
+}
+
+################################################################################
 # FILE: :\good projects\cost estimation\testdata\terraform\bad_configs\missing_required.tf
 # TYPE: hcl
 # SIZE: 156 bytes
@@ -14074,6 +18622,225 @@ resource "aws_instance" "broken" {
   tags = {
     Name = "broken"
   # Missing closing brace
+}
+
+################################################################################
+# FILE: :\good projects\cost estimation\testdata\terraform\bad_configs\type_mismatch.tf
+# TYPE: hcl
+# SIZE: 548 bytes
+################################################################################
+# Bad Config: Type mismatch
+
+variable "count_value" {
+  type    = string  # Should be number
+  default = "three" # Invalid for count
+}
+
+resource "aws_instance" "type_error" {
+  count = var.count_value # ERROR: string to number
+
+  ami           = "ami-12345678"
+  instance_type = "t3.micro"
+}
+
+variable "for_each_value" {
+  type    = number
+  default = 5
+}
+
+resource "aws_instance" "for_each_error" {
+  for_each = var.for_each_value # ERROR: number not valid
+
+  ami           = "ami-12345678"
+  instance_type = "t3.micro"
+}
+
+################################################################################
+# FILE: :\good projects\cost estimation\testdata\terraform\basic\high_cost.tf
+# TYPE: hcl
+# SIZE: 1938 bytes
+################################################################################
+# Basic: High-cost infrastructure pattern
+
+# NAT Gateways (expensive)
+resource "aws_nat_gateway" "main" {
+  count = 3
+
+  allocation_id = "eipalloc-${count.index}"
+  subnet_id     = "subnet-${count.index}"
+
+  tags = {
+    Name = "nat-${count.index}"
+  }
+}
+
+# RDS Multi-AZ (expensive)
+resource "aws_db_instance" "production" {
+  identifier     = "production-db"
+  engine         = "postgres"
+  engine_version = "14"
+  instance_class = "db.r6g.2xlarge"
+
+  allocated_storage     = 500
+  max_allocated_storage = 2000
+  storage_type          = "io1"
+  iops                  = 10000
+
+  multi_az = true
+
+  backup_retention_period = 30
+  storage_encrypted       = true
+}
+
+# ElastiCache cluster (medium cost)
+resource "aws_elasticache_replication_group" "main" {
+  replication_group_id = "main-cache"
+  description          = "Main cache cluster"
+
+  node_type          = "cache.r6g.large"
+  num_cache_clusters = 3
+  engine             = "redis"
+  engine_version     = "7.0"
+
+  automatic_failover_enabled = true
+  multi_az_enabled           = true
+}
+
+# EKS cluster (expensive with nodes)
+resource "aws_eks_cluster" "main" {
+  name     = "main-cluster"
+  role_arn = "arn:aws:iam::123456789:role/eks-cluster-role"
+
+  vpc_config {
+    subnet_ids = ["subnet-1", "subnet-2", "subnet-3"]
+  }
+}
+
+resource "aws_eks_node_group" "main" {
+  cluster_name    = aws_eks_cluster.main.name
+  node_group_name = "main-nodes"
+  node_role_arn   = "arn:aws:iam::123456789:role/eks-node-role"
+  subnet_ids      = ["subnet-1", "subnet-2", "subnet-3"]
+
+  scaling_config {
+    desired_size = 5
+    max_size     = 10
+    min_size     = 3
+  }
+
+  instance_types = ["m6i.2xlarge"]
+}
+
+# Kinesis (usage-based)
+resource "aws_kinesis_stream" "events" {
+  name             = "event-stream"
+  shard_count      = 10
+  retention_period = 168
+
+  stream_mode_details {
+    stream_mode = "PROVISIONED"
+  }
+}
+
+################################################################################
+# FILE: :\good projects\cost estimation\testdata\terraform\basic\mixed_resources.tf
+# TYPE: hcl
+# SIZE: 1891 bytes
+################################################################################
+# Basic: Mixed resource types for cost estimation
+
+# Compute
+resource "aws_instance" "app" {
+  count = 3
+
+  ami           = "ami-12345678"
+  instance_type = "t3.medium"
+
+  root_block_device {
+    volume_size = 30
+    volume_type = "gp3"
+  }
+
+  tags = {
+    Name = "app-${count.index}"
+  }
+}
+
+# Database
+resource "aws_db_instance" "main" {
+  identifier     = "main-db"
+  engine         = "postgres"
+  engine_version = "14.8"
+  instance_class = "db.t3.medium"
+
+  allocated_storage     = 100
+  max_allocated_storage = 500
+  storage_type          = "gp3"
+
+  db_name  = "appdb"
+  username = "admin"
+  password = "changeme123"
+
+  multi_az            = true
+  publicly_accessible = false
+
+  backup_retention_period = 7
+
+  tags = {
+    Name = "main-database"
+  }
+}
+
+# Storage
+resource "aws_s3_bucket" "assets" {
+  bucket = "my-app-assets-12345"
+}
+
+resource "aws_s3_bucket" "logs" {
+  bucket = "my-app-logs-12345"
+}
+
+# Network
+resource "aws_nat_gateway" "main" {
+  allocation_id = "eipalloc-12345678"
+  subnet_id     = "subnet-12345678"
+
+  tags = {
+    Name = "main-nat"
+  }
+}
+
+resource "aws_lb" "app" {
+  name               = "app-lb"
+  internal           = false
+  load_balancer_type = "application"
+  subnets            = ["subnet-12345678", "subnet-87654321"]
+
+  tags = {
+    Name = "app-load-balancer"
+  }
+}
+
+# Cache
+resource "aws_elasticache_cluster" "session" {
+  cluster_id      = "session-cache"
+  engine          = "redis"
+  node_type       = "cache.t3.micro"
+  num_cache_nodes = 1
+  port            = 6379
+}
+
+# Lambda
+resource "aws_lambda_function" "processor" {
+  function_name = "data-processor"
+  role          = "arn:aws:iam::123456789:role/lambda-role"
+  handler       = "index.handler"
+  runtime       = "nodejs18.x"
+
+  memory_size = 256
+  timeout     = 30
+
+  filename = "function.zip"
 }
 
 ################################################################################
@@ -14145,6 +18912,143 @@ resource "aws_instance" "simple" {
   tags = {
     Name        = "simple-instance"
     Environment = "test"
+  }
+}
+
+################################################################################
+# FILE: :\good projects\cost estimation\testdata\terraform\dynamic_blocks\conditional_dynamic.tf
+# TYPE: hcl
+# SIZE: 1115 bytes
+################################################################################
+# Dynamic Block: Conditional dynamic block
+
+variable "enable_logging" {
+  type    = bool
+  default = true
+}
+
+variable "access_logs_bucket" {
+  type    = string
+  default = "my-access-logs"
+}
+
+variable "enable_stickiness" {
+  type    = bool
+  default = false
+}
+
+resource "aws_lb" "conditional_dynamic" {
+  name               = "conditional-lb"
+  internal           = false
+  load_balancer_type = "application"
+  subnets            = ["subnet-12345678", "subnet-87654321"]
+
+  # Conditional dynamic block for access logs
+  dynamic "access_logs" {
+    for_each = var.enable_logging ? [1] : []
+    content {
+      bucket  = var.access_logs_bucket
+      prefix  = "lb-logs"
+      enabled = true
+    }
+  }
+}
+
+resource "aws_lb_target_group" "conditional" {
+  name     = "conditional-tg"
+  port     = 80
+  protocol = "HTTP"
+  vpc_id   = "vpc-12345678"
+
+  # Conditional stickiness
+  dynamic "stickiness" {
+    for_each = var.enable_stickiness ? [1] : []
+    content {
+      type            = "lb_cookie"
+      cookie_duration = 86400
+      enabled         = true
+    }
+  }
+}
+
+################################################################################
+# FILE: :\good projects\cost estimation\testdata\terraform\dynamic_blocks\multiple_dynamic.tf
+# TYPE: hcl
+# SIZE: 1704 bytes
+################################################################################
+# Dynamic Blocks: Multiple dynamic blocks in one resource
+
+variable "ingress_rules" {
+  type = list(object({
+    from_port   = number
+    to_port     = number
+    protocol    = string
+    cidr_blocks = list(string)
+    description = string
+  }))
+  default = [
+    {
+      from_port   = 80
+      to_port     = 80
+      protocol    = "tcp"
+      cidr_blocks = ["0.0.0.0/0"]
+      description = "HTTP"
+    },
+    {
+      from_port   = 443
+      to_port     = 443
+      protocol    = "tcp"
+      cidr_blocks = ["0.0.0.0/0"]
+      description = "HTTPS"
+    }
+  ]
+}
+
+variable "egress_rules" {
+  type = list(object({
+    from_port   = number
+    to_port     = number
+    protocol    = string
+    cidr_blocks = list(string)
+  }))
+  default = [
+    {
+      from_port   = 0
+      to_port     = 0
+      protocol    = "-1"
+      cidr_blocks = ["0.0.0.0/0"]
+    }
+  ]
+}
+
+resource "aws_security_group" "multi_dynamic" {
+  name        = "multi-dynamic-sg"
+  description = "Security group with multiple dynamic blocks"
+  vpc_id      = "vpc-12345678"
+
+  dynamic "ingress" {
+    for_each = var.ingress_rules
+    content {
+      from_port   = ingress.value.from_port
+      to_port     = ingress.value.to_port
+      protocol    = ingress.value.protocol
+      cidr_blocks = ingress.value.cidr_blocks
+      description = ingress.value.description
+    }
+  }
+
+  dynamic "egress" {
+    for_each = var.egress_rules
+    content {
+      from_port   = egress.value.from_port
+      to_port     = egress.value.to_port
+      protocol    = egress.value.protocol
+      cidr_blocks = egress.value.cidr_blocks
+    }
+  }
+
+  tags = {
+    Name = "multi-dynamic"
   }
 }
 
@@ -14306,6 +19210,66 @@ resource "aws_security_group" "sg_b" {
 }
 
 ################################################################################
+# FILE: :\good projects\cost estimation\testdata\terraform\edge_cases\complex_locals.tf
+# TYPE: hcl
+# SIZE: 1283 bytes
+################################################################################
+# Edge Case: Local values with complex expressions
+
+locals {
+  # Nested locals referencing each other
+  base_name = "myapp"
+  env       = "production"
+  full_name = "${local.base_name}-${local.env}"
+
+  # Complex conditional
+  instance_size = local.env == "production" ? (
+    local.high_availability ? "large" : "medium"
+  ) : "small"
+
+  high_availability = local.env == "production"
+
+  # Map transformation
+  raw_instances = {
+    web    = { count = 3, type = "t3.small" }
+    api    = { count = 2, type = "t3.medium" }
+    worker = { count = 1, type = "t3.large" }
+  }
+
+  # Flatten for iteration
+  instance_list = flatten([
+    for name, config in local.raw_instances : [
+      for i in range(config.count) : {
+        name = "${name}-${i}"
+        type = config.type
+        role = name
+      }
+    ]
+  ])
+
+  # Map by name
+  instance_map = {
+    for inst in local.instance_list :
+    inst.name => inst
+  }
+
+  # Sum of counts
+  total_instances = sum([for k, v in local.raw_instances : v.count])
+}
+
+resource "aws_instance" "from_locals" {
+  for_each = local.instance_map
+
+  ami           = "ami-12345678"
+  instance_type = each.value.type
+
+  tags = {
+    Name = "${local.full_name}-${each.key}"
+    Role = each.value.role
+  }
+}
+
+################################################################################
 # FILE: :\good projects\cost estimation\testdata\terraform\edge_cases\conditional_resource.tf
 # TYPE: hcl
 # SIZE: 642 bytes
@@ -14342,6 +19306,156 @@ resource "aws_eip" "instance_eip" {
 }
 
 ################################################################################
+# FILE: :\good projects\cost estimation\testdata\terraform\edge_cases\data_source_dependency.tf
+# TYPE: hcl
+# SIZE: 651 bytes
+################################################################################
+# Edge Case: Data source dependency
+
+data "aws_ami" "latest" {
+  most_recent = true
+
+  filter {
+    name   = "name"
+    values = ["amzn2-ami-hvm-*-x86_64-gp2"]
+  }
+
+  owners = ["amazon"]
+}
+
+data "aws_vpc" "selected" {
+  default = true
+}
+
+data "aws_availability_zones" "available" {
+  state = "available"
+}
+
+resource "aws_instance" "from_data" {
+  ami               = data.aws_ami.latest.id
+  instance_type     = "t3.micro"
+  availability_zone = data.aws_availability_zones.available.names[0]
+
+  vpc_security_group_ids = [data.aws_vpc.selected.default_security_group_id]
+
+  tags = {
+    Name = "from-data-sources"
+  }
+}
+
+################################################################################
+# FILE: :\good projects\cost estimation\testdata\terraform\edge_cases\lifecycle.tf
+# TYPE: hcl
+# SIZE: 553 bytes
+################################################################################
+# Edge Case: Lifecycle with create_before_destroy
+
+resource "aws_instance" "lifecycle_test" {
+  ami           = "ami-12345678"
+  instance_type = "t3.micro"
+
+  lifecycle {
+    create_before_destroy = true
+    prevent_destroy       = false
+    ignore_changes        = [tags, user_data]
+  }
+
+  tags = {
+    Name = "lifecycle-test"
+  }
+}
+
+resource "aws_launch_template" "lifecycle" {
+  name_prefix   = "lifecycle-"
+  instance_type = "t3.micro"
+  image_id      = "ami-12345678"
+
+  lifecycle {
+    create_before_destroy = true
+  }
+}
+
+################################################################################
+# FILE: :\good projects\cost estimation\testdata\terraform\edge_cases\moved_import.tf
+# TYPE: hcl
+# SIZE: 462 bytes
+################################################################################
+# Edge Case: Resource moved block
+
+# Simulate state moves
+moved {
+  from = aws_instance.old_name
+  to   = aws_instance.new_name
+}
+
+resource "aws_instance" "new_name" {
+  ami           = "ami-12345678"
+  instance_type = "t3.micro"
+
+  tags = {
+    Name = "renamed-instance"
+  }
+}
+
+# Import block
+import {
+  to = aws_s3_bucket.imported
+  id = "my-existing-bucket"
+}
+
+resource "aws_s3_bucket" "imported" {
+  bucket = "my-existing-bucket"
+}
+
+################################################################################
+# FILE: :\good projects\cost estimation\testdata\terraform\edge_cases\null_optional.tf
+# TYPE: hcl
+# SIZE: 917 bytes
+################################################################################
+# Edge Case: Null values and optionals
+
+variable "optional_config" {
+  type = object({
+    enabled       = optional(bool, false)
+    instance_type = optional(string)
+    volume_size   = optional(number, 20)
+  })
+  default = {}
+}
+
+variable "nullable_string" {
+  type    = string
+  default = null
+}
+
+resource "aws_instance" "optional_test" {
+  count = var.optional_config.enabled ? 1 : 0
+
+  ami           = "ami-12345678"
+  instance_type = coalesce(var.optional_config.instance_type, "t3.micro")
+
+  root_block_device {
+    volume_size = var.optional_config.volume_size
+  }
+
+  # Using try() for safe access
+  user_data = try(var.nullable_string, "default-user-data")
+
+  tags = {
+    Name = "optional-test"
+  }
+}
+
+# Null resource for testing
+resource "null_resource" "example" {
+  count = var.nullable_string != null ? 1 : 0
+
+  triggers = {
+    value = var.nullable_string
+  }
+}
+
+################################################################################
 # FILE: :\good projects\cost estimation\testdata\terraform\edge_cases\self_reference.tf
 # TYPE: hcl
 # SIZE: 239 bytes
@@ -14353,6 +19467,138 @@ resource "aws_instance" "self_ref" {
 
   ami           = "ami-12345678"
   instance_type = "t3.micro"
+}
+
+################################################################################
+# FILE: :\good projects\cost estimation\testdata\terraform\edge_cases\sensitive_values.tf
+# TYPE: hcl
+# SIZE: 721 bytes
+################################################################################
+# Edge Case: Sensitive values
+
+variable "db_password" {
+  type      = string
+  sensitive = true
+}
+
+variable "api_key" {
+  type      = string
+  sensitive = true
+  default   = "default-key"
+}
+
+resource "aws_db_instance" "sensitive" {
+  identifier     = "sensitive-db"
+  engine         = "mysql"
+  instance_class = "db.t3.micro"
+
+  username = "admin"
+  password = var.db_password # Sensitive
+
+  tags = {
+    Name = "sensitive-db"
+  }
+}
+
+resource "aws_secretsmanager_secret" "api" {
+  name = "api-credentials"
+}
+
+resource "aws_secretsmanager_secret_version" "api" {
+  secret_id = aws_secretsmanager_secret.api.id
+  secret_string = jsonencode({
+    api_key = var.api_key # Sensitive
+  })
+}
+
+################################################################################
+# FILE: :\good projects\cost estimation\testdata\terraform\edge_cases\splat_expression.tf
+# TYPE: hcl
+# SIZE: 790 bytes
+################################################################################
+# Edge Case: Splat expression and resource references
+
+variable "instance_count" {
+  type    = number
+  default = 3
+}
+
+resource "aws_instance" "cluster" {
+  count = var.instance_count
+
+  ami           = "ami-12345678"
+  instance_type = "t3.micro"
+
+  tags = {
+    Name = "cluster-${count.index}"
+  }
+}
+
+# Using splat expression
+resource "aws_lb_target_group_attachment" "cluster" {
+  count = var.instance_count
+
+  target_group_arn = "arn:aws:elasticloadbalancing:us-east-1:123456789:targetgroup/main/abc123"
+  target_id        = aws_instance.cluster[count.index].id
+  port             = 80
+}
+
+# Using splat to get all IDs
+output "instance_ids" {
+  value = aws_instance.cluster[*].id
+}
+
+output "private_ips" {
+  value = aws_instance.cluster[*].private_ip
+}
+
+################################################################################
+# FILE: :\good projects\cost estimation\testdata\terraform\edge_cases\terraform_functions.tf
+# TYPE: hcl
+# SIZE: 974 bytes
+################################################################################
+# Edge Case: Terraform functions in expressions
+
+locals {
+  environment = "production"
+
+  # String functions
+  upper_env = upper(local.environment)
+  lower_env = lower(local.environment)
+
+  # Collection functions
+  instance_types = ["t3.micro", "t3.small", "t3.medium"]
+  first_type     = element(local.instance_types, 0)
+  type_count     = length(local.instance_types)
+
+  # Numeric functions
+  max_cpu = max(2, 4, 8)
+  min_cpu = min(2, 4, 8)
+
+  # Conditional
+  instance_type = local.environment == "production" ? "t3.large" : "t3.micro"
+
+  # Map functions
+  tags = merge(
+    {
+      Environment = local.environment
+    },
+    {
+      ManagedBy = "terraform"
+    }
+  )
+
+  # Encoding
+  encoded = base64encode("hello world")
+}
+
+resource "aws_instance" "with_functions" {
+  ami           = "ami-12345678"
+  instance_type = local.instance_type
+
+  tags = merge(local.tags, {
+    Name = format("web-%s-%d", local.environment, 1)
+  })
 }
 
 ################################################################################
@@ -14371,6 +19617,190 @@ resource "aws_instance" "unknown_count" {
   count         = var.count_from_external
   ami           = "ami-12345678"
   instance_type = "t3.micro"
+}
+
+################################################################################
+# FILE: :\good projects\cost estimation\testdata\terraform\edge_cases\workspaces.tf
+# TYPE: hcl
+# SIZE: 901 bytes
+################################################################################
+# Edge Case: Terraform workspaces
+
+terraform {
+  backend "s3" {
+    bucket         = "terraform-state"
+    key            = "app/terraform.tfstate"
+    region         = "us-east-1"
+    dynamodb_table = "terraform-locks"
+  }
+}
+
+locals {
+  workspace_config = {
+    default = {
+      instance_type  = "t3.micro"
+      instance_count = 1
+    }
+    staging = {
+      instance_type  = "t3.small"
+      instance_count = 2
+    }
+    production = {
+      instance_type  = "t3.medium"
+      instance_count = 3
+    }
+  }
+
+  current_config = local.workspace_config[terraform.workspace]
+}
+
+resource "aws_instance" "app" {
+  count = local.current_config.instance_count
+
+  ami           = "ami-12345678"
+  instance_type = local.current_config.instance_type
+
+  tags = {
+    Name        = "app-${terraform.workspace}-${count.index}"
+    Environment = terraform.workspace
+  }
+}
+
+################################################################################
+# FILE: :\good projects\cost estimation\testdata\terraform\expansion\complex_for_each.tf
+# TYPE: hcl
+# SIZE: 1958 bytes
+################################################################################
+# Expansion: Complex for_each with nested objects
+
+variable "services" {
+  type = map(object({
+    cpu         = number
+    memory      = number
+    ports       = list(number)
+    replicas    = number
+    environment = map(string)
+  }))
+  default = {
+    api = {
+      cpu      = 256
+      memory   = 512
+      ports    = [8080]
+      replicas = 3
+      environment = {
+        NODE_ENV  = "production"
+        LOG_LEVEL = "info"
+      }
+    }
+    worker = {
+      cpu      = 512
+      memory   = 1024
+      ports    = []
+      replicas = 2
+      environment = {
+        QUEUE_URL = "https://sqs.example.com"
+      }
+    }
+    scheduler = {
+      cpu         = 128
+      memory      = 256
+      ports       = []
+      replicas    = 1
+      environment = {}
+    }
+  }
+}
+
+resource "aws_ecs_task_definition" "services" {
+  for_each = var.services
+
+  family                   = each.key
+  requires_compatibilities = ["FARGATE"]
+  network_mode             = "awsvpc"
+  cpu                      = each.value.cpu
+  memory                   = each.value.memory
+
+  container_definitions = jsonencode([{
+    name      = each.key
+    image     = "my-app/${each.key}:latest"
+    cpu       = each.value.cpu
+    memory    = each.value.memory
+    essential = true
+
+    portMappings = [
+      for port in each.value.ports : {
+        containerPort = port
+        hostPort      = port
+        protocol      = "tcp"
+      }
+    ]
+
+    environment = [
+      for k, v in each.value.environment : {
+        name  = k
+        value = v
+      }
+    ]
+  }])
+}
+
+resource "aws_ecs_service" "services" {
+  for_each = var.services
+
+  name            = each.key
+  cluster         = "main-cluster"
+  task_definition = aws_ecs_task_definition.services[each.key].arn
+  desired_count   = each.value.replicas
+  launch_type     = "FARGATE"
+
+  network_configuration {
+    subnets = ["subnet-12345678"]
+  }
+}
+
+################################################################################
+# FILE: :\good projects\cost estimation\testdata\terraform\expansion\count_from_length.tf
+# TYPE: hcl
+# SIZE: 898 bytes
+################################################################################
+# Expansion: count depending on length of list
+
+variable "subnets" {
+  type = list(object({
+    cidr = string
+    az   = string
+  }))
+  default = [
+    { cidr = "10.0.1.0/24", az = "us-east-1a" },
+    { cidr = "10.0.2.0/24", az = "us-east-1b" },
+    { cidr = "10.0.3.0/24", az = "us-east-1c" }
+  ]
+}
+
+resource "aws_subnet" "from_list" {
+  count = length(var.subnets)
+
+  vpc_id            = "vpc-12345678"
+  cidr_block        = var.subnets[count.index].cidr
+  availability_zone = var.subnets[count.index].az
+
+  tags = {
+    Name  = "subnet-${count.index}"
+    Index = count.index
+  }
+}
+
+# Instance per subnet
+resource "aws_instance" "per_subnet" {
+  count = length(aws_subnet.from_list)
+
+  ami           = "ami-12345678"
+  instance_type = "t3.micro"
+  subnet_id     = aws_subnet.from_list[count.index].id
+
+  tags = {
+    Name = "instance-${count.index}"
+  }
 }
 
 ################################################################################
@@ -14406,6 +19836,34 @@ resource "aws_instance" "zero" {
   count         = 0
   ami           = "ami-12345678"
   instance_type = "t3.micro"
+}
+
+################################################################################
+# FILE: :\good projects\cost estimation\testdata\terraform\expansion\for_each_fileset.tf
+# TYPE: hcl
+# SIZE: 672 bytes
+################################################################################
+# Expansion: for_each with fileset
+
+resource "aws_s3_object" "configs" {
+  for_each = fileset("${path.module}/configs", "*.json")
+
+  bucket = "my-config-bucket"
+  key    = "configs/${each.value}"
+  source = "${path.module}/configs/${each.value}"
+
+  etag = filemd5("${path.module}/configs/${each.value}")
+}
+
+resource "aws_lambda_function" "handlers" {
+  for_each = fileset("${path.module}/lambdas", "*/handler.py")
+
+  function_name = replace(dirname(each.value), "/", "-")
+  role          = "arn:aws:iam::123456789:role/lambda-role"
+  handler       = "handler.main"
+  runtime       = "python3.9"
+
+  filename = "${path.module}/lambdas/${each.value}"
 }
 
 ################################################################################
@@ -14485,6 +19943,40 @@ resource "aws_instance" "per_az" {
 }
 
 ################################################################################
+# FILE: :\good projects\cost estimation\testdata\terraform\expansion\for_each_toset.tf
+# TYPE: hcl
+# SIZE: 552 bytes
+################################################################################
+# Expansion: for_each with toset() conversion
+
+variable "bucket_names" {
+  type    = list(string)
+  default = ["logs", "data", "backups", "archives"]
+}
+
+resource "aws_s3_bucket" "buckets" {
+  for_each = toset(var.bucket_names)
+
+  bucket = "${each.value}-bucket-12345"
+
+  tags = {
+    Name    = each.value
+    Purpose = each.key
+  }
+}
+
+# Dependent resource
+resource "aws_s3_bucket_versioning" "buckets" {
+  for_each = aws_s3_bucket.buckets
+
+  bucket = each.value.id
+
+  versioning_configuration {
+    status = "Enabled"
+  }
+}
+
+################################################################################
 # FILE: :\good projects\cost estimation\testdata\terraform\expansion\nested_count_for_each.tf
 # TYPE: hcl
 # SIZE: 857 bytes
@@ -14527,6 +20019,74 @@ module "db_replicas" {
 }
 
 ################################################################################
+# FILE: :\good projects\cost estimation\testdata\terraform\expansion\triple_nested.tf
+# TYPE: hcl
+# SIZE: 1497 bytes
+################################################################################
+# Expansion: Triple nested for_each/count
+
+variable "regions" {
+  type = map(object({
+    availability_zones = list(string)
+    instance_per_az    = number
+  }))
+  default = {
+    us-east-1 = {
+      availability_zones = ["us-east-1a", "us-east-1b"]
+      instance_per_az    = 2
+    }
+    us-west-2 = {
+      availability_zones = ["us-west-2a"]
+      instance_per_az    = 3
+    }
+  }
+}
+
+# Level 1: for_each on regions
+module "regional" {
+  source   = "./regional"
+  for_each = var.regions
+
+  region             = each.key
+  availability_zones = each.value.availability_zones
+  instance_per_az    = each.value.instance_per_az
+}
+
+# Simulating what the regional module might contain:
+# Level 2: for_each on AZs (conceptually)
+# Level 3: count on instances per AZ
+
+# This flattening pattern is common
+locals {
+  all_instances = flatten([
+    for region, config in var.regions : [
+      for az in config.availability_zones : [
+        for i in range(config.instance_per_az) : {
+          region = region
+          az     = az
+          index  = i
+          name   = "${region}-${az}-${i}"
+        }
+      ]
+    ]
+  ])
+}
+
+resource "aws_instance" "triple_nested" {
+  for_each = { for inst in local.all_instances : inst.name => inst }
+
+  ami               = "ami-12345678"
+  instance_type     = "t3.micro"
+  availability_zone = each.value.az
+
+  tags = {
+    Name   = each.key
+    Region = each.value.region
+    Index  = each.value.index
+  }
+}
+
+################################################################################
 # FILE: :\good projects\cost estimation\testdata\terraform\modules\local_module.tf
 # TYPE: hcl
 # SIZE: 305 bytes
@@ -14548,6 +20108,117 @@ module "app" {
 
 output "app_ids" {
   value = module.app[*].instance_id
+}
+
+################################################################################
+# FILE: :\good projects\cost estimation\testdata\terraform\modules\module_count.tf
+# TYPE: hcl
+# SIZE: 813 bytes
+################################################################################
+# Module: Passing count to module
+
+variable "create_vpc" {
+  type    = bool
+  default = true
+}
+
+module "vpc" {
+  source = "./vpc"
+  count  = var.create_vpc ? 1 : 0
+
+  cidr_block = "10.0.0.0/16"
+  name       = "main-vpc"
+}
+
+# Accessing module with count
+resource "aws_subnet" "public" {
+  count = var.create_vpc ? 2 : 0
+
+  vpc_id     = module.vpc[0].vpc_id
+  cidr_block = "10.0.${count.index}.0/24"
+
+  tags = {
+    Name = "public-${count.index}"
+  }
+}
+
+# Module with count creating multiple modules
+variable "environment_count" {
+  type    = number
+  default = 3
+}
+
+module "environment" {
+  source = "./environment"
+  count  = var.environment_count
+
+  name  = "env-${count.index}"
+  index = count.index
+}
+
+output "environment_ids" {
+  value = module.environment[*].id
+}
+
+################################################################################
+# FILE: :\good projects\cost estimation\testdata\terraform\modules\module_with_outputs.tf
+# TYPE: hcl
+# SIZE: 942 bytes
+################################################################################
+# Module: Module with outputs that reference each other
+
+variable "name" {
+  type    = string
+  default = "test"
+}
+
+resource "aws_vpc" "main" {
+  cidr_block = "10.0.0.0/16"
+
+  tags = {
+    Name = "${var.name}-vpc"
+  }
+}
+
+resource "aws_subnet" "public" {
+  count = 2
+
+  vpc_id     = aws_vpc.main.id
+  cidr_block = "10.0.${count.index}.0/24"
+
+  tags = {
+    Name = "${var.name}-public-${count.index}"
+  }
+}
+
+resource "aws_subnet" "private" {
+  count = 2
+
+  vpc_id     = aws_vpc.main.id
+  cidr_block = "10.0.${count.index + 10}.0/24"
+
+  tags = {
+    Name = "${var.name}-private-${count.index}"
+  }
+}
+
+output "vpc_id" {
+  value = aws_vpc.main.id
+}
+
+output "public_subnet_ids" {
+  value = aws_subnet.public[*].id
+}
+
+output "private_subnet_ids" {
+  value = aws_subnet.private[*].id
+}
+
+output "all_subnet_ids" {
+  value = concat(
+    aws_subnet.public[*].id,
+    aws_subnet.private[*].id
+  )
 }
 
 ################################################################################
@@ -14665,6 +20336,149 @@ module "app_west" {
 }
 
 ################################################################################
+# FILE: :\good projects\cost estimation\testdata\terraform\providers\multi_region_modules.tf
+# TYPE: hcl
+# SIZE: 899 bytes
+################################################################################
+# Module: Passing providers to module
+
+terraform {
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 5.0"
+    }
+  }
+}
+
+provider "aws" {
+  alias  = "primary"
+  region = "us-east-1"
+}
+
+provider "aws" {
+  alias  = "dr"
+  region = "us-west-2"
+}
+
+module "primary_infra" {
+  source = "./infra"
+
+  providers = {
+    aws = aws.primary
+  }
+
+  environment = "primary"
+  vpc_cidr    = "10.0.0.0/16"
+}
+
+module "dr_infra" {
+  source = "./infra"
+
+  providers = {
+    aws = aws.dr
+  }
+
+  environment = "dr"
+  vpc_cidr    = "10.1.0.0/16"
+}
+
+# Cross-region peering would reference both
+resource "aws_vpc_peering_connection" "primary_to_dr" {
+  provider = aws.primary
+
+  vpc_id      = module.primary_infra.vpc_id
+  peer_vpc_id = module.dr_infra.vpc_id
+  peer_region = "us-west-2"
+
+  tags = {
+    Name = "primary-to-dr"
+  }
+}
+
+################################################################################
+# FILE: :\good projects\cost estimation\testdata\terraform\providers\multiple_same_type.tf
+# TYPE: hcl
+# SIZE: 1433 bytes
+################################################################################
+# Providers: Multiple providers same type
+
+terraform {
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 5.0"
+    }
+  }
+}
+
+# Default provider
+provider "aws" {
+  region = "us-east-1"
+
+  default_tags {
+    tags = {
+      Environment = "production"
+      ManagedBy   = "terraform"
+    }
+  }
+}
+
+# Alternative region
+provider "aws" {
+  alias  = "west"
+  region = "us-west-2"
+
+  default_tags {
+    tags = {
+      Environment = "production"
+      ManagedBy   = "terraform"
+    }
+  }
+}
+
+# Cross-account
+provider "aws" {
+  alias  = "shared"
+  region = "us-east-1"
+
+  assume_role {
+    role_arn = "arn:aws:iam::987654321:role/terraform-cross-account"
+  }
+}
+
+# Resources using different providers
+resource "aws_s3_bucket" "primary" {
+  bucket = "primary-bucket-12345"
+}
+
+resource "aws_s3_bucket" "west" {
+  provider = aws.west
+  bucket   = "west-bucket-12345"
+}
+
+resource "aws_s3_bucket" "shared" {
+  provider = aws.shared
+  bucket   = "shared-bucket-12345"
+}
+
+# Replication between regions
+resource "aws_s3_bucket_replication_configuration" "primary_to_west" {
+  bucket = aws_s3_bucket.primary.id
+  role   = "arn:aws:iam::123456789:role/replication-role"
+
+  rule {
+    id     = "replicate-to-west"
+    status = "Enabled"
+
+    destination {
+      bucket        = aws_s3_bucket.west.arn
+      storage_class = "STANDARD"
+    }
+  }
+}
+
+################################################################################
 #                              END OF FILE                                     #
 ################################################################################
 
@@ -14672,12 +20486,12 @@ module "app_west" {
                                 SUMMARY
 ================================================================================
 
-Total Files Combined: 79
-Generated: 2026-01-16 00:49:24
+Total Files Combined: 118
+Generated: 2026-01-16 12:19:35
 Project: cost estimation
 
-Files by Type:  .go : 53 files
-  .tf : 20 files
+Files by Type:  .go : 66 files
+  .tf : 46 files
   .md : 1 files
   .mod : 1 files
   (no extension) : 1 files

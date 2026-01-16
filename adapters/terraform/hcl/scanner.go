@@ -1,4 +1,6 @@
-// Package hcl provides Terraform HCL parsing.
+// Package hcl provides Terraform HCL parsing with DEFERRED evaluation.
+// Expressions are NOT evaluated immediately - they are captured as unevaluated
+// and resolved only after variables, locals, and references are available.
 package hcl
 
 import (
@@ -10,12 +12,15 @@ import (
 
 	"github.com/hashicorp/hcl/v2"
 	"github.com/hashicorp/hcl/v2/hclparse"
+	"github.com/hashicorp/hcl/v2/hclsyntax"
 
 	"terraform-cost/core/scanner"
 	"terraform-cost/core/types"
 )
 
 // Scanner implements the scanner.Scanner interface for Terraform HCL
+// CRITICAL: This scanner does NOT evaluate expressions.
+// It captures expressions as unevaluated for later resolution.
 type Scanner struct {
 	parser *hclparse.Parser
 }
@@ -54,7 +59,7 @@ func (s *Scanner) CanScan(ctx context.Context, input *types.ProjectInput) (bool,
 	return hasTfFiles, nil
 }
 
-// Scan parses HCL files and returns raw assets
+// Scan parses HCL files and returns raw assets with UNEVALUATED expressions
 func (s *Scanner) Scan(ctx context.Context, input *types.ProjectInput) (*scanner.ScanResult, error) {
 	result := &scanner.ScanResult{
 		Assets:    make([]types.RawAsset, 0),
@@ -80,7 +85,7 @@ func (s *Scanner) Scan(ctx context.Context, input *types.ProjectInput) (*scanner
 		return nil, fmt.Errorf("failed to walk directory: %w", err)
 	}
 
-	// Parse each file
+	// Parse each file - DO NOT EVALUATE
 	for _, file := range tfFiles {
 		assets, modules, warnings, errs := s.parseFile(ctx, file, input.Path)
 		result.Assets = append(result.Assets, assets...)
@@ -147,17 +152,17 @@ func (s *Scanner) parseFile(ctx context.Context, file, basePath string) ([]types
 	for _, block := range content.Blocks {
 		switch block.Type {
 		case "resource":
-			asset := s.parseResource(block, relPath, false)
+			asset := s.parseResourceDeferred(block, relPath, false)
 			if asset != nil {
 				assets = append(assets, *asset)
 			}
 		case "data":
-			asset := s.parseResource(block, relPath, true)
+			asset := s.parseResourceDeferred(block, relPath, true)
 			if asset != nil {
 				assets = append(assets, *asset)
 			}
 		case "module":
-			mod := s.parseModule(block)
+			mod := s.parseModuleDeferred(block)
 			if mod != nil {
 				modules = append(modules, *mod)
 			}
@@ -167,7 +172,8 @@ func (s *Scanner) parseFile(ctx context.Context, file, basePath string) ([]types
 	return assets, modules, warnings, errors
 }
 
-func (s *Scanner) parseResource(block *hcl.Block, file string, isDataSource bool) *types.RawAsset {
+// parseResourceDeferred captures expressions WITHOUT evaluating them
+func (s *Scanner) parseResourceDeferred(block *hcl.Block, file string, isDataSource bool) *types.RawAsset {
 	if len(block.Labels) < 2 {
 		return nil
 	}
@@ -185,8 +191,8 @@ func (s *Scanner) parseResource(block *hcl.Block, file string, isDataSource bool
 		provider = types.ProviderGCP
 	}
 
-	// Extract attributes from block body
-	attrs := s.extractAttributes(block.Body)
+	// Extract attributes as UNEVALUATED expressions
+	attrs := s.extractAttributesDeferred(block.Body)
 
 	address := types.ResourceAddress(fmt.Sprintf("%s.%s", resourceType, resourceName))
 	if isDataSource {
@@ -210,25 +216,29 @@ func (s *Scanner) parseResource(block *hcl.Block, file string, isDataSource bool
 	}
 }
 
-func (s *Scanner) parseModule(block *hcl.Block) *scanner.ModuleReference {
+func (s *Scanner) parseModuleDeferred(block *hcl.Block) *scanner.ModuleReference {
 	if len(block.Labels) < 1 {
 		return nil
 	}
 
 	name := block.Labels[0]
-	attrs := s.extractAttributes(block.Body)
+	attrs := s.extractAttributesDeferred(block.Body)
 
 	source := ""
 	if src := attrs.Get("source"); src != nil {
-		if srcStr, ok := src.(string); ok {
-			source = srcStr
+		if attr, ok := src.(types.Attribute); ok && !attr.IsComputed && !attr.IsUnknown {
+			if srcStr, ok := attr.Value.(string); ok {
+				source = srcStr
+			}
 		}
 	}
 
 	version := ""
 	if ver := attrs.Get("version"); ver != nil {
-		if verStr, ok := ver.(string); ok {
-			version = verStr
+		if attr, ok := ver.(types.Attribute); ok && !attr.IsComputed && !attr.IsUnknown {
+			if verStr, ok := attr.Value.(string); ok {
+				version = verStr
+			}
 		}
 	}
 
@@ -239,29 +249,151 @@ func (s *Scanner) parseModule(block *hcl.Block) *scanner.ModuleReference {
 	}
 }
 
-func (s *Scanner) extractAttributes(body hcl.Body) types.Attributes {
+// extractAttributesDeferred captures expressions WITHOUT evaluating them
+// This is the CRITICAL fix - we do NOT call attr.Expr.Value(nil)
+func (s *Scanner) extractAttributesDeferred(body hcl.Body) types.Attributes {
 	attrs := make(types.Attributes)
 
 	// Get all attributes from the body
 	content, _, _ := body.PartialContent(&hcl.BodySchema{})
-	
+
 	for name, attr := range content.Attributes {
-		val, diags := attr.Expr.Value(nil)
-		if diags.HasErrors() {
-			// Mark as computed if we can't evaluate
-			attrs[name] = types.Attribute{
-				Value:      nil,
-				IsComputed: true,
+		// Analyze the expression to determine if it needs context
+		exprInfo := s.analyzeExpression(attr.Expr)
+
+		if exprInfo.IsLiteral {
+			// Safe to evaluate literals immediately
+			val, diags := attr.Expr.Value(nil)
+			if !diags.HasErrors() {
+				attrs[name] = types.Attribute{
+					Value:      s.ctyToGo(val),
+					IsComputed: false,
+					IsUnknown:  false,
+				}
+				continue
 			}
-			continue
 		}
 
+		// Expression requires context - mark as unevaluated
 		attrs[name] = types.Attribute{
-			Value: s.ctyToGo(val),
+			Value:             nil,
+			IsComputed:        exprInfo.RequiresContext,
+			IsUnknown:         exprInfo.HasUnknownRefs,
+			Expression:        s.expressionToString(attr.Expr),
+			ExpressionType:    exprInfo.Type,
+			References:        exprInfo.References,
+			ConfidenceImpact:  exprInfo.ConfidenceImpact,
 		}
 	}
 
 	return attrs
+}
+
+// ExpressionInfo describes an unevaluated expression
+type ExpressionInfo struct {
+	IsLiteral        bool
+	RequiresContext  bool
+	HasUnknownRefs   bool
+	Type             string   // "literal", "variable", "local", "reference", "function", "conditional"
+	References       []string // Referenced addresses
+	ConfidenceImpact float64  // How much this reduces confidence (0.0 - 1.0)
+}
+
+// analyzeExpression determines what kind of expression this is
+func (s *Scanner) analyzeExpression(expr hcl.Expression) ExpressionInfo {
+	info := ExpressionInfo{
+		IsLiteral:        true,
+		RequiresContext:  false,
+		HasUnknownRefs:   false,
+		Type:             "literal",
+		References:       []string{},
+		ConfidenceImpact: 0.0,
+	}
+
+	// Get all variable references
+	refs := expr.Variables()
+	if len(refs) > 0 {
+		info.IsLiteral = false
+		info.RequiresContext = true
+		info.ConfidenceImpact = 0.1 // Base impact for having references
+
+		for _, ref := range refs {
+			refStr := formatTraversal(ref)
+			info.References = append(info.References, refStr)
+
+			// Classify reference type
+			if len(ref) > 0 {
+				root := ref.RootName()
+				switch root {
+				case "var":
+					info.Type = "variable"
+					info.ConfidenceImpact += 0.1 // Variable adds uncertainty
+				case "local":
+					info.Type = "local"
+					// Locals are resolvable
+				case "count":
+					info.Type = "count_reference"
+					info.ConfidenceImpact += 0.2 // Count adds more uncertainty
+				case "each":
+					info.Type = "for_each_reference"
+					info.ConfidenceImpact += 0.2
+				case "data":
+					info.Type = "data_source"
+					info.HasUnknownRefs = true // Data sources are runtime
+					info.ConfidenceImpact += 0.3
+				default:
+					// Resource reference
+					info.Type = "resource_reference"
+					info.HasUnknownRefs = true
+					info.ConfidenceImpact += 0.3
+				}
+			}
+		}
+	}
+
+	// Check for function calls
+	if synExpr, ok := expr.(*hclsyntax.FunctionCallExpr); ok {
+		info.IsLiteral = false
+		info.RequiresContext = true
+		info.Type = "function:" + synExpr.Name
+		info.ConfidenceImpact += 0.1
+	}
+
+	// Check for conditional
+	if _, ok := expr.(*hclsyntax.ConditionalExpr); ok {
+		info.IsLiteral = false
+		info.RequiresContext = true
+		info.Type = "conditional"
+		info.ConfidenceImpact += 0.15
+	}
+
+	// Cap confidence impact
+	if info.ConfidenceImpact > 0.5 {
+		info.ConfidenceImpact = 0.5
+	}
+
+	return info
+}
+
+func formatTraversal(traversal hcl.Traversal) string {
+	parts := make([]string, 0, len(traversal))
+	for _, t := range traversal {
+		switch tt := t.(type) {
+		case hcl.TraverseRoot:
+			parts = append(parts, tt.Name)
+		case hcl.TraverseAttr:
+			parts = append(parts, "."+tt.Name)
+		case hcl.TraverseIndex:
+			parts = append(parts, "[...]")
+		}
+	}
+	return strings.Join(parts, "")
+}
+
+func (s *Scanner) expressionToString(expr hcl.Expression) string {
+	// Get the source range and extract the text
+	rng := expr.Range()
+	return fmt.Sprintf("<%s:%d-%d>", rng.Filename, rng.Start.Line, rng.End.Line)
 }
 
 func (s *Scanner) ctyToGo(val interface{}) interface{} {

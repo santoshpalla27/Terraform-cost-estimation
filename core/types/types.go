@@ -39,11 +39,20 @@ func (r ResourceAddress) String() string {
 }
 
 // Attribute represents a resource attribute value
+// CRITICAL: Attribute may be UNEVALUATED if it depends on context
 type Attribute struct {
 	Value       interface{} `json:"value"`
 	IsComputed  bool        `json:"is_computed"`
 	IsSensitive bool        `json:"is_sensitive"`
-	Type        string      `json:"type,omitempty"`
+	IsUnknown   bool        `json:"is_unknown"` // True if value cannot be determined
+
+	// Expression tracking for deferred evaluation
+	Expression       string   `json:"expression,omitempty"`        // Source expression
+	ExpressionType   string   `json:"expression_type,omitempty"`   // "literal", "variable", "local", etc
+	References       []string `json:"references,omitempty"`        // Referenced addresses
+	ConfidenceImpact float64  `json:"confidence_impact,omitempty"` // 0.0-1.0 impact on confidence
+
+	Type string `json:"type,omitempty"`
 }
 
 // Attributes is a map of attribute names to values
