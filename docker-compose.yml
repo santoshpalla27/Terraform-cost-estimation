@@ -1,114 +1,122 @@
-version: "3.9"
-
 services:
   # =========================
-  # CLI Service (for batch jobs)
+  # PostgreSQL Database
   # =========================
-  terraform-cost:
+  db:
+    image: postgres:16-alpine
+    container_name: terraform-cost-db
+    environment:
+      POSTGRES_DB: terraform_cost
+      POSTGRES_USER: terraform_cost
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-terraform_cost_dev}
+    volumes:
+      - db-data:/var/lib/postgresql/data
+      - ./db/migrations:/docker-entrypoint-initdb.d:ro
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U terraform_cost -d terraform_cost"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - terraform-cost-network
+    restart: unless-stopped
+
+  # =========================
+  # Pricing Pipeline CLI
+  # =========================
+  pipeline:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: terraform-cost:latest
+    container_name: terraform-cost-pipeline
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      - DATABASE_URL=postgres://terraform_cost:${DB_PASSWORD:-terraform_cost_dev}@db:5432/terraform_cost?sslmode=disable
+      - TERRAFORM_COST_LOG_LEVEL=info
+      - TERRAFORM_COST_ENVIRONMENT=production
+    volumes:
+      - pricing-backups:/app/pricing-backups
+      - pipeline-cache:/app/cache
+    networks:
+      - terraform-cost-network
+    # Run pricing update (override as needed)
+    command: ["pricing", "update", "--provider", "aws", "--region", "us-east-1", "--memory-profile", "low", "--dry-run"]
+    profiles:
+      - pipeline
+
+  # =========================
+  # CLI for Estimation
+  # =========================
+  cli:
     build:
       context: .
       dockerfile: Dockerfile
     image: terraform-cost:latest
     container_name: terraform-cost-cli
-    volumes:
-      # Mount your Terraform projects here
-      - ./projects:/projects:ro
-      # Persist cache and data
-      - terraform-cost-cache:/app/cache
-      - terraform-cost-data:/app/data
-      # Custom config (optional)
-      - ./config:/app/config:ro
+    depends_on:
+      db:
+        condition: service_healthy
     environment:
+      - DATABASE_URL=postgres://terraform_cost:${DB_PASSWORD:-terraform_cost_dev}@db:5432/terraform_cost?sslmode=disable
       - TERRAFORM_COST_LOG_LEVEL=info
-      - TERRAFORM_COST_DEFAULT_REGION=us-east-1
-    # Override command for different operations
-    command: ["estimate", "/projects"]
+    volumes:
+      - ./projects:/projects:ro
+      - ./config:/app/config:ro
     networks:
       - terraform-cost-network
+    command: ["estimate", "/projects"]
+    profiles:
+      - cli
 
   # =========================
-  # API Server (future)
+  # API Server
   # =========================
-  # terraform-cost-api:
-  #   build:
-  #     context: .
-  #     dockerfile: Dockerfile.server
-  #   image: terraform-cost-api:latest
-  #   container_name: terraform-cost-api
-  #   ports:
-  #     - "8080:8080"
-  #   volumes:
-  #     - terraform-cost-cache:/app/cache
-  #     - terraform-cost-data:/app/data
-  #   environment:
-  #     - TERRAFORM_COST_API_PORT=8080
-  #     - TERRAFORM_COST_LOG_LEVEL=info
-  #   healthcheck:
-  #     test: ["CMD", "wget", "-q", "--spider", "http://localhost:8080/health"]
-  #     interval: 30s
-  #     timeout: 10s
-  #     retries: 3
-  #     start_period: 10s
-  #   networks:
-  #     - terraform-cost-network
-  #   restart: unless-stopped
-
-  # =========================
-  # Pricing Database (future)
-  # =========================
-  # pricing-db:
-  #   image: postgres:16-alpine
-  #   container_name: terraform-cost-db
-  #   environment:
-  #     - POSTGRES_DB=terraform_cost
-  #     - POSTGRES_USER=terraform_cost
-  #     - POSTGRES_PASSWORD_FILE=/run/secrets/db_password
-  #   volumes:
-  #     - pricing-db-data:/var/lib/postgresql/data
-  #     - ./scripts/init-db.sql:/docker-entrypoint-initdb.d/init.sql:ro
-  #   secrets:
-  #     - db_password
-  #   healthcheck:
-  #     test: ["CMD-SHELL", "pg_isready -U terraform_cost -d terraform_cost"]
-  #     interval: 10s
-  #     timeout: 5s
-  #     retries: 5
-  #   networks:
-  #     - terraform-cost-network
-  #   restart: unless-stopped
-
-  # =========================
-  # Redis Cache (future)
-  # =========================
-  # cache:
-  #   image: redis:7-alpine
-  #   container_name: terraform-cost-cache
-  #   command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
-  #   volumes:
-  #     - redis-data:/data
-  #   healthcheck:
-  #     test: ["CMD", "redis-cli", "ping"]
-  #     interval: 10s
-  #     timeout: 5s
-  #     retries: 5
-  #   networks:
-  #     - terraform-cost-network
-  #   restart: unless-stopped
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: terraform-cost:latest
+    container_name: terraform-cost-api
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+    environment:
+      - DATABASE_URL=postgres://terraform_cost:${DB_PASSWORD:-terraform_cost_dev}@db:5432/terraform_cost?sslmode=disable
+      - TERRAFORM_COST_API_PORT=8080
+      - TERRAFORM_COST_LOG_LEVEL=info
+    volumes:
+      - api-cache:/app/cache
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+    networks:
+      - terraform-cost-network
+    command: ["serve", "--port", "8080"]
+    restart: unless-stopped
+    profiles:
+      - api
 
 volumes:
-  terraform-cost-cache:
+  db-data:
     driver: local
-  terraform-cost-data:
+  pricing-backups:
     driver: local
-  # pricing-db-data:
-  #   driver: local
-  # redis-data:
-  #   driver: local
+  pipeline-cache:
+    driver: local
+  api-cache:
+    driver: local
 
 networks:
   terraform-cost-network:
     driver: bridge
-
-# secrets:
-#   db_password:
-#     file: ./secrets/db_password.txt

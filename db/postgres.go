@@ -324,3 +324,142 @@ func (s *PostgresStore) ResolveTieredRates(ctx context.Context, cloud CloudProvi
 	}
 	return tiers, nil
 }
+
+// Transaction interface for atomic operations
+type Tx interface {
+	CreateSnapshot(ctx context.Context, snapshot *PricingSnapshot) error
+	UpsertRateKey(ctx context.Context, key *RateKey) (*RateKey, error)
+	CreateRate(ctx context.Context, rate *PricingRate) error
+	ActivateSnapshot(ctx context.Context, id uuid.UUID) error
+	Commit() error
+	Rollback() error
+}
+
+// PostgresTx wraps a database transaction
+type PostgresTx struct {
+	tx *sql.Tx
+}
+
+// BeginTx starts a new transaction
+func (s *PostgresStore) BeginTx(ctx context.Context) (Tx, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	return &PostgresTx{tx: tx}, nil
+}
+
+// CreateSnapshot creates a snapshot within a transaction
+func (t *PostgresTx) CreateSnapshot(ctx context.Context, snapshot *PricingSnapshot) error {
+	query := `
+		INSERT INTO pricing_snapshots 
+		(id, cloud, region, provider_alias, source, fetched_at, valid_from, valid_to, hash, version, is_active)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+	`
+	_, err := t.tx.ExecContext(ctx, query,
+		snapshot.ID, snapshot.Cloud, snapshot.Region, snapshot.ProviderAlias,
+		snapshot.Source, snapshot.FetchedAt, snapshot.ValidFrom, snapshot.ValidTo,
+		snapshot.Hash, snapshot.Version, snapshot.IsActive,
+	)
+	return err
+}
+
+// UpsertRateKey inserts or returns existing rate key within a transaction
+func (t *PostgresTx) UpsertRateKey(ctx context.Context, key *RateKey) (*RateKey, error) {
+	attrsJSON, err := json.Marshal(key.Attributes)
+	if err != nil {
+		return nil, err
+	}
+
+	query := `
+		INSERT INTO pricing_rate_keys (id, cloud, service, product_family, region, attributes)
+		VALUES ($1, $2, $3, $4, $5, $6)
+		ON CONFLICT (cloud, service, product_family, region, attributes) 
+		DO UPDATE SET id = pricing_rate_keys.id
+		RETURNING id, created_at
+	`
+	err = t.tx.QueryRowContext(ctx, query,
+		key.ID, key.Cloud, key.Service, key.ProductFamily, key.Region, attrsJSON,
+	).Scan(&key.ID, &key.CreatedAt)
+	return key, err
+}
+
+// CreateRate creates a rate within a transaction
+func (t *PostgresTx) CreateRate(ctx context.Context, rate *PricingRate) error {
+	query := `
+		INSERT INTO pricing_rates 
+		(id, snapshot_id, rate_key_id, unit, price, currency, confidence, tier_min, tier_max, effective_date)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+	`
+	_, err := t.tx.ExecContext(ctx, query,
+		rate.ID, rate.SnapshotID, rate.RateKeyID, rate.Unit,
+		rate.Price, rate.Currency, rate.Confidence,
+		rate.TierMin, rate.TierMax, rate.EffectiveDate,
+	)
+	return err
+}
+
+// ActivateSnapshot activates a snapshot within a transaction
+func (t *PostgresTx) ActivateSnapshot(ctx context.Context, id uuid.UUID) error {
+	// Deactivate existing snapshots for same cloud/region/alias
+	_, err := t.tx.ExecContext(ctx, `
+		UPDATE pricing_snapshots SET is_active = FALSE 
+		WHERE id IN (
+			SELECT ps2.id FROM pricing_snapshots ps2 
+			JOIN pricing_snapshots ps1 ON ps1.cloud = ps2.cloud 
+				AND ps1.region = ps2.region 
+				AND ps1.provider_alias = ps2.provider_alias
+			WHERE ps1.id = $1 AND ps2.id != $1 AND ps2.is_active = TRUE
+		)
+	`, id)
+	if err != nil {
+		return err
+	}
+	
+	// Activate the new snapshot
+	_, err = t.tx.ExecContext(ctx, `
+		UPDATE pricing_snapshots SET is_active = TRUE WHERE id = $1
+	`, id)
+	return err
+}
+
+// Commit commits the transaction
+func (t *PostgresTx) Commit() error {
+	return t.tx.Commit()
+}
+
+// Rollback rolls back the transaction
+func (t *PostgresTx) Rollback() error {
+	return t.tx.Rollback()
+}
+
+// FindSnapshotByHash finds a snapshot with matching content hash
+func (s *PostgresStore) FindSnapshotByHash(ctx context.Context, cloud CloudProvider, region, alias, hash string) (*PricingSnapshot, error) {
+	query := `
+		SELECT id, cloud, region, provider_alias, source, fetched_at, valid_from, valid_to, hash, version, is_active, created_at
+		FROM pricing_snapshots 
+		WHERE cloud = $1 AND region = $2 AND provider_alias = $3 AND hash = $4
+		ORDER BY created_at DESC
+		LIMIT 1
+	`
+	snapshot := &PricingSnapshot{}
+	err := s.db.QueryRowContext(ctx, query, cloud, region, alias, hash).Scan(
+		&snapshot.ID, &snapshot.Cloud, &snapshot.Region, &snapshot.ProviderAlias,
+		&snapshot.Source, &snapshot.FetchedAt, &snapshot.ValidFrom, &snapshot.ValidTo,
+		&snapshot.Hash, &snapshot.Version, &snapshot.IsActive, &snapshot.CreatedAt,
+	)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	return snapshot, err
+}
+
+// CountRates returns the count of rates in a snapshot
+func (s *PostgresStore) CountRates(ctx context.Context, snapshotID uuid.UUID) (int, error) {
+	var count int
+	err := s.db.QueryRowContext(ctx, 
+		"SELECT COUNT(*) FROM pricing_rates WHERE snapshot_id = $1", 
+		snapshotID,
+	).Scan(&count)
+	return count, err
+}

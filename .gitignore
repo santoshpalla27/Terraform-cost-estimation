@@ -182,3 +182,6 @@ projects/
 # Local examples with real data
 examples/local/
 examples/private/
+
+combine-code.ps1
+combined-code.txt

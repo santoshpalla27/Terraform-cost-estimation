@@ -63,19 +63,26 @@ const (
 
 // IngestionValidator validates ingestion against contracts
 type IngestionValidator struct {
-	contracts map[string]IngestionContract
+	contracts          map[string]IngestionContract
+	minCoveragePercent float64
 }
 
 // NewIngestionValidator creates a new validator with default contracts
 func NewIngestionValidator() *IngestionValidator {
 	v := &IngestionValidator{
-		contracts: make(map[string]IngestionContract),
+		contracts:          make(map[string]IngestionContract),
+		minCoveragePercent: 95.0, // Very high coverage required
 	}
 	for _, c := range DefaultContracts() {
 		key := fmt.Sprintf("%s:%s", c.Cloud, c.Service)
 		v.contracts[key] = c
 	}
 	return v
+}
+
+// SetMinCoveragePercent sets the minimum coverage percentage
+func (v *IngestionValidator) SetMinCoveragePercent(pct float64) {
+	v.minCoveragePercent = pct
 }
 
 // AddContract adds a custom contract
@@ -261,4 +268,106 @@ func CalculateChecksum(rates []NormalizedRate) string {
 		hasher.Write([]byte(r.Price.String()))
 	}
 	return hex.EncodeToString(hasher.Sum(nil))
+}
+
+// ValidateAll runs all pre-commit validations (abort on failure)
+func (v *IngestionValidator) ValidateAll(rates []NormalizedRate, prevRateCount int) error {
+	// 1. Validate no negative prices
+	if err := v.ValidatePricesPositive(rates); err != nil {
+		return err
+	}
+
+	// 2. Validate required dimensions exist
+	if err := v.ValidateDimensionsComplete(rates); err != nil {
+		return err
+	}
+
+	// 3. Validate no duplicate rate keys
+	if err := v.ValidateNoDuplicates(rates); err != nil {
+		return err
+	}
+
+	// 4. Validate coverage not decreased (if previous exists)
+	if prevRateCount > 0 {
+		if err := v.ValidateCoverageNotDecreased(len(rates), prevRateCount); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// ValidatePricesPositive ensures no negative prices
+func (v *IngestionValidator) ValidatePricesPositive(rates []NormalizedRate) error {
+	for _, r := range rates {
+		if r.Price.IsNegative() {
+			return fmt.Errorf("negative price found: %s = %s", 
+				fmt.Sprintf("%s/%s/%s", r.RateKey.Service, r.RateKey.ProductFamily, r.RateKey.Region),
+				r.Price.String())
+		}
+	}
+	return nil
+}
+
+// ValidateDimensionsComplete ensures required dimensions exist
+func (v *IngestionValidator) ValidateDimensionsComplete(rates []NormalizedRate) error {
+	// Group by service
+	byService := make(map[string]map[string]bool)
+	for _, r := range rates {
+		if byService[r.RateKey.Service] == nil {
+			byService[r.RateKey.Service] = make(map[string]bool)
+		}
+		for k := range r.RateKey.Attributes {
+			byService[r.RateKey.Service][k] = true
+		}
+	}
+
+	// Check contracts
+	for _, contract := range v.contracts {
+		presentDims := byService[contract.Service]
+		if presentDims == nil {
+			continue // Service not in this ingestion
+		}
+		for _, reqDim := range contract.RequiredDimensions {
+			if !presentDims[reqDim] {
+				return fmt.Errorf("service %s missing required dimension: %s", contract.Service, reqDim)
+			}
+		}
+	}
+
+	return nil
+}
+
+// ValidateNoDuplicates ensures no duplicate rate keys
+func (v *IngestionValidator) ValidateNoDuplicates(rates []NormalizedRate) error {
+	seen := make(map[string]bool)
+	for _, r := range rates {
+		key := rateKeyForDedupe(r.RateKey)
+		if seen[key] {
+			return fmt.Errorf("duplicate rate key found: %s", key)
+		}
+		seen[key] = true
+	}
+	return nil
+}
+
+func rateKeyForDedupe(k db.RateKey) string {
+	return fmt.Sprintf("%s|%s|%s|%s|%v", k.Cloud, k.Service, k.ProductFamily, k.Region, k.Attributes)
+}
+
+// ValidateCoverageNotDecreased ensures coverage >= previous snapshot
+func (v *IngestionValidator) ValidateCoverageNotDecreased(newCount, prevCount int) error {
+	if newCount == 0 {
+		return fmt.Errorf("new snapshot has 0 rates, previous had %d", prevCount)
+	}
+
+	// Calculate coverage percentage
+	coveragePercent := float64(newCount) / float64(prevCount) * 100
+
+	if coveragePercent < v.minCoveragePercent {
+		return fmt.Errorf("coverage decreased: new has %d rates (%.1f%%) vs previous %d rates, minimum %.1f%% required",
+			newCount, coveragePercent, prevCount, v.minCoveragePercent)
+	}
+
+	return nil
 }

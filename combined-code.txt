@@ -3,7 +3,7 @@
 #                    TERRAFORM COST ESTIMATION SYSTEM                          #
 #                         Combined Source Code                                 #
 #                                                                              #
-#                    Generated: 2026-01-17 02:13:06                          #
+#                    Generated: 2026-01-17 12:44:52                          #
 #                                                                              #
 ################################################################################
 
@@ -136,6 +136,8 @@ cost estimation/
 |   |-- cli/
 |   |   |-- cmd/
 |   |   |   |-- estimate.go
+|   |   |   |-- pricing_restore.go
+|   |   |   |-- pricing_update.go
 |   |   |   +-- root.go
 |   |   +-- main.go
 |   +-- server/
@@ -281,11 +283,15 @@ cost estimation/
 |   |-- ingestion/
 |   |   |-- aws.go
 |   |   |-- aws_api.go
+|   |   |-- azure.go
+|   |   |-- backup.go
 |   |   |-- coverage.go
 |   |   |-- dimension_filter.go
 |   |   |-- drift.go
+|   |   |-- gcp.go
 |   |   |-- governance.go
-|   |   +-- pipeline.go
+|   |   |-- pipeline.go
+|   |   +-- pipeline_test.go
 |   |-- migrations/
 |   |   |-- 001_pricing_schema.sql
 |   |   |-- 002_pricing_dimensions.sql
@@ -16879,6 +16885,367 @@ func truncate(s string, maxLen int) string {
 		return s
 	}
 	return s[:maxLen-3] + "..."
+}
+
+################################################################################
+# FILE: :\good projects\cost estimation\cmd\cli\cmd\pricing_restore.go
+# TYPE: go
+# SIZE: 4625 bytes
+################################################################################
+// Package cmd - CLI command: terraform-cost pricing restore
+package cmd
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"time"
+
+	"terraform-cost/db/ingestion"
+
+	"github.com/spf13/cobra"
+)
+
+var pricingRestoreCmd = &cobra.Command{
+	Use:   "restore <backup-file>",
+	Short: "Restore pricing data from backup",
+	Long: `Restore pricing data from a local backup file.
+
+This command:
+  1. Reads the backup file (gzipped JSON)
+  2. Validates content hash and structure
+  3. Runs all governance checks
+  4. Creates a NEW snapshot (never overwrites existing)
+  5. Atomically commits to database
+
+IMPORTANT: This creates a new snapshot ID, not a rollback.`,
+	Args: cobra.ExactArgs(1),
+	RunE: runPricingRestore,
+}
+
+var (
+	restoreDryRun bool
+	restoreForce  bool
+)
+
+func init() {
+	pricingCmd.AddCommand(pricingRestoreCmd)
+
+	pricingRestoreCmd.Flags().BoolVar(&restoreDryRun, "dry-run", false, "Validate only, no database writes")
+	pricingRestoreCmd.Flags().BoolVar(&restoreForce, "force", false, "Skip coverage decrease check")
+}
+
+func runPricingRestore(cmd *cobra.Command, args []string) error {
+	backupPath := args[0]
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+
+	// Print header
+	fmt.Println("")
+	fmt.Println("â•”â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•—")
+	fmt.Println("â•‘           PRICING DATA RESTORE FROM BACKUP                   â•‘")
+	fmt.Println("â•šâ•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•")
+	fmt.Println("")
+	fmt.Printf("Backup file: %s\n", backupPath)
+	fmt.Printf("Dry-run:     %t\n", restoreDryRun)
+	fmt.Printf("Force:       %t\n", restoreForce)
+	fmt.Println("")
+
+	// Read backup
+	fmt.Println("Reading backup file...")
+	backupMgr := ingestion.NewBackupManager()
+	backup, err := backupMgr.ReadBackup(backupPath)
+	if err != nil {
+		fmt.Printf("âœ— Failed to read backup: %v\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Printf("âœ“ Backup read successfully\n")
+	fmt.Println("")
+
+	// Print backup info
+	fmt.Println("Backup details:")
+	fmt.Printf("  Provider:      %s\n", backup.Provider)
+	fmt.Printf("  Region:        %s\n", backup.Region)
+	fmt.Printf("  Alias:         %s\n", backup.Alias)
+	fmt.Printf("  Timestamp:     %s\n", backup.Timestamp.Format(time.RFC3339))
+	fmt.Printf("  Rate count:    %d\n", backup.RateCount)
+	fmt.Printf("  Content hash:  %s\n", truncateHash(backup.ContentHash))
+	fmt.Printf("  Schema:        %s\n", backup.SchemaVersion)
+	fmt.Println("")
+
+	// Run validation
+	fmt.Println("Running governance validation...")
+	validator := ingestion.NewIngestionValidator()
+	if restoreForce {
+		validator.SetMinCoveragePercent(0) // Skip coverage check
+	}
+
+	if err := validator.ValidateAll(backup.Rates, 0); err != nil {
+		fmt.Printf("âœ— Validation failed: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Println("âœ“ Validation passed")
+	fmt.Println("")
+
+	// Dry-run check
+	if restoreDryRun {
+		fmt.Println("â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•")
+		fmt.Println("âœ“ DRY-RUN COMPLETED - No database changes made")
+		fmt.Println("â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•")
+		return nil
+	}
+
+	// Get database store
+	store, err := getDBStore()
+	if err != nil {
+		return fmt.Errorf("failed to connect to database: %w", err)
+	}
+
+	// Check for existing snapshot with same hash
+	existing, _ := store.FindSnapshotByHash(ctx, backup.Provider, backup.Region, backup.Alias, backup.ContentHash)
+	if existing != nil {
+		fmt.Printf("âš  Snapshot with this content hash already exists: %s\n", existing.ID.String())
+		fmt.Println("  No action needed - data is already current")
+		return nil
+	}
+
+	// Create restore pipeline config
+	fmt.Println("Creating new snapshot...")
+
+	// For restore, we need to directly commit the rates
+	// This would normally go through the pipeline, but we already have normalized rates
+	fmt.Println("âœ— Database commit not yet implemented")
+	fmt.Println("  Backup validation successful - would create snapshot from %d rates", backup.RateCount)
+	os.Exit(1)
+
+	return nil
+}
+
+################################################################################
+# FILE: :\good projects\cost estimation\cmd\cli\cmd\pricing_update.go
+# TYPE: go
+# SIZE: 7114 bytes
+################################################################################
+// Package cmd - CLI command: terraform-cost pricing update
+package cmd
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"time"
+
+	"terraform-cost/db"
+	"terraform-cost/db/ingestion"
+
+	"github.com/spf13/cobra"
+)
+
+var pricingCmd = &cobra.Command{
+	Use:   "pricing",
+	Short: "Pricing data management commands",
+	Long:  "Commands for updating, restoring, and managing pricing data snapshots.",
+}
+
+var pricingUpdateCmd = &cobra.Command{
+	Use:   "update",
+	Short: "Update pricing data from cloud provider",
+	Long: `Manually trigger pricing data ingestion from cloud provider APIs.
+
+This command runs a 5-phase pipeline:
+  1. FETCH     - Download raw pricing from cloud API (no DB writes)
+  2. NORMALIZE - Transform to canonical dimensions
+  3. VALIDATE  - Governance checks (abort on failure)
+  4. BACKUP    - Write local snapshot dump
+  5. COMMIT    - Atomic database transaction
+
+IMPORTANT: This command is for operators only. Never run automatically.`,
+	RunE: runPricingUpdate,
+}
+
+var (
+	updateProvider  string
+	updateRegion    string
+	updateDryRun    bool
+	updateOutputDir string
+	updateAlias     string
+	updateTimeout   time.Duration
+)
+
+func init() {
+	// Add pricing command to root
+	rootCmd.AddCommand(pricingCmd)
+	pricingCmd.AddCommand(pricingUpdateCmd)
+
+	// Flags for update command
+	pricingUpdateCmd.Flags().StringVarP(&updateProvider, "provider", "p", "", "Cloud provider (aws, azure, gcp)")
+	pricingUpdateCmd.Flags().StringVarP(&updateRegion, "region", "r", "", "Region to ingest (e.g., us-east-1)")
+	pricingUpdateCmd.Flags().BoolVar(&updateDryRun, "dry-run", false, "Validate only, no database writes")
+	pricingUpdateCmd.Flags().StringVarP(&updateOutputDir, "output-dir", "o", "./pricing-backups", "Directory for backup files")
+	pricingUpdateCmd.Flags().StringVar(&updateAlias, "alias", "default", "Provider alias for multi-account")
+	pricingUpdateCmd.Flags().DurationVar(&updateTimeout, "timeout", 30*time.Minute, "Timeout for the pipeline")
+
+	pricingUpdateCmd.MarkFlagRequired("provider")
+	pricingUpdateCmd.MarkFlagRequired("region")
+}
+
+func runPricingUpdate(cmd *cobra.Command, args []string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), updateTimeout)
+	defer cancel()
+
+	// Parse provider
+	var provider db.CloudProvider
+	switch updateProvider {
+	case "aws":
+		provider = db.AWS
+	case "azure":
+		provider = db.Azure
+	case "gcp":
+		provider = db.GCP
+	default:
+		return fmt.Errorf("unsupported provider: %s (use aws, azure, or gcp)", updateProvider)
+	}
+
+	// Print header
+	fmt.Println("")
+	fmt.Println("â•”â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•—")
+	fmt.Println("â•‘           MANUAL PRICING DATA INGESTION PIPELINE             â•‘")
+	fmt.Println("â•šâ•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•")
+	fmt.Println("")
+	fmt.Printf("Provider:   %s\n", provider)
+	fmt.Printf("Region:     %s\n", updateRegion)
+	fmt.Printf("Alias:      %s\n", updateAlias)
+	fmt.Printf("Dry-run:    %t\n", updateDryRun)
+	fmt.Printf("Output:     %s\n", updateOutputDir)
+	fmt.Println("")
+
+	// Create fetcher and normalizer based on provider
+	var fetcher ingestion.PriceFetcher
+	var normalizer ingestion.PriceNormalizer
+
+	switch provider {
+	case db.AWS:
+		fetcher = ingestion.NewAWSPriceFetcher()
+		normalizer = ingestion.NewAWSPriceNormalizer()
+	case db.Azure:
+		fetcher = ingestion.NewAzurePriceFetcher()
+		normalizer = ingestion.NewAzurePriceNormalizer()
+	case db.GCP:
+		fetcher = ingestion.NewGCPPriceFetcher()
+		normalizer = ingestion.NewGCPPriceNormalizer()
+	default:
+		return fmt.Errorf("provider %s not implemented", provider)
+	}
+
+	// Get database store (placeholder - would come from config)
+	store, err := getDBStore()
+	if err != nil {
+		return fmt.Errorf("failed to connect to database: %w", err)
+	}
+
+	// Create pipeline
+	pipeline := ingestion.NewPipeline(fetcher, normalizer, store)
+
+	// Configure
+	config := &ingestion.PipelineConfig{
+		Provider:           provider,
+		Region:             updateRegion,
+		Alias:              updateAlias,
+		DryRun:             updateDryRun,
+		BackupDir:          updateOutputDir,
+		MinCoveragePercent: 95.0,
+		Timeout:            updateTimeout,
+	}
+
+	// Execute
+	fmt.Println("Starting pipeline...")
+	fmt.Println("")
+	result, err := pipeline.Execute(ctx, config)
+	if err != nil {
+		return fmt.Errorf("pipeline execution failed: %w", err)
+	}
+
+	// Print results
+	printPipelineResult(result)
+
+	// Exit with error if failed
+	if !result.Success {
+		os.Exit(1)
+	}
+
+	return nil
+}
+
+func printPipelineResult(result *ingestion.PipelineResult) {
+	fmt.Println("â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•")
+	
+	if result.Success {
+		fmt.Println("âœ“ PIPELINE COMPLETED SUCCESSFULLY")
+	} else {
+		fmt.Printf("âœ— PIPELINE FAILED at phase: %s\n", result.FailedPhase)
+		fmt.Printf("  Error: %s\n", result.Error)
+	}
+	
+	fmt.Println("â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•")
+	fmt.Println("")
+
+	// Phases
+	fmt.Println("Phases completed:")
+	phases := []ingestion.Phase{
+		ingestion.PhaseFetch,
+		ingestion.PhaseNormalize,
+		ingestion.PhaseValidate,
+		ingestion.PhaseBackup,
+		ingestion.PhaseCommit,
+	}
+	for _, phase := range phases {
+		status := "â¬œ"
+		for _, completed := range result.PhasesCompleted {
+			if completed == phase {
+				status = "âœ“"
+				break
+			}
+		}
+		if phase == result.FailedPhase {
+			status = "âœ—"
+		}
+		fmt.Printf("  %s %s\n", status, phase)
+	}
+	fmt.Println("")
+
+	// Stats
+	fmt.Println("Statistics:")
+	fmt.Printf("  Raw prices fetched:     %d\n", result.Stats.RawPricesCount)
+	fmt.Printf("  Normalized rates:       %d\n", result.Stats.NormalizedRatesCount)
+	fmt.Printf("  Unique services:        %d\n", result.Stats.UniqueServicesCount)
+	fmt.Printf("  Content hash:           %s\n", truncateHash(result.Stats.ContentHash))
+	fmt.Println("")
+
+	if result.BackupPath != "" {
+		fmt.Printf("Backup written to: %s\n", result.BackupPath)
+	}
+
+	if result.SnapshotID != nil {
+		fmt.Printf("Snapshot ID: %s\n", result.SnapshotID.String())
+	}
+
+	fmt.Printf("\nDuration: %s\n", result.Duration)
+}
+
+func truncateHash(hash string) string {
+	if len(hash) > 16 {
+		return hash[:16] + "..."
+	}
+	return hash
+}
+
+// getDBStore returns the database store (placeholder)
+func getDBStore() (db.PricingStore, error) {
+	// TODO: Load from config
+	// For now, return nil to indicate not implemented
+	return nil, fmt.Errorf("database connection not configured - set DATABASE_URL environment variable")
 }
 
 ################################################################################
@@ -43185,7 +43552,7 @@ func (r *AggregateRisk) Summary() string {
 ################################################################################
 # FILE: :\good projects\cost estimation\db\postgres.go
 # TYPE: go
-# SIZE: 10412 bytes
+# SIZE: 15223 bytes
 ################################################################################
 // Package db - PostgreSQL implementation of PricingStore
 package db
@@ -43512,6 +43879,145 @@ func (s *PostgresStore) ResolveTieredRates(ctx context.Context, cloud CloudProvi
 		tiers = append(tiers, t)
 	}
 	return tiers, nil
+}
+
+// Transaction interface for atomic operations
+type Tx interface {
+	CreateSnapshot(ctx context.Context, snapshot *PricingSnapshot) error
+	UpsertRateKey(ctx context.Context, key *RateKey) (*RateKey, error)
+	CreateRate(ctx context.Context, rate *PricingRate) error
+	ActivateSnapshot(ctx context.Context, id uuid.UUID) error
+	Commit() error
+	Rollback() error
+}
+
+// PostgresTx wraps a database transaction
+type PostgresTx struct {
+	tx *sql.Tx
+}
+
+// BeginTx starts a new transaction
+func (s *PostgresStore) BeginTx(ctx context.Context) (Tx, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	return &PostgresTx{tx: tx}, nil
+}
+
+// CreateSnapshot creates a snapshot within a transaction
+func (t *PostgresTx) CreateSnapshot(ctx context.Context, snapshot *PricingSnapshot) error {
+	query := `
+		INSERT INTO pricing_snapshots 
+		(id, cloud, region, provider_alias, source, fetched_at, valid_from, valid_to, hash, version, is_active)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+	`
+	_, err := t.tx.ExecContext(ctx, query,
+		snapshot.ID, snapshot.Cloud, snapshot.Region, snapshot.ProviderAlias,
+		snapshot.Source, snapshot.FetchedAt, snapshot.ValidFrom, snapshot.ValidTo,
+		snapshot.Hash, snapshot.Version, snapshot.IsActive,
+	)
+	return err
+}
+
+// UpsertRateKey inserts or returns existing rate key within a transaction
+func (t *PostgresTx) UpsertRateKey(ctx context.Context, key *RateKey) (*RateKey, error) {
+	attrsJSON, err := json.Marshal(key.Attributes)
+	if err != nil {
+		return nil, err
+	}
+
+	query := `
+		INSERT INTO pricing_rate_keys (id, cloud, service, product_family, region, attributes)
+		VALUES ($1, $2, $3, $4, $5, $6)
+		ON CONFLICT (cloud, service, product_family, region, attributes) 
+		DO UPDATE SET id = pricing_rate_keys.id
+		RETURNING id, created_at
+	`
+	err = t.tx.QueryRowContext(ctx, query,
+		key.ID, key.Cloud, key.Service, key.ProductFamily, key.Region, attrsJSON,
+	).Scan(&key.ID, &key.CreatedAt)
+	return key, err
+}
+
+// CreateRate creates a rate within a transaction
+func (t *PostgresTx) CreateRate(ctx context.Context, rate *PricingRate) error {
+	query := `
+		INSERT INTO pricing_rates 
+		(id, snapshot_id, rate_key_id, unit, price, currency, confidence, tier_min, tier_max, effective_date)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+	`
+	_, err := t.tx.ExecContext(ctx, query,
+		rate.ID, rate.SnapshotID, rate.RateKeyID, rate.Unit,
+		rate.Price, rate.Currency, rate.Confidence,
+		rate.TierMin, rate.TierMax, rate.EffectiveDate,
+	)
+	return err
+}
+
+// ActivateSnapshot activates a snapshot within a transaction
+func (t *PostgresTx) ActivateSnapshot(ctx context.Context, id uuid.UUID) error {
+	// Deactivate existing snapshots for same cloud/region/alias
+	_, err := t.tx.ExecContext(ctx, `
+		UPDATE pricing_snapshots SET is_active = FALSE 
+		WHERE id IN (
+			SELECT ps2.id FROM pricing_snapshots ps2 
+			JOIN pricing_snapshots ps1 ON ps1.cloud = ps2.cloud 
+				AND ps1.region = ps2.region 
+				AND ps1.provider_alias = ps2.provider_alias
+			WHERE ps1.id = $1 AND ps2.id != $1 AND ps2.is_active = TRUE
+		)
+	`, id)
+	if err != nil {
+		return err
+	}
+	
+	// Activate the new snapshot
+	_, err = t.tx.ExecContext(ctx, `
+		UPDATE pricing_snapshots SET is_active = TRUE WHERE id = $1
+	`, id)
+	return err
+}
+
+// Commit commits the transaction
+func (t *PostgresTx) Commit() error {
+	return t.tx.Commit()
+}
+
+// Rollback rolls back the transaction
+func (t *PostgresTx) Rollback() error {
+	return t.tx.Rollback()
+}
+
+// FindSnapshotByHash finds a snapshot with matching content hash
+func (s *PostgresStore) FindSnapshotByHash(ctx context.Context, cloud CloudProvider, region, alias, hash string) (*PricingSnapshot, error) {
+	query := `
+		SELECT id, cloud, region, provider_alias, source, fetched_at, valid_from, valid_to, hash, version, is_active, created_at
+		FROM pricing_snapshots 
+		WHERE cloud = $1 AND region = $2 AND provider_alias = $3 AND hash = $4
+		ORDER BY created_at DESC
+		LIMIT 1
+	`
+	snapshot := &PricingSnapshot{}
+	err := s.db.QueryRowContext(ctx, query, cloud, region, alias, hash).Scan(
+		&snapshot.ID, &snapshot.Cloud, &snapshot.Region, &snapshot.ProviderAlias,
+		&snapshot.Source, &snapshot.FetchedAt, &snapshot.ValidFrom, &snapshot.ValidTo,
+		&snapshot.Hash, &snapshot.Version, &snapshot.IsActive, &snapshot.CreatedAt,
+	)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	return snapshot, err
+}
+
+// CountRates returns the count of rates in a snapshot
+func (s *PostgresStore) CountRates(ctx context.Context, snapshotID uuid.UUID) (int, error) {
+	var count int
+	err := s.db.QueryRowContext(ctx, 
+		"SELECT COUNT(*) FROM pricing_rates WHERE snapshot_id = $1", 
+		snapshotID,
+	).Scan(&count)
+	return count, err
 }
 
 ################################################################################
@@ -44079,7 +44585,7 @@ func (b *SnapshotBuilder) Build(hash string) *PricingSnapshot {
 ################################################################################
 # FILE: :\good projects\cost estimation\db\ingestion\aws.go
 # TYPE: go
-# SIZE: 9524 bytes
+# SIZE: 36895 bytes
 ################################################################################
 // Package ingestion - AWS pricing fetcher and normalizer
 package ingestion
@@ -44122,6 +44628,29 @@ func (f *AWSFetcher) SupportedRegions() []string {
 	return f.regions
 }
 
+// SupportedServices returns services this fetcher covers
+func (f *AWSFetcher) SupportedServices() []string {
+	return []string{
+		"AmazonEC2",
+		"AmazonRDS",
+		"AmazonS3",
+		"AWSLambda",
+		"ElasticLoadBalancing",
+		"AmazonDynamoDB",
+		"AmazonECS",
+		"AmazonElastiCache",
+		"AWSSecretsManager",
+		"AmazonCloudWatch",
+		"AmazonVPC",
+		"AWSDataTransfer",
+		"AWSQueueService",
+		"AmazonSNS",
+		"awskms",
+		"AWSCertificateManager",
+		"AmazonRoute53",
+	}
+}
+
 // FetchRegion fetches AWS pricing for a region
 // Note: In production, use AWS Pricing API or bulk price list files
 func (f *AWSFetcher) FetchRegion(ctx context.Context, region string) ([]RawPrice, error) {
@@ -44132,10 +44661,16 @@ func (f *AWSFetcher) FetchRegion(ctx context.Context, region string) ([]RawPrice
 	return f.getStubPrices(region), nil
 }
 
-// getStubPrices returns development stub prices
+// getStubPrices returns development stub prices for ALL supported AWS services
 func (f *AWSFetcher) getStubPrices(region string) []RawPrice {
 	return []RawPrice{
-		// EC2 Instances
+		// ============================================================
+		// EC2 INSTANCES - aws_instance
+		// ============================================================
+		// T3 Series (Burstable)
+		{SKU: "ec2-t3-nano", ServiceCode: "AmazonEC2", ProductFamily: "Compute Instance", Region: region,
+			Unit: "Hrs", PricePerUnit: "0.0052", Currency: "USD",
+			Attributes: map[string]string{"instanceType": "t3.nano", "operatingSystem": "Linux", "tenancy": "Shared"}},
 		{SKU: "ec2-t3-micro", ServiceCode: "AmazonEC2", ProductFamily: "Compute Instance", Region: region,
 			Unit: "Hrs", PricePerUnit: "0.0104", Currency: "USD",
 			Attributes: map[string]string{"instanceType": "t3.micro", "operatingSystem": "Linux", "tenancy": "Shared"}},
@@ -44148,55 +44683,409 @@ func (f *AWSFetcher) getStubPrices(region string) []RawPrice {
 		{SKU: "ec2-t3-large", ServiceCode: "AmazonEC2", ProductFamily: "Compute Instance", Region: region,
 			Unit: "Hrs", PricePerUnit: "0.0832", Currency: "USD",
 			Attributes: map[string]string{"instanceType": "t3.large", "operatingSystem": "Linux", "tenancy": "Shared"}},
+		{SKU: "ec2-t3-xlarge", ServiceCode: "AmazonEC2", ProductFamily: "Compute Instance", Region: region,
+			Unit: "Hrs", PricePerUnit: "0.1664", Currency: "USD",
+			Attributes: map[string]string{"instanceType": "t3.xlarge", "operatingSystem": "Linux", "tenancy": "Shared"}},
+		{SKU: "ec2-t3-2xlarge", ServiceCode: "AmazonEC2", ProductFamily: "Compute Instance", Region: region,
+			Unit: "Hrs", PricePerUnit: "0.3328", Currency: "USD",
+			Attributes: map[string]string{"instanceType": "t3.2xlarge", "operatingSystem": "Linux", "tenancy": "Shared"}},
+
+		// M5 Series (General Purpose)
 		{SKU: "ec2-m5-large", ServiceCode: "AmazonEC2", ProductFamily: "Compute Instance", Region: region,
 			Unit: "Hrs", PricePerUnit: "0.096", Currency: "USD",
 			Attributes: map[string]string{"instanceType": "m5.large", "operatingSystem": "Linux", "tenancy": "Shared"}},
-		
-		// EBS Volumes
+		{SKU: "ec2-m5-xlarge", ServiceCode: "AmazonEC2", ProductFamily: "Compute Instance", Region: region,
+			Unit: "Hrs", PricePerUnit: "0.192", Currency: "USD",
+			Attributes: map[string]string{"instanceType": "m5.xlarge", "operatingSystem": "Linux", "tenancy": "Shared"}},
+		{SKU: "ec2-m5-2xlarge", ServiceCode: "AmazonEC2", ProductFamily: "Compute Instance", Region: region,
+			Unit: "Hrs", PricePerUnit: "0.384", Currency: "USD",
+			Attributes: map[string]string{"instanceType": "m5.2xlarge", "operatingSystem": "Linux", "tenancy": "Shared"}},
+		{SKU: "ec2-m5-4xlarge", ServiceCode: "AmazonEC2", ProductFamily: "Compute Instance", Region: region,
+			Unit: "Hrs", PricePerUnit: "0.768", Currency: "USD",
+			Attributes: map[string]string{"instanceType": "m5.4xlarge", "operatingSystem": "Linux", "tenancy": "Shared"}},
+
+		// C5 Series (Compute Optimized)
+		{SKU: "ec2-c5-large", ServiceCode: "AmazonEC2", ProductFamily: "Compute Instance", Region: region,
+			Unit: "Hrs", PricePerUnit: "0.085", Currency: "USD",
+			Attributes: map[string]string{"instanceType": "c5.large", "operatingSystem": "Linux", "tenancy": "Shared"}},
+		{SKU: "ec2-c5-xlarge", ServiceCode: "AmazonEC2", ProductFamily: "Compute Instance", Region: region,
+			Unit: "Hrs", PricePerUnit: "0.17", Currency: "USD",
+			Attributes: map[string]string{"instanceType": "c5.xlarge", "operatingSystem": "Linux", "tenancy": "Shared"}},
+		{SKU: "ec2-c5-2xlarge", ServiceCode: "AmazonEC2", ProductFamily: "Compute Instance", Region: region,
+			Unit: "Hrs", PricePerUnit: "0.34", Currency: "USD",
+			Attributes: map[string]string{"instanceType": "c5.2xlarge", "operatingSystem": "Linux", "tenancy": "Shared"}},
+
+		// R5 Series (Memory Optimized)
+		{SKU: "ec2-r5-large", ServiceCode: "AmazonEC2", ProductFamily: "Compute Instance", Region: region,
+			Unit: "Hrs", PricePerUnit: "0.126", Currency: "USD",
+			Attributes: map[string]string{"instanceType": "r5.large", "operatingSystem": "Linux", "tenancy": "Shared"}},
+		{SKU: "ec2-r5-xlarge", ServiceCode: "AmazonEC2", ProductFamily: "Compute Instance", Region: region,
+			Unit: "Hrs", PricePerUnit: "0.252", Currency: "USD",
+			Attributes: map[string]string{"instanceType": "r5.xlarge", "operatingSystem": "Linux", "tenancy": "Shared"}},
+
+		// Windows Instances
+		{SKU: "ec2-t3-micro-win", ServiceCode: "AmazonEC2", ProductFamily: "Compute Instance", Region: region,
+			Unit: "Hrs", PricePerUnit: "0.0208", Currency: "USD",
+			Attributes: map[string]string{"instanceType": "t3.micro", "operatingSystem": "Windows", "tenancy": "Shared"}},
+		{SKU: "ec2-m5-large-win", ServiceCode: "AmazonEC2", ProductFamily: "Compute Instance", Region: region,
+			Unit: "Hrs", PricePerUnit: "0.188", Currency: "USD",
+			Attributes: map[string]string{"instanceType": "m5.large", "operatingSystem": "Windows", "tenancy": "Shared"}},
+
+		// ============================================================
+		// EBS VOLUMES - aws_ebs_volume
+		// ============================================================
 		{SKU: "ebs-gp3", ServiceCode: "AmazonEC2", ProductFamily: "Storage", Region: region,
 			Unit: "GB-Mo", PricePerUnit: "0.08", Currency: "USD",
-			Attributes: map[string]string{"volumeApiName": "gp3"}},
+			Attributes: map[string]string{"volumeApiName": "gp3", "volumeType": "General Purpose"}},
+		{SKU: "ebs-gp3-iops", ServiceCode: "AmazonEC2", ProductFamily: "Storage", Region: region,
+			Unit: "IOPS-Mo", PricePerUnit: "0.005", Currency: "USD",
+			Attributes: map[string]string{"volumeApiName": "gp3", "usagetype": "IOPS"}},
+		{SKU: "ebs-gp3-throughput", ServiceCode: "AmazonEC2", ProductFamily: "Storage", Region: region,
+			Unit: "MiBps-Mo", PricePerUnit: "0.04", Currency: "USD",
+			Attributes: map[string]string{"volumeApiName": "gp3", "usagetype": "Throughput"}},
 		{SKU: "ebs-gp2", ServiceCode: "AmazonEC2", ProductFamily: "Storage", Region: region,
 			Unit: "GB-Mo", PricePerUnit: "0.10", Currency: "USD",
-			Attributes: map[string]string{"volumeApiName": "gp2"}},
+			Attributes: map[string]string{"volumeApiName": "gp2", "volumeType": "General Purpose"}},
 		{SKU: "ebs-io1", ServiceCode: "AmazonEC2", ProductFamily: "Storage", Region: region,
 			Unit: "GB-Mo", PricePerUnit: "0.125", Currency: "USD",
-			Attributes: map[string]string{"volumeApiName": "io1"}},
-		
-		// RDS
+			Attributes: map[string]string{"volumeApiName": "io1", "volumeType": "Provisioned IOPS"}},
+		{SKU: "ebs-io1-iops", ServiceCode: "AmazonEC2", ProductFamily: "Storage", Region: region,
+			Unit: "IOPS-Mo", PricePerUnit: "0.065", Currency: "USD",
+			Attributes: map[string]string{"volumeApiName": "io1", "usagetype": "IOPS"}},
+		{SKU: "ebs-io2", ServiceCode: "AmazonEC2", ProductFamily: "Storage", Region: region,
+			Unit: "GB-Mo", PricePerUnit: "0.125", Currency: "USD",
+			Attributes: map[string]string{"volumeApiName": "io2", "volumeType": "Provisioned IOPS"}},
+		{SKU: "ebs-st1", ServiceCode: "AmazonEC2", ProductFamily: "Storage", Region: region,
+			Unit: "GB-Mo", PricePerUnit: "0.045", Currency: "USD",
+			Attributes: map[string]string{"volumeApiName": "st1", "volumeType": "Throughput Optimized"}},
+		{SKU: "ebs-sc1", ServiceCode: "AmazonEC2", ProductFamily: "Storage", Region: region,
+			Unit: "GB-Mo", PricePerUnit: "0.025", Currency: "USD",
+			Attributes: map[string]string{"volumeApiName": "sc1", "volumeType": "Cold HDD"}},
+		{SKU: "ebs-standard", ServiceCode: "AmazonEC2", ProductFamily: "Storage", Region: region,
+			Unit: "GB-Mo", PricePerUnit: "0.05", Currency: "USD",
+			Attributes: map[string]string{"volumeApiName": "standard", "volumeType": "Magnetic"}},
+
+		// EBS Snapshots
+		{SKU: "ebs-snapshot", ServiceCode: "AmazonEC2", ProductFamily: "Storage Snapshot", Region: region,
+			Unit: "GB-Mo", PricePerUnit: "0.05", Currency: "USD",
+			Attributes: map[string]string{"usagetype": "EBS:SnapshotUsage"}},
+
+		// ============================================================
+		// RDS - aws_db_instance
+		// ============================================================
+		// MySQL
 		{SKU: "rds-mysql-db.t3.micro", ServiceCode: "AmazonRDS", ProductFamily: "Database Instance", Region: region,
 			Unit: "Hrs", PricePerUnit: "0.017", Currency: "USD",
 			Attributes: map[string]string{"instanceType": "db.t3.micro", "databaseEngine": "MySQL"}},
 		{SKU: "rds-mysql-db.t3.small", ServiceCode: "AmazonRDS", ProductFamily: "Database Instance", Region: region,
 			Unit: "Hrs", PricePerUnit: "0.034", Currency: "USD",
 			Attributes: map[string]string{"instanceType": "db.t3.small", "databaseEngine": "MySQL"}},
+		{SKU: "rds-mysql-db.t3.medium", ServiceCode: "AmazonRDS", ProductFamily: "Database Instance", Region: region,
+			Unit: "Hrs", PricePerUnit: "0.068", Currency: "USD",
+			Attributes: map[string]string{"instanceType": "db.t3.medium", "databaseEngine": "MySQL"}},
+		{SKU: "rds-mysql-db.m5.large", ServiceCode: "AmazonRDS", ProductFamily: "Database Instance", Region: region,
+			Unit: "Hrs", PricePerUnit: "0.171", Currency: "USD",
+			Attributes: map[string]string{"instanceType": "db.m5.large", "databaseEngine": "MySQL"}},
+		{SKU: "rds-mysql-db.r5.large", ServiceCode: "AmazonRDS", ProductFamily: "Database Instance", Region: region,
+			Unit: "Hrs", PricePerUnit: "0.24", Currency: "USD",
+			Attributes: map[string]string{"instanceType": "db.r5.large", "databaseEngine": "MySQL"}},
+
+		// PostgreSQL
+		{SKU: "rds-postgres-db.t3.micro", ServiceCode: "AmazonRDS", ProductFamily: "Database Instance", Region: region,
+			Unit: "Hrs", PricePerUnit: "0.018", Currency: "USD",
+			Attributes: map[string]string{"instanceType": "db.t3.micro", "databaseEngine": "PostgreSQL"}},
 		{SKU: "rds-postgres-db.t3.small", ServiceCode: "AmazonRDS", ProductFamily: "Database Instance", Region: region,
 			Unit: "Hrs", PricePerUnit: "0.036", Currency: "USD",
 			Attributes: map[string]string{"instanceType": "db.t3.small", "databaseEngine": "PostgreSQL"}},
-		
-		// NAT Gateway
+		{SKU: "rds-postgres-db.m5.large", ServiceCode: "AmazonRDS", ProductFamily: "Database Instance", Region: region,
+			Unit: "Hrs", PricePerUnit: "0.178", Currency: "USD",
+			Attributes: map[string]string{"instanceType": "db.m5.large", "databaseEngine": "PostgreSQL"}},
+
+		// Aurora MySQL
+		{SKU: "rds-aurora-mysql-db.t3.small", ServiceCode: "AmazonRDS", ProductFamily: "Database Instance", Region: region,
+			Unit: "Hrs", PricePerUnit: "0.041", Currency: "USD",
+			Attributes: map[string]string{"instanceType": "db.t3.small", "databaseEngine": "Aurora MySQL"}},
+		{SKU: "rds-aurora-mysql-db.r5.large", ServiceCode: "AmazonRDS", ProductFamily: "Database Instance", Region: region,
+			Unit: "Hrs", PricePerUnit: "0.29", Currency: "USD",
+			Attributes: map[string]string{"instanceType": "db.r5.large", "databaseEngine": "Aurora MySQL"}},
+
+		// RDS Storage
+		{SKU: "rds-storage-gp2", ServiceCode: "AmazonRDS", ProductFamily: "Database Storage", Region: region,
+			Unit: "GB-Mo", PricePerUnit: "0.115", Currency: "USD",
+			Attributes: map[string]string{"volumeType": "General Purpose (SSD)"}},
+		{SKU: "rds-storage-io1", ServiceCode: "AmazonRDS", ProductFamily: "Database Storage", Region: region,
+			Unit: "GB-Mo", PricePerUnit: "0.125", Currency: "USD",
+			Attributes: map[string]string{"volumeType": "Provisioned IOPS (SSD)"}},
+		{SKU: "rds-iops", ServiceCode: "AmazonRDS", ProductFamily: "Provisioned IOPS", Region: region,
+			Unit: "IOPS-Mo", PricePerUnit: "0.10", Currency: "USD",
+			Attributes: map[string]string{"usagetype": "RDS:PIOPS"}},
+
+		// ============================================================
+		// S3 - aws_s3_bucket
+		// ============================================================
+		// Storage Classes
+		{SKU: "s3-standard", ServiceCode: "AmazonS3", ProductFamily: "Storage", Region: region,
+			Unit: "GB-Mo", PricePerUnit: "0.023", Currency: "USD",
+			Attributes: map[string]string{"storageClass": "General Purpose", "volumeType": "Standard"}},
+		{SKU: "s3-intelligent-tiering", ServiceCode: "AmazonS3", ProductFamily: "Storage", Region: region,
+			Unit: "GB-Mo", PricePerUnit: "0.023", Currency: "USD",
+			Attributes: map[string]string{"storageClass": "Intelligent-Tiering"}},
+		{SKU: "s3-standard-ia", ServiceCode: "AmazonS3", ProductFamily: "Storage", Region: region,
+			Unit: "GB-Mo", PricePerUnit: "0.0125", Currency: "USD",
+			Attributes: map[string]string{"storageClass": "Infrequent Access"}},
+		{SKU: "s3-onezone-ia", ServiceCode: "AmazonS3", ProductFamily: "Storage", Region: region,
+			Unit: "GB-Mo", PricePerUnit: "0.01", Currency: "USD",
+			Attributes: map[string]string{"storageClass": "One Zone - Infrequent Access"}},
+		{SKU: "s3-glacier-instant", ServiceCode: "AmazonS3", ProductFamily: "Storage", Region: region,
+			Unit: "GB-Mo", PricePerUnit: "0.004", Currency: "USD",
+			Attributes: map[string]string{"storageClass": "Glacier Instant Retrieval"}},
+		{SKU: "s3-glacier-flexible", ServiceCode: "AmazonS3", ProductFamily: "Storage", Region: region,
+			Unit: "GB-Mo", PricePerUnit: "0.0036", Currency: "USD",
+			Attributes: map[string]string{"storageClass": "Glacier Flexible Retrieval"}},
+		{SKU: "s3-glacier-deep", ServiceCode: "AmazonS3", ProductFamily: "Storage", Region: region,
+			Unit: "GB-Mo", PricePerUnit: "0.00099", Currency: "USD",
+			Attributes: map[string]string{"storageClass": "Glacier Deep Archive"}},
+
+		// S3 Requests
+		{SKU: "s3-put-requests", ServiceCode: "AmazonS3", ProductFamily: "API Requests", Region: region,
+			Unit: "Requests", PricePerUnit: "0.000005", Currency: "USD",
+			Attributes: map[string]string{"operation": "PUT", "storageClass": "Standard"}},
+		{SKU: "s3-get-requests", ServiceCode: "AmazonS3", ProductFamily: "API Requests", Region: region,
+			Unit: "Requests", PricePerUnit: "0.0000004", Currency: "USD",
+			Attributes: map[string]string{"operation": "GET", "storageClass": "Standard"}},
+		{SKU: "s3-list-requests", ServiceCode: "AmazonS3", ProductFamily: "API Requests", Region: region,
+			Unit: "Requests", PricePerUnit: "0.000005", Currency: "USD",
+			Attributes: map[string]string{"operation": "LIST", "storageClass": "Standard"}},
+
+		// S3 Data Transfer
+		{SKU: "s3-data-transfer-out", ServiceCode: "AmazonS3", ProductFamily: "Data Transfer", Region: region,
+			Unit: "GB", PricePerUnit: "0.09", Currency: "USD",
+			Attributes: map[string]string{"transferType": "AWS Outbound", "fromLocation": region}},
+
+		// ============================================================
+		// NAT GATEWAY - aws_nat_gateway
+		// ============================================================
 		{SKU: "nat-gateway-hour", ServiceCode: "AmazonEC2", ProductFamily: "NAT Gateway", Region: region,
 			Unit: "Hrs", PricePerUnit: "0.045", Currency: "USD",
 			Attributes: map[string]string{"usagetype": "NatGateway-Hours"}},
 		{SKU: "nat-gateway-data", ServiceCode: "AmazonEC2", ProductFamily: "NAT Gateway", Region: region,
 			Unit: "GB", PricePerUnit: "0.045", Currency: "USD",
 			Attributes: map[string]string{"usagetype": "NatGateway-Bytes"}},
-		
-		// Lambda
+
+		// ============================================================
+		// LAMBDA - aws_lambda_function
+		// ============================================================
 		{SKU: "lambda-requests", ServiceCode: "AWSLambda", ProductFamily: "Serverless", Region: region,
 			Unit: "Requests", PricePerUnit: "0.0000002", Currency: "USD",
 			Attributes: map[string]string{"group": "AWS-Lambda-Requests"}},
-		{SKU: "lambda-duration", ServiceCode: "AWSLambda", ProductFamily: "Serverless", Region: region,
+		{SKU: "lambda-duration-128", ServiceCode: "AWSLambda", ProductFamily: "Serverless", Region: region,
 			Unit: "GB-Second", PricePerUnit: "0.0000166667", Currency: "USD",
-			Attributes: map[string]string{"group": "AWS-Lambda-Duration"}},
-		
-		// Load Balancer
+			Attributes: map[string]string{"group": "AWS-Lambda-Duration", "memorySize": "128"}},
+		{SKU: "lambda-duration-512", ServiceCode: "AWSLambda", ProductFamily: "Serverless", Region: region,
+			Unit: "GB-Second", PricePerUnit: "0.0000166667", Currency: "USD",
+			Attributes: map[string]string{"group": "AWS-Lambda-Duration", "memorySize": "512"}},
+		{SKU: "lambda-duration-1024", ServiceCode: "AWSLambda", ProductFamily: "Serverless", Region: region,
+			Unit: "GB-Second", PricePerUnit: "0.0000166667", Currency: "USD",
+			Attributes: map[string]string{"group": "AWS-Lambda-Duration", "memorySize": "1024"}},
+		{SKU: "lambda-provisioned-concurrency", ServiceCode: "AWSLambda", ProductFamily: "Serverless", Region: region,
+			Unit: "GB-Second", PricePerUnit: "0.000004", Currency: "USD",
+			Attributes: map[string]string{"group": "AWS-Lambda-Provisioned-Concurrency"}},
+
+		// ============================================================
+		// LOAD BALANCERS - aws_lb, aws_alb, aws_nlb
+		// ============================================================
 		{SKU: "alb-hour", ServiceCode: "ElasticLoadBalancing", ProductFamily: "Load Balancer", Region: region,
 			Unit: "Hrs", PricePerUnit: "0.0225", Currency: "USD",
-			Attributes: map[string]string{"productFamily": "Load Balancer-Application"}},
+			Attributes: map[string]string{"productFamily": "Load Balancer-Application", "usagetype": "LoadBalancerUsage"}},
+		{SKU: "alb-lcu", ServiceCode: "ElasticLoadBalancing", ProductFamily: "Load Balancer", Region: region,
+			Unit: "LCU-Hrs", PricePerUnit: "0.008", Currency: "USD",
+			Attributes: map[string]string{"productFamily": "Load Balancer-Application", "usagetype": "LCUUsage"}},
 		{SKU: "nlb-hour", ServiceCode: "ElasticLoadBalancing", ProductFamily: "Load Balancer", Region: region,
 			Unit: "Hrs", PricePerUnit: "0.0225", Currency: "USD",
 			Attributes: map[string]string{"productFamily": "Load Balancer-Network"}},
+		{SKU: "nlb-lcu", ServiceCode: "ElasticLoadBalancing", ProductFamily: "Load Balancer", Region: region,
+			Unit: "NLCU-Hrs", PricePerUnit: "0.006", Currency: "USD",
+			Attributes: map[string]string{"productFamily": "Load Balancer-Network", "usagetype": "NLCUUsage"}},
+		{SKU: "clb-hour", ServiceCode: "ElasticLoadBalancing", ProductFamily: "Load Balancer", Region: region,
+			Unit: "Hrs", PricePerUnit: "0.025", Currency: "USD",
+			Attributes: map[string]string{"productFamily": "Load Balancer-Classic"}},
+		{SKU: "clb-data", ServiceCode: "ElasticLoadBalancing", ProductFamily: "Load Balancer", Region: region,
+			Unit: "GB", PricePerUnit: "0.008", Currency: "USD",
+			Attributes: map[string]string{"productFamily": "Load Balancer-Classic", "usagetype": "DataProcessing"}},
+
+		// ============================================================
+		// ECS / FARGATE - aws_ecs_service, aws_ecs_task_definition
+		// ============================================================
+		{SKU: "fargate-vcpu", ServiceCode: "AmazonECS", ProductFamily: "Compute", Region: region,
+			Unit: "vCPU-Hours", PricePerUnit: "0.04048", Currency: "USD",
+			Attributes: map[string]string{"cputype": "ARM", "usagetype": "Fargate-vCPU-Hours"}},
+		{SKU: "fargate-vcpu-x86", ServiceCode: "AmazonECS", ProductFamily: "Compute", Region: region,
+			Unit: "vCPU-Hours", PricePerUnit: "0.04048", Currency: "USD",
+			Attributes: map[string]string{"cputype": "x86", "usagetype": "Fargate-vCPU-Hours"}},
+		{SKU: "fargate-memory", ServiceCode: "AmazonECS", ProductFamily: "Compute", Region: region,
+			Unit: "GB-Hours", PricePerUnit: "0.004445", Currency: "USD",
+			Attributes: map[string]string{"usagetype": "Fargate-GB-Hours"}},
+		{SKU: "fargate-spot-vcpu", ServiceCode: "AmazonECS", ProductFamily: "Compute", Region: region,
+			Unit: "vCPU-Hours", PricePerUnit: "0.01334384", Currency: "USD",
+			Attributes: map[string]string{"usagetype": "Fargate-SpotUsage-vCPU-Hours"}},
+		{SKU: "fargate-spot-memory", ServiceCode: "AmazonECS", ProductFamily: "Compute", Region: region,
+			Unit: "GB-Hours", PricePerUnit: "0.00146489", Currency: "USD",
+			Attributes: map[string]string{"usagetype": "Fargate-SpotUsage-GB-Hours"}},
+
+		// ============================================================
+		// DYNAMODB - aws_dynamodb_table
+		// ============================================================
+		{SKU: "dynamodb-wcu", ServiceCode: "AmazonDynamoDB", ProductFamily: "Provisioned Throughput", Region: region,
+			Unit: "WriteCapacityUnit-Hrs", PricePerUnit: "0.00065", Currency: "USD",
+			Attributes: map[string]string{"group": "DDB-WriteUnits"}},
+		{SKU: "dynamodb-rcu", ServiceCode: "AmazonDynamoDB", ProductFamily: "Provisioned Throughput", Region: region,
+			Unit: "ReadCapacityUnit-Hrs", PricePerUnit: "0.00013", Currency: "USD",
+			Attributes: map[string]string{"group": "DDB-ReadUnits"}},
+		{SKU: "dynamodb-ondemand-write", ServiceCode: "AmazonDynamoDB", ProductFamily: "Amazon DynamoDB PayPerRequest Throughput", Region: region,
+			Unit: "WriteRequestUnits", PricePerUnit: "0.00000125", Currency: "USD",
+			Attributes: map[string]string{"group": "DDB-WriteUnits", "usagetype": "PayPerRequest"}},
+		{SKU: "dynamodb-ondemand-read", ServiceCode: "AmazonDynamoDB", ProductFamily: "Amazon DynamoDB PayPerRequest Throughput", Region: region,
+			Unit: "ReadRequestUnits", PricePerUnit: "0.00000025", Currency: "USD",
+			Attributes: map[string]string{"group": "DDB-ReadUnits", "usagetype": "PayPerRequest"}},
+		{SKU: "dynamodb-storage", ServiceCode: "AmazonDynamoDB", ProductFamily: "Database Storage", Region: region,
+			Unit: "GB-Mo", PricePerUnit: "0.25", Currency: "USD",
+			Attributes: map[string]string{"usagetype": "TimedStorage-ByteHrs"}},
+		{SKU: "dynamodb-gsi-wcu", ServiceCode: "AmazonDynamoDB", ProductFamily: "Provisioned Throughput", Region: region,
+			Unit: "WriteCapacityUnit-Hrs", PricePerUnit: "0.00065", Currency: "USD",
+			Attributes: map[string]string{"group": "DDB-WriteUnits", "indexType": "GSI"}},
+		{SKU: "dynamodb-gsi-rcu", ServiceCode: "AmazonDynamoDB", ProductFamily: "Provisioned Throughput", Region: region,
+			Unit: "ReadCapacityUnit-Hrs", PricePerUnit: "0.00013", Currency: "USD",
+			Attributes: map[string]string{"group": "DDB-ReadUnits", "indexType": "GSI"}},
+
+		// ============================================================
+		// ELASTICACHE - aws_elasticache_cluster
+		// ============================================================
+		{SKU: "elasticache-redis-t3.micro", ServiceCode: "AmazonElastiCache", ProductFamily: "Cache Instance", Region: region,
+			Unit: "Hrs", PricePerUnit: "0.017", Currency: "USD",
+			Attributes: map[string]string{"instanceType": "cache.t3.micro", "cacheEngine": "Redis"}},
+		{SKU: "elasticache-redis-t3.small", ServiceCode: "AmazonElastiCache", ProductFamily: "Cache Instance", Region: region,
+			Unit: "Hrs", PricePerUnit: "0.034", Currency: "USD",
+			Attributes: map[string]string{"instanceType": "cache.t3.small", "cacheEngine": "Redis"}},
+		{SKU: "elasticache-redis-m5.large", ServiceCode: "AmazonElastiCache", ProductFamily: "Cache Instance", Region: region,
+			Unit: "Hrs", PricePerUnit: "0.156", Currency: "USD",
+			Attributes: map[string]string{"instanceType": "cache.m5.large", "cacheEngine": "Redis"}},
+		{SKU: "elasticache-redis-r5.large", ServiceCode: "AmazonElastiCache", ProductFamily: "Cache Instance", Region: region,
+			Unit: "Hrs", PricePerUnit: "0.224", Currency: "USD",
+			Attributes: map[string]string{"instanceType": "cache.r5.large", "cacheEngine": "Redis"}},
+		{SKU: "elasticache-memcached-t3.micro", ServiceCode: "AmazonElastiCache", ProductFamily: "Cache Instance", Region: region,
+			Unit: "Hrs", PricePerUnit: "0.017", Currency: "USD",
+			Attributes: map[string]string{"instanceType": "cache.t3.micro", "cacheEngine": "Memcached"}},
+
+		// ============================================================
+		// SECRETS MANAGER - aws_secretsmanager_secret
+		// ============================================================
+		{SKU: "secrets-manager-secret", ServiceCode: "AWSSecretsManager", ProductFamily: "Secret", Region: region,
+			Unit: "Secrets", PricePerUnit: "0.40", Currency: "USD",
+			Attributes: map[string]string{"usagetype": "SecretMonth"}},
+		{SKU: "secrets-manager-api", ServiceCode: "AWSSecretsManager", ProductFamily: "API Request", Region: region,
+			Unit: "Requests", PricePerUnit: "0.05", Currency: "USD",
+			Attributes: map[string]string{"usagetype": "API-Requests-Per10K"}},
+
+		// ============================================================
+		// CLOUDWATCH - aws_cloudwatch_metric_alarm, aws_cloudwatch_log_group
+		// ============================================================
+		{SKU: "cloudwatch-metric", ServiceCode: "AmazonCloudWatch", ProductFamily: "Metric", Region: region,
+			Unit: "Metrics", PricePerUnit: "0.30", Currency: "USD",
+			Attributes: map[string]string{"usagetype": "CW:MetricMonitorUsage"}},
+		{SKU: "cloudwatch-alarm", ServiceCode: "AmazonCloudWatch", ProductFamily: "Alarm", Region: region,
+			Unit: "Alarms", PricePerUnit: "0.10", Currency: "USD",
+			Attributes: map[string]string{"usagetype": "CW:AlarmMonitorUsage", "alarmType": "Standard"}},
+		{SKU: "cloudwatch-alarm-highres", ServiceCode: "AmazonCloudWatch", ProductFamily: "Alarm", Region: region,
+			Unit: "Alarms", PricePerUnit: "0.30", Currency: "USD",
+			Attributes: map[string]string{"usagetype": "CW:AlarmMonitorUsage", "alarmType": "High Resolution"}},
+		{SKU: "cloudwatch-logs-ingest", ServiceCode: "AmazonCloudWatch", ProductFamily: "Logs", Region: region,
+			Unit: "GB", PricePerUnit: "0.50", Currency: "USD",
+			Attributes: map[string]string{"usagetype": "DataProcessing-Bytes"}},
+		{SKU: "cloudwatch-logs-storage", ServiceCode: "AmazonCloudWatch", ProductFamily: "Logs", Region: region,
+			Unit: "GB-Mo", PricePerUnit: "0.03", Currency: "USD",
+			Attributes: map[string]string{"usagetype": "TimedStorage-ByteHrs"}},
+
+		// ============================================================
+		// VPC - aws_vpc, aws_subnet, aws_internet_gateway
+		// ============================================================
+		{SKU: "vpc-endpoint-hour", ServiceCode: "AmazonVPC", ProductFamily: "VpcEndpoint", Region: region,
+			Unit: "Hrs", PricePerUnit: "0.01", Currency: "USD",
+			Attributes: map[string]string{"usagetype": "VpcEndpoint-Hours"}},
+		{SKU: "vpc-endpoint-data", ServiceCode: "AmazonVPC", ProductFamily: "VpcEndpoint", Region: region,
+			Unit: "GB", PricePerUnit: "0.01", Currency: "USD",
+			Attributes: map[string]string{"usagetype": "VpcEndpoint-Bytes"}},
+		{SKU: "vpn-connection-hour", ServiceCode: "AmazonVPC", ProductFamily: "VPN Connection", Region: region,
+			Unit: "Hrs", PricePerUnit: "0.05", Currency: "USD",
+			Attributes: map[string]string{"usagetype": "VPN-Hours"}},
+
+		// ============================================================
+		// DATA TRANSFER (Cross-region, Internet)
+		// ============================================================
+		{SKU: "data-transfer-out-internet", ServiceCode: "AWSDataTransfer", ProductFamily: "Data Transfer", Region: region,
+			Unit: "GB", PricePerUnit: "0.09", Currency: "USD",
+			Attributes: map[string]string{"transferType": "AWS Outbound", "toLocation": "External"}},
+		{SKU: "data-transfer-in-internet", ServiceCode: "AWSDataTransfer", ProductFamily: "Data Transfer", Region: region,
+			Unit: "GB", PricePerUnit: "0.00", Currency: "USD",
+			Attributes: map[string]string{"transferType": "AWS Inbound", "fromLocation": "External"}},
+		{SKU: "data-transfer-inter-region", ServiceCode: "AWSDataTransfer", ProductFamily: "Data Transfer", Region: region,
+			Unit: "GB", PricePerUnit: "0.02", Currency: "USD",
+			Attributes: map[string]string{"transferType": "InterRegion Outbound"}},
+		{SKU: "data-transfer-inter-az", ServiceCode: "AWSDataTransfer", ProductFamily: "Data Transfer", Region: region,
+			Unit: "GB", PricePerUnit: "0.01", Currency: "USD",
+			Attributes: map[string]string{"transferType": "IntraRegion"}},
+
+		// ============================================================
+		// SQS - aws_sqs_queue
+		// ============================================================
+		{SKU: "sqs-standard", ServiceCode: "AWSQueueService", ProductFamily: "Queue", Region: region,
+			Unit: "Requests", PricePerUnit: "0.0000004", Currency: "USD",
+			Attributes: map[string]string{"queueType": "Standard", "usagetype": "Requests"}},
+		{SKU: "sqs-fifo", ServiceCode: "AWSQueueService", ProductFamily: "Queue", Region: region,
+			Unit: "Requests", PricePerUnit: "0.00000050", Currency: "USD",
+			Attributes: map[string]string{"queueType": "FIFO", "usagetype": "Requests"}},
+
+		// ============================================================
+		// SNS - aws_sns_topic
+		// ============================================================
+		{SKU: "sns-publish", ServiceCode: "AmazonSNS", ProductFamily: "Notification", Region: region,
+			Unit: "Requests", PricePerUnit: "0.50", Currency: "USD",
+			Attributes: map[string]string{"usagetype": "PublishAPI-Requests-Per1M"}},
+		{SKU: "sns-delivery-http", ServiceCode: "AmazonSNS", ProductFamily: "Notification", Region: region,
+			Unit: "Notifications", PricePerUnit: "0.06", Currency: "USD",
+			Attributes: map[string]string{"usagetype": "DeliveryAttempts-HTTP-Per100K"}},
+
+		// ============================================================
+		// KMS - aws_kms_key
+		// ============================================================
+		{SKU: "kms-key", ServiceCode: "awskms", ProductFamily: "Key Management", Region: region,
+			Unit: "Keys", PricePerUnit: "1.00", Currency: "USD",
+			Attributes: map[string]string{"usagetype": "KMS-Keys"}},
+		{SKU: "kms-requests", ServiceCode: "awskms", ProductFamily: "Key Management", Region: region,
+			Unit: "Requests", PricePerUnit: "0.03", Currency: "USD",
+			Attributes: map[string]string{"usagetype": "KMS-Requests-Per10K"}},
+
+		// ============================================================
+		// ACM - aws_acm_certificate (Free for public certs)
+		// ============================================================
+		{SKU: "acm-private-ca", ServiceCode: "AWSCertificateManager", ProductFamily: "Certificate Authority", Region: region,
+			Unit: "CA", PricePerUnit: "400.00", Currency: "USD",
+			Attributes: map[string]string{"usagetype": "PrivateCA"}},
+		{SKU: "acm-private-cert", ServiceCode: "AWSCertificateManager", ProductFamily: "Certificate", Region: region,
+			Unit: "Certificates", PricePerUnit: "0.75", Currency: "USD",
+			Attributes: map[string]string{"usagetype": "PrivateCertificate"}},
+
+		// ============================================================
+		// ROUTE53 - aws_route53_zone, aws_route53_record
+		// ============================================================
+		{SKU: "route53-hosted-zone", ServiceCode: "AmazonRoute53", ProductFamily: "Hosted Zone", Region: region,
+			Unit: "HostedZone", PricePerUnit: "0.50", Currency: "USD",
+			Attributes: map[string]string{"usagetype": "HostedZone"}},
+		{SKU: "route53-queries", ServiceCode: "AmazonRoute53", ProductFamily: "DNS Query", Region: region,
+			Unit: "Queries", PricePerUnit: "0.40", Currency: "USD",
+			Attributes: map[string]string{"usagetype": "DNS-Queries-Per1M"}},
+		{SKU: "route53-health-check", ServiceCode: "AmazonRoute53", ProductFamily: "Health Check", Region: region,
+			Unit: "HealthCheck", PricePerUnit: "0.50", Currency: "USD",
+			Attributes: map[string]string{"usagetype": "HealthCheck-Basic"}},
 	}
 }
 
@@ -44848,6 +45737,285 @@ func (n *AWSPricingAPINormalizer) normalizeUnit(unit string) string {
 		return normalized
 	}
 	return strings.ToLower(unit)
+}
+
+################################################################################
+# FILE: :\good projects\cost estimation\db\ingestion\azure.go
+# TYPE: go
+# SIZE: 1921 bytes
+################################################################################
+// Package ingestion - Azure pricing fetcher and normalizer (placeholder)
+package ingestion
+
+import (
+	"context"
+	"fmt"
+
+	"terraform-cost/db"
+)
+
+// AzurePriceFetcher fetches pricing from Azure Retail Prices API
+type AzurePriceFetcher struct{}
+
+// NewAzurePriceFetcher creates an Azure price fetcher
+func NewAzurePriceFetcher() *AzurePriceFetcher {
+	return &AzurePriceFetcher{}
+}
+
+// Cloud returns the cloud provider
+func (f *AzurePriceFetcher) Cloud() db.CloudProvider {
+	return db.Azure
+}
+
+// FetchRegion fetches all prices for a region
+func (f *AzurePriceFetcher) FetchRegion(ctx context.Context, region string) ([]RawPrice, error) {
+	// Placeholder - needs Azure Retail Prices API implementation
+	return nil, fmt.Errorf("Azure pricing fetcher not yet implemented")
+}
+
+// SupportedRegions returns supported regions
+func (f *AzurePriceFetcher) SupportedRegions() []string {
+	return []string{
+		"eastus",
+		"eastus2",
+		"westus",
+		"westus2",
+		"centralus",
+		"northeurope",
+		"westeurope",
+	}
+}
+
+// SupportedServices returns supported services
+func (f *AzurePriceFetcher) SupportedServices() []string {
+	return []string{
+		"Virtual Machines",
+		"Storage",
+		"Azure SQL Database",
+		"Azure Cosmos DB",
+		"Azure Functions",
+	}
+}
+
+// AzurePriceNormalizer normalizes Azure pricing
+type AzurePriceNormalizer struct{}
+
+// NewAzurePriceNormalizer creates an Azure price normalizer
+func NewAzurePriceNormalizer() *AzurePriceNormalizer {
+	return &AzurePriceNormalizer{}
+}
+
+// Cloud returns the cloud provider
+func (n *AzurePriceNormalizer) Cloud() db.CloudProvider {
+	return db.Azure
+}
+
+// Normalize converts raw prices to normalized rates
+func (n *AzurePriceNormalizer) Normalize(raw []RawPrice) ([]NormalizedRate, error) {
+	// Placeholder - needs Azure-specific normalization logic
+	return nil, fmt.Errorf("Azure pricing normalizer not yet implemented")
+}
+
+################################################################################
+# FILE: :\good projects\cost estimation\db\ingestion\backup.go
+# TYPE: go
+# SIZE: 5218 bytes
+################################################################################
+// Package ingestion - Backup and restore for pricing snapshots
+package ingestion
+
+import (
+	"compress/gzip"
+	"encoding/json"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"strings"
+	"time"
+
+	"terraform-cost/db"
+)
+
+// SnapshotBackup is a complete snapshot dump for backup/restore
+type SnapshotBackup struct {
+	// Provider is the cloud provider
+	Provider db.CloudProvider `json:"provider"`
+
+	// Region
+	Region string `json:"region"`
+
+	// Alias for multi-account
+	Alias string `json:"alias"`
+
+	// Timestamp when backup was created
+	Timestamp time.Time `json:"timestamp"`
+
+	// ContentHash of the rates
+	ContentHash string `json:"content_hash"`
+
+	// RateCount for quick validation
+	RateCount int `json:"rate_count"`
+
+	// SchemaVersion for compatibility
+	SchemaVersion string `json:"schema_version"`
+
+	// Rates is the complete set of normalized rates
+	Rates []NormalizedRate `json:"rates"`
+}
+
+// BackupManager handles backup creation and reading
+type BackupManager struct{}
+
+// NewBackupManager creates a backup manager
+func NewBackupManager() *BackupManager {
+	return &BackupManager{}
+}
+
+// WriteBackup writes a snapshot backup to disk
+func (m *BackupManager) WriteBackup(baseDir string, backup *SnapshotBackup) (string, error) {
+	// Create directory structure: baseDir/provider/timestamp.json.gz
+	providerDir := filepath.Join(baseDir, string(backup.Provider))
+	if err := os.MkdirAll(providerDir, 0755); err != nil {
+		return "", fmt.Errorf("failed to create backup directory: %w", err)
+	}
+
+	// Generate filename with timestamp
+	filename := fmt.Sprintf("%s_%s.json.gz",
+		backup.Region,
+		backup.Timestamp.Format("2006-01-02T15-04-05"),
+	)
+	fullPath := filepath.Join(providerDir, filename)
+
+	// Create file
+	file, err := os.Create(fullPath)
+	if err != nil {
+		return "", fmt.Errorf("failed to create backup file: %w", err)
+	}
+	defer file.Close()
+
+	// Write gzipped JSON
+	gzWriter := gzip.NewWriter(file)
+	defer gzWriter.Close()
+
+	encoder := json.NewEncoder(gzWriter)
+	encoder.SetIndent("", "  ")
+	if err := encoder.Encode(backup); err != nil {
+		return "", fmt.Errorf("failed to write backup: %w", err)
+	}
+
+	return fullPath, nil
+}
+
+// ReadBackup reads a snapshot backup from disk
+func (m *BackupManager) ReadBackup(path string) (*SnapshotBackup, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open backup file: %w", err)
+	}
+	defer file.Close()
+
+	var reader io.Reader = file
+
+	// Handle gzipped files
+	if strings.HasSuffix(path, ".gz") {
+		gzReader, err := gzip.NewReader(file)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create gzip reader: %w", err)
+		}
+		defer gzReader.Close()
+		reader = gzReader
+	}
+
+	var backup SnapshotBackup
+	if err := json.NewDecoder(reader).Decode(&backup); err != nil {
+		return nil, fmt.Errorf("failed to decode backup: %w", err)
+	}
+
+	// Validate
+	if err := m.ValidateBackup(&backup); err != nil {
+		return nil, fmt.Errorf("backup validation failed: %w", err)
+	}
+
+	return &backup, nil
+}
+
+// ValidateBackup validates a backup file
+func (m *BackupManager) ValidateBackup(backup *SnapshotBackup) error {
+	if backup.Provider == "" {
+		return fmt.Errorf("backup missing provider")
+	}
+	if backup.Region == "" {
+		return fmt.Errorf("backup missing region")
+	}
+	if backup.ContentHash == "" {
+		return fmt.Errorf("backup missing content hash")
+	}
+	if backup.RateCount == 0 {
+		return fmt.Errorf("backup has 0 rates")
+	}
+	if len(backup.Rates) != backup.RateCount {
+		return fmt.Errorf("backup rate count mismatch: header says %d, actual %d", backup.RateCount, len(backup.Rates))
+	}
+
+	// Verify hash
+	actualHash := calculateHash(backup.Rates)
+	if actualHash != backup.ContentHash {
+		return fmt.Errorf("backup content hash mismatch: expected %s, got %s", backup.ContentHash, actualHash)
+	}
+
+	return nil
+}
+
+// ListBackups lists all backups in a directory
+func (m *BackupManager) ListBackups(baseDir string) ([]BackupInfo, error) {
+	var backups []BackupInfo
+
+	providers := []string{"aws", "azure", "gcp"}
+	for _, provider := range providers {
+		providerDir := filepath.Join(baseDir, provider)
+		if _, err := os.Stat(providerDir); os.IsNotExist(err) {
+			continue
+		}
+
+		entries, err := os.ReadDir(providerDir)
+		if err != nil {
+			continue
+		}
+
+		for _, entry := range entries {
+			if entry.IsDir() {
+				continue
+			}
+			if !strings.HasSuffix(entry.Name(), ".json") && !strings.HasSuffix(entry.Name(), ".json.gz") {
+				continue
+			}
+
+			info, err := entry.Info()
+			if err != nil {
+				continue
+			}
+
+			backups = append(backups, BackupInfo{
+				Provider:  db.CloudProvider(provider),
+				Path:      filepath.Join(providerDir, entry.Name()),
+				Filename:  entry.Name(),
+				Size:      info.Size(),
+				CreatedAt: info.ModTime(),
+			})
+		}
+	}
+
+	return backups, nil
+}
+
+// BackupInfo is metadata about a backup file
+type BackupInfo struct {
+	Provider  db.CloudProvider `json:"provider"`
+	Path      string           `json:"path"`
+	Filename  string           `json:"filename"`
+	Size      int64            `json:"size"`
+	CreatedAt time.Time        `json:"created_at"`
 }
 
 ################################################################################
@@ -45620,9 +46788,84 @@ func (s *DriftSummary) GroupByService() map[string][]DriftRecord {
 }
 
 ################################################################################
+# FILE: :\good projects\cost estimation\db\ingestion\gcp.go
+# TYPE: go
+# SIZE: 1828 bytes
+################################################################################
+// Package ingestion - GCP pricing fetcher and normalizer (placeholder)
+package ingestion
+
+import (
+	"context"
+	"fmt"
+
+	"terraform-cost/db"
+)
+
+// GCPPriceFetcher fetches pricing from GCP Cloud Billing API
+type GCPPriceFetcher struct{}
+
+// NewGCPPriceFetcher creates a GCP price fetcher
+func NewGCPPriceFetcher() *GCPPriceFetcher {
+	return &GCPPriceFetcher{}
+}
+
+// Cloud returns the cloud provider
+func (f *GCPPriceFetcher) Cloud() db.CloudProvider {
+	return db.GCP
+}
+
+// FetchRegion fetches all prices for a region
+func (f *GCPPriceFetcher) FetchRegion(ctx context.Context, region string) ([]RawPrice, error) {
+	// Placeholder - needs GCP Cloud Billing API implementation
+	return nil, fmt.Errorf("GCP pricing fetcher not yet implemented")
+}
+
+// SupportedRegions returns supported regions
+func (f *GCPPriceFetcher) SupportedRegions() []string {
+	return []string{
+		"us-central1",
+		"us-east1",
+		"us-west1",
+		"europe-west1",
+		"asia-east1",
+	}
+}
+
+// SupportedServices returns supported services
+func (f *GCPPriceFetcher) SupportedServices() []string {
+	return []string{
+		"Compute Engine",
+		"Cloud Storage",
+		"Cloud SQL",
+		"BigQuery",
+		"Cloud Functions",
+	}
+}
+
+// GCPPriceNormalizer normalizes GCP pricing
+type GCPPriceNormalizer struct{}
+
+// NewGCPPriceNormalizer creates a GCP price normalizer
+func NewGCPPriceNormalizer() *GCPPriceNormalizer {
+	return &GCPPriceNormalizer{}
+}
+
+// Cloud returns the cloud provider
+func (n *GCPPriceNormalizer) Cloud() db.CloudProvider {
+	return db.GCP
+}
+
+// Normalize converts raw prices to normalized rates
+func (n *GCPPriceNormalizer) Normalize(raw []RawPrice) ([]NormalizedRate, error) {
+	// Placeholder - needs GCP-specific normalization logic
+	return nil, fmt.Errorf("GCP pricing normalizer not yet implemented")
+}
+
+################################################################################
 # FILE: :\good projects\cost estimation\db\ingestion\governance.go
 # TYPE: go
-# SIZE: 7528 bytes
+# SIZE: 10909 bytes
 ################################################################################
 // Package ingestion - Ingestion governance and validation
 package ingestion
@@ -45689,19 +46932,26 @@ const (
 
 // IngestionValidator validates ingestion against contracts
 type IngestionValidator struct {
-	contracts map[string]IngestionContract
+	contracts          map[string]IngestionContract
+	minCoveragePercent float64
 }
 
 // NewIngestionValidator creates a new validator with default contracts
 func NewIngestionValidator() *IngestionValidator {
 	v := &IngestionValidator{
-		contracts: make(map[string]IngestionContract),
+		contracts:          make(map[string]IngestionContract),
+		minCoveragePercent: 95.0, // Very high coverage required
 	}
 	for _, c := range DefaultContracts() {
 		key := fmt.Sprintf("%s:%s", c.Cloud, c.Service)
 		v.contracts[key] = c
 	}
 	return v
+}
+
+// SetMinCoveragePercent sets the minimum coverage percentage
+func (v *IngestionValidator) SetMinCoveragePercent(pct float64) {
+	v.minCoveragePercent = pct
 }
 
 // AddContract adds a custom contract
@@ -45889,13 +47139,115 @@ func CalculateChecksum(rates []NormalizedRate) string {
 	return hex.EncodeToString(hasher.Sum(nil))
 }
 
+// ValidateAll runs all pre-commit validations (abort on failure)
+func (v *IngestionValidator) ValidateAll(rates []NormalizedRate, prevRateCount int) error {
+	// 1. Validate no negative prices
+	if err := v.ValidatePricesPositive(rates); err != nil {
+		return err
+	}
+
+	// 2. Validate required dimensions exist
+	if err := v.ValidateDimensionsComplete(rates); err != nil {
+		return err
+	}
+
+	// 3. Validate no duplicate rate keys
+	if err := v.ValidateNoDuplicates(rates); err != nil {
+		return err
+	}
+
+	// 4. Validate coverage not decreased (if previous exists)
+	if prevRateCount > 0 {
+		if err := v.ValidateCoverageNotDecreased(len(rates), prevRateCount); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// ValidatePricesPositive ensures no negative prices
+func (v *IngestionValidator) ValidatePricesPositive(rates []NormalizedRate) error {
+	for _, r := range rates {
+		if r.Price.IsNegative() {
+			return fmt.Errorf("negative price found: %s = %s", 
+				fmt.Sprintf("%s/%s/%s", r.RateKey.Service, r.RateKey.ProductFamily, r.RateKey.Region),
+				r.Price.String())
+		}
+	}
+	return nil
+}
+
+// ValidateDimensionsComplete ensures required dimensions exist
+func (v *IngestionValidator) ValidateDimensionsComplete(rates []NormalizedRate) error {
+	// Group by service
+	byService := make(map[string]map[string]bool)
+	for _, r := range rates {
+		if byService[r.RateKey.Service] == nil {
+			byService[r.RateKey.Service] = make(map[string]bool)
+		}
+		for k := range r.RateKey.Attributes {
+			byService[r.RateKey.Service][k] = true
+		}
+	}
+
+	// Check contracts
+	for _, contract := range v.contracts {
+		presentDims := byService[contract.Service]
+		if presentDims == nil {
+			continue // Service not in this ingestion
+		}
+		for _, reqDim := range contract.RequiredDimensions {
+			if !presentDims[reqDim] {
+				return fmt.Errorf("service %s missing required dimension: %s", contract.Service, reqDim)
+			}
+		}
+	}
+
+	return nil
+}
+
+// ValidateNoDuplicates ensures no duplicate rate keys
+func (v *IngestionValidator) ValidateNoDuplicates(rates []NormalizedRate) error {
+	seen := make(map[string]bool)
+	for _, r := range rates {
+		key := rateKeyForDedupe(r.RateKey)
+		if seen[key] {
+			return fmt.Errorf("duplicate rate key found: %s", key)
+		}
+		seen[key] = true
+	}
+	return nil
+}
+
+func rateKeyForDedupe(k db.RateKey) string {
+	return fmt.Sprintf("%s|%s|%s|%s|%v", k.Cloud, k.Service, k.ProductFamily, k.Region, k.Attributes)
+}
+
+// ValidateCoverageNotDecreased ensures coverage >= previous snapshot
+func (v *IngestionValidator) ValidateCoverageNotDecreased(newCount, prevCount int) error {
+	if newCount == 0 {
+		return fmt.Errorf("new snapshot has 0 rates, previous had %d", prevCount)
+	}
+
+	// Calculate coverage percentage
+	coveragePercent := float64(newCount) / float64(prevCount) * 100
+
+	if coveragePercent < v.minCoveragePercent {
+		return fmt.Errorf("coverage decreased: new has %d rates (%.1f%%) vs previous %d rates, minimum %.1f%% required",
+			newCount, coveragePercent, prevCount, v.minCoveragePercent)
+	}
+
+	return nil
+}
+
 ################################################################################
 # FILE: :\good projects\cost estimation\db\ingestion\pipeline.go
 # TYPE: go
-# SIZE: 7658 bytes
+# SIZE: 14448 bytes
 ################################################################################
 // Package ingestion - Pricing data ingestion pipeline
-// Strictly separated from estimation: fetch â†’ normalize â†’ store
+// Strictly separated from estimation: fetch â†’ normalize â†’ validate â†’ backup â†’ commit
 package ingestion
 
 import (
@@ -45914,113 +47266,369 @@ import (
 	"github.com/shopspring/decimal"
 )
 
+// Phase represents a pipeline execution phase
+type Phase string
+
+const (
+	PhaseFetch     Phase = "fetch"
+	PhaseNormalize Phase = "normalize"
+	PhaseValidate  Phase = "validate"
+	PhaseBackup    Phase = "backup"
+	PhaseCommit    Phase = "commit"
+)
+
+// PipelineConfig configures the ingestion pipeline
+type PipelineConfig struct {
+	// Provider is the cloud provider (aws, azure, gcp)
+	Provider db.CloudProvider
+
+	// Region to ingest
+	Region string
+
+	// Alias for multi-account (default if empty)
+	Alias string
+
+	// DryRun validates only, no DB writes
+	DryRun bool
+
+	// BackupDir is where to write backups
+	BackupDir string
+
+	// MinCoveragePercent is the minimum required coverage (default 95%)
+	MinCoveragePercent float64
+
+	// Timeout for the entire pipeline
+	Timeout time.Duration
+}
+
+// DefaultPipelineConfig returns production defaults
+func DefaultPipelineConfig() *PipelineConfig {
+	return &PipelineConfig{
+		Alias:              "default",
+		DryRun:             false,
+		BackupDir:          "./pricing-backups",
+		MinCoveragePercent: 95.0, // Very high coverage required
+		Timeout:            30 * time.Minute,
+	}
+}
+
+// PipelineResult contains the outcome of a pipeline run
+type PipelineResult struct {
+	// Success indicates all phases completed
+	Success bool `json:"success"`
+
+	// SnapshotID of the created snapshot (nil if dry-run or failure)
+	SnapshotID *uuid.UUID `json:"snapshot_id,omitempty"`
+
+	// Phases completed
+	PhasesCompleted []Phase `json:"phases_completed"`
+
+	// FailedPhase if any
+	FailedPhase Phase `json:"failed_phase,omitempty"`
+
+	// Error message if failed
+	Error string `json:"error,omitempty"`
+
+	// Stats from the run
+	Stats PipelineStats `json:"stats"`
+
+	// BackupPath where backup was written
+	BackupPath string `json:"backup_path,omitempty"`
+
+	// Duration of the run
+	Duration time.Duration `json:"duration"`
+}
+
+// PipelineStats contains statistics from a run
+type PipelineStats struct {
+	RawPricesCount       int     `json:"raw_prices_count"`
+	NormalizedRatesCount int     `json:"normalized_rates_count"`
+	UniqueServicesCount  int     `json:"unique_services_count"`
+	CoveragePercent      float64 `json:"coverage_percent"`
+	ContentHash          string  `json:"content_hash"`
+}
+
 // RawPrice represents a raw price record from a cloud API
 type RawPrice struct {
-	SKU            string
-	ServiceCode    string
-	ProductFamily  string
-	Region         string
-	Unit           string
-	PricePerUnit   string
-	Currency       string
-	Attributes     map[string]string
-	TierStart      *float64
-	TierEnd        *float64
-	EffectiveDate  *time.Time
+	SKU           string            `json:"sku"`
+	ServiceCode   string            `json:"service_code"`
+	ProductFamily string            `json:"product_family"`
+	Region        string            `json:"region"`
+	Unit          string            `json:"unit"`
+	PricePerUnit  string            `json:"price_per_unit"`
+	Currency      string            `json:"currency"`
+	Attributes    map[string]string `json:"attributes"`
+	TierStart     *float64          `json:"tier_start,omitempty"`
+	TierEnd       *float64          `json:"tier_end,omitempty"`
+	EffectiveDate *time.Time        `json:"effective_date,omitempty"`
 }
 
 // NormalizedRate is the output of normalization
 type NormalizedRate struct {
-	RateKey    db.RateKey
-	Unit       string
-	Price      decimal.Decimal
-	Currency   string
-	Confidence float64
-	TierMin    *decimal.Decimal
-	TierMax    *decimal.Decimal
+	RateKey    db.RateKey      `json:"rate_key"`
+	Unit       string          `json:"unit"`
+	Price      decimal.Decimal `json:"price"`
+	Currency   string          `json:"currency"`
+	Confidence float64         `json:"confidence"`
+	TierMin    *decimal.Decimal `json:"tier_min,omitempty"`
+	TierMax    *decimal.Decimal `json:"tier_max,omitempty"`
 }
 
 // PriceFetcher fetches raw prices from a cloud API
 type PriceFetcher interface {
 	// Cloud returns the cloud provider
 	Cloud() db.CloudProvider
-	
-	// FetchRegion fetches all prices for a region
+
+	// FetchRegion fetches all prices for a region (NO DB WRITES)
 	FetchRegion(ctx context.Context, region string) ([]RawPrice, error)
-	
+
 	// SupportedRegions returns supported regions
 	SupportedRegions() []string
+
+	// SupportedServices returns services this fetcher covers
+	SupportedServices() []string
 }
 
 // PriceNormalizer converts raw prices to normalized rates
 type PriceNormalizer interface {
 	// Cloud returns the cloud provider
 	Cloud() db.CloudProvider
-	
+
 	// Normalize converts raw prices to normalized rates
 	Normalize(raw []RawPrice) ([]NormalizedRate, error)
 }
 
-// SnapshotBuilder builds and persists pricing snapshots
-type SnapshotBuilder struct {
-	store  db.PricingStore
+// Pipeline orchestrates the full ingestion flow with 5 strict phases
+type Pipeline struct {
+	fetcher    PriceFetcher
+	normalizer PriceNormalizer
+	validator  *IngestionValidator
+	backupMgr  *BackupManager
+	store      db.PricingStore
 }
 
-// NewSnapshotBuilder creates a new snapshot builder
-func NewSnapshotBuilder(store db.PricingStore) *SnapshotBuilder {
-	return &SnapshotBuilder{store: store}
+// NewPipeline creates a new ingestion pipeline
+func NewPipeline(
+	fetcher PriceFetcher,
+	normalizer PriceNormalizer,
+	store db.PricingStore,
+) *Pipeline {
+	return &Pipeline{
+		fetcher:    fetcher,
+		normalizer: normalizer,
+		validator:  NewIngestionValidator(),
+		backupMgr:  NewBackupManager(),
+		store:      store,
+	}
 }
 
-// BuildSnapshot creates a pricing snapshot from normalized rates
-func (b *SnapshotBuilder) BuildSnapshot(
-	ctx context.Context,
-	cloud db.CloudProvider,
-	region string,
-	alias string,
-	source string,
-	rates []NormalizedRate,
-) (*db.PricingSnapshot, error) {
-	// Calculate content hash
-	hash := b.calculateHash(rates)
-	
-	// Check if snapshot already exists
-	existing, err := b.findExistingSnapshot(ctx, cloud, region, alias, hash)
+// Execute runs the full 5-phase ingestion pipeline
+func (p *Pipeline) Execute(ctx context.Context, config *PipelineConfig) (*PipelineResult, error) {
+	if config == nil {
+		config = DefaultPipelineConfig()
+	}
+
+	start := time.Now()
+	result := &PipelineResult{
+		PhasesCompleted: make([]Phase, 0, 5),
+	}
+
+	// Apply timeout
+	if config.Timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, config.Timeout)
+		defer cancel()
+	}
+
+	// ========================================
+	// PHASE A: FETCH (NO DB WRITES)
+	// ========================================
+	rawPrices, err := p.phaseFetch(ctx, config)
 	if err != nil {
-		return nil, fmt.Errorf("failed to check existing snapshot: %w", err)
+		result.FailedPhase = PhaseFetch
+		result.Error = err.Error()
+		result.Duration = time.Since(start)
+		return result, nil
 	}
+	result.PhasesCompleted = append(result.PhasesCompleted, PhaseFetch)
+	result.Stats.RawPricesCount = len(rawPrices)
+
+	// ========================================
+	// PHASE B: NORMALIZE
+	// ========================================
+	normalizedRates, err := p.phaseNormalize(ctx, rawPrices)
+	if err != nil {
+		result.FailedPhase = PhaseNormalize
+		result.Error = err.Error()
+		result.Duration = time.Since(start)
+		return result, nil
+	}
+	result.PhasesCompleted = append(result.PhasesCompleted, PhaseNormalize)
+	result.Stats.NormalizedRatesCount = len(normalizedRates)
+	result.Stats.UniqueServicesCount = countUniqueServices(normalizedRates)
+	result.Stats.ContentHash = calculateHash(normalizedRates)
+
+	// ========================================
+	// PHASE C: VALIDATE (NON-NEGOTIABLE)
+	// ========================================
+	validationErr := p.phaseValidate(ctx, config, normalizedRates)
+	if validationErr != nil {
+		result.FailedPhase = PhaseValidate
+		result.Error = validationErr.Error()
+		result.Duration = time.Since(start)
+		return result, nil
+	}
+	result.PhasesCompleted = append(result.PhasesCompleted, PhaseValidate)
+
+	// ========================================
+	// PHASE D: BACKUP (MANDATORY)
+	// ========================================
+	backupPath, err := p.phaseBackup(ctx, config, normalizedRates, result.Stats)
+	if err != nil {
+		result.FailedPhase = PhaseBackup
+		result.Error = err.Error()
+		result.Duration = time.Since(start)
+		return result, nil
+	}
+	result.PhasesCompleted = append(result.PhasesCompleted, PhaseBackup)
+	result.BackupPath = backupPath
+
+	// ========================================
+	// DRY-RUN CHECK
+	// ========================================
+	if config.DryRun {
+		result.Success = true
+		result.Duration = time.Since(start)
+		return result, nil
+	}
+
+	// ========================================
+	// PHASE E: ATOMIC DATABASE COMMIT
+	// ========================================
+	snapshotID, err := p.phaseCommit(ctx, config, normalizedRates, result.Stats.ContentHash)
+	if err != nil {
+		result.FailedPhase = PhaseCommit
+		result.Error = err.Error()
+		result.Duration = time.Since(start)
+		return result, nil
+	}
+	result.PhasesCompleted = append(result.PhasesCompleted, PhaseCommit)
+	result.SnapshotID = &snapshotID
+
+	result.Success = true
+	result.Duration = time.Since(start)
+	return result, nil
+}
+
+// phaseFetch downloads raw pricing (NO DB WRITES)
+func (p *Pipeline) phaseFetch(ctx context.Context, config *PipelineConfig) ([]RawPrice, error) {
+	rawPrices, err := p.fetcher.FetchRegion(ctx, config.Region)
+	if err != nil {
+		return nil, fmt.Errorf("fetch failed for %s/%s: %w", config.Provider, config.Region, err)
+	}
+
+	if len(rawPrices) == 0 {
+		return nil, fmt.Errorf("fetch returned 0 prices for %s/%s", config.Provider, config.Region)
+	}
+
+	return rawPrices, nil
+}
+
+// phaseNormalize transforms raw prices to canonical rates
+func (p *Pipeline) phaseNormalize(ctx context.Context, rawPrices []RawPrice) ([]NormalizedRate, error) {
+	normalized, err := p.normalizer.Normalize(rawPrices)
+	if err != nil {
+		return nil, fmt.Errorf("normalization failed: %w", err)
+	}
+
+	if len(normalized) == 0 {
+		return nil, fmt.Errorf("normalization produced 0 rates")
+	}
+
+	return normalized, nil
+}
+
+// phaseValidate runs governance checks (abort on failure)
+func (p *Pipeline) phaseValidate(ctx context.Context, config *PipelineConfig, rates []NormalizedRate) error {
+	// Configure validator
+	p.validator.SetMinCoveragePercent(config.MinCoveragePercent)
+
+	// Get previous snapshot for coverage comparison
+	prevSnapshot, _ := p.store.GetActiveSnapshot(ctx, config.Provider, config.Region, config.Alias)
+	var prevRateCount int
+	if prevSnapshot != nil {
+		prevRateCount, _ = p.store.CountRates(ctx, prevSnapshot.ID)
+	}
+
+	// Run all validations
+	return p.validator.ValidateAll(rates, prevRateCount)
+}
+
+// phaseBackup writes snapshot dump to local file
+func (p *Pipeline) phaseBackup(ctx context.Context, config *PipelineConfig, rates []NormalizedRate, stats PipelineStats) (string, error) {
+	backup := &SnapshotBackup{
+		Provider:      config.Provider,
+		Region:        config.Region,
+		Alias:         config.Alias,
+		Timestamp:     time.Now(),
+		ContentHash:   stats.ContentHash,
+		RateCount:     len(rates),
+		SchemaVersion: "1.0",
+		Rates:         rates,
+	}
+
+	return p.backupMgr.WriteBackup(config.BackupDir, backup)
+}
+
+// phaseCommit atomically writes to database
+func (p *Pipeline) phaseCommit(ctx context.Context, config *PipelineConfig, rates []NormalizedRate, contentHash string) (uuid.UUID, error) {
+	// Check for existing snapshot with same hash (idempotency)
+	existing, _ := p.store.FindSnapshotByHash(ctx, config.Provider, config.Region, config.Alias, contentHash)
 	if existing != nil {
-		return existing, nil // Already ingested
+		// Already ingested, return existing
+		return existing.ID, nil
 	}
-	
-	// Create new snapshot
+
+	// Create snapshot in a single transaction
 	snapshot := &db.PricingSnapshot{
 		ID:            uuid.New(),
-		Cloud:         cloud,
-		Region:        region,
-		ProviderAlias: alias,
-		Source:        source,
+		Cloud:         config.Provider,
+		Region:        config.Region,
+		ProviderAlias: config.Alias,
+		Source:        "manual_ingestion_pipeline",
 		FetchedAt:     time.Now(),
 		ValidFrom:     time.Now(),
-		Hash:          hash,
+		Hash:          contentHash,
 		Version:       "1.0",
-		IsActive:      false,
+		IsActive:      false, // Not active until commit succeeds
 	}
-	
-	// Insert snapshot
-	if err := b.store.CreateSnapshot(ctx, snapshot); err != nil {
-		return nil, fmt.Errorf("failed to create snapshot: %w", err)
+
+	// Begin transaction
+	tx, err := p.store.BeginTx(ctx)
+	if err != nil {
+		return uuid.Nil, fmt.Errorf("failed to begin transaction: %w", err)
 	}
-	
-	// Insert rates
-	for _, nr := range rates {
-		// Upsert rate key
-		nr.RateKey.ID = uuid.New()
-		key, err := b.store.UpsertRateKey(ctx, &nr.RateKey)
+
+	// Rollback on any error
+	defer func() {
 		if err != nil {
-			return nil, fmt.Errorf("failed to upsert rate key: %w", err)
+			tx.Rollback()
 		}
-		
-		// Create rate
+	}()
+
+	// Insert snapshot
+	if err = tx.CreateSnapshot(ctx, snapshot); err != nil {
+		return uuid.Nil, fmt.Errorf("failed to create snapshot: %w", err)
+	}
+
+	// Insert all rates
+	for _, nr := range rates {
+		nr.RateKey.ID = uuid.New()
+		key, err := tx.UpsertRateKey(ctx, &nr.RateKey)
+		if err != nil {
+			return uuid.Nil, fmt.Errorf("failed to upsert rate key: %w", err)
+		}
+
 		rate := &db.PricingRate{
 			ID:         uuid.New(),
 			SnapshotID: snapshot.ID,
@@ -46032,35 +47640,42 @@ func (b *SnapshotBuilder) BuildSnapshot(
 			TierMin:    nr.TierMin,
 			TierMax:    nr.TierMax,
 		}
-		if err := b.store.CreateRate(ctx, rate); err != nil {
-			return nil, fmt.Errorf("failed to create rate: %w", err)
+		if err = tx.CreateRate(ctx, rate); err != nil {
+			return uuid.Nil, fmt.Errorf("failed to create rate: %w", err)
 		}
 	}
-	
-	return snapshot, nil
-}
 
-// ActivateSnapshot activates a snapshot
-func (b *SnapshotBuilder) ActivateSnapshot(ctx context.Context, snapshotID uuid.UUID) error {
-	return b.store.ActivateSnapshot(ctx, snapshotID)
+	// Mark snapshot as ready and activate
+	if err = tx.ActivateSnapshot(ctx, snapshot.ID); err != nil {
+		return uuid.Nil, fmt.Errorf("failed to activate snapshot: %w", err)
+	}
+
+	// Commit transaction
+	if err = tx.Commit(); err != nil {
+		return uuid.Nil, fmt.Errorf("commit failed: %w", err)
+	}
+
+	return snapshot.ID, nil
 }
 
 // calculateHash computes a deterministic hash of rates
-func (b *SnapshotBuilder) calculateHash(rates []NormalizedRate) string {
+func calculateHash(rates []NormalizedRate) string {
 	// Sort for determinism
-	sort.Slice(rates, func(i, j int) bool {
-		ki := rateKeyString(rates[i].RateKey)
-		kj := rateKeyString(rates[j].RateKey)
+	sorted := make([]NormalizedRate, len(rates))
+	copy(sorted, rates)
+	sort.Slice(sorted, func(i, j int) bool {
+		ki := rateKeyString(sorted[i].RateKey)
+		kj := rateKeyString(sorted[j].RateKey)
 		return ki < kj
 	})
-	
+
 	hasher := sha256.New()
-	for _, r := range rates {
+	for _, r := range sorted {
 		hasher.Write([]byte(rateKeyString(r.RateKey)))
 		hasher.Write([]byte(r.Unit))
 		hasher.Write([]byte(r.Price.String()))
 	}
-	
+
 	return hex.EncodeToString(hasher.Sum(nil))
 }
 
@@ -46073,90 +47688,19 @@ func rateKeyString(k db.RateKey) string {
 	return fmt.Sprintf("%s|%s|%s|%s|%s", k.Cloud, k.Service, k.ProductFamily, k.Region, strings.Join(attrs, ","))
 }
 
-func (b *SnapshotBuilder) findExistingSnapshot(ctx context.Context, cloud db.CloudProvider, region, alias, hash string) (*db.PricingSnapshot, error) {
-	snapshots, err := b.store.ListSnapshots(ctx, cloud, region)
-	if err != nil {
-		return nil, err
+func countUniqueServices(rates []NormalizedRate) int {
+	services := make(map[string]bool)
+	for _, r := range rates {
+		services[r.RateKey.Service] = true
 	}
-	for _, s := range snapshots {
-		if s.ProviderAlias == alias && s.Hash == hash {
-			return s, nil
-		}
-	}
-	return nil, nil
-}
-
-// Pipeline orchestrates the full ingestion flow
-type Pipeline struct {
-	fetcher    PriceFetcher
-	normalizer PriceNormalizer
-	builder    *SnapshotBuilder
-}
-
-// NewPipeline creates a new ingestion pipeline
-func NewPipeline(fetcher PriceFetcher, normalizer PriceNormalizer, store db.PricingStore) *Pipeline {
-	return &Pipeline{
-		fetcher:    fetcher,
-		normalizer: normalizer,
-		builder:    NewSnapshotBuilder(store),
-	}
-}
-
-// IngestRegion runs the full ingestion for a region
-func (p *Pipeline) IngestRegion(ctx context.Context, region, alias string) (*db.PricingSnapshot, error) {
-	// Fetch
-	raw, err := p.fetcher.FetchRegion(ctx, region)
-	if err != nil {
-		return nil, fmt.Errorf("fetch failed: %w", err)
-	}
-	
-	// Normalize
-	normalized, err := p.normalizer.Normalize(raw)
-	if err != nil {
-		return nil, fmt.Errorf("normalization failed: %w", err)
-	}
-	
-	// Build snapshot
-	snapshot, err := p.builder.BuildSnapshot(
-		ctx,
-		p.fetcher.Cloud(),
-		region,
-		alias,
-		"ingestion_pipeline",
-		normalized,
-	)
-	if err != nil {
-		return nil, fmt.Errorf("snapshot build failed: %w", err)
-	}
-	
-	// Activate
-	if err := p.builder.ActivateSnapshot(ctx, snapshot.ID); err != nil {
-		return nil, fmt.Errorf("activation failed: %w", err)
-	}
-	
-	return snapshot, nil
-}
-
-// IngestAllRegions ingests all supported regions
-func (p *Pipeline) IngestAllRegions(ctx context.Context, alias string) ([]*db.PricingSnapshot, error) {
-	var snapshots []*db.PricingSnapshot
-	for _, region := range p.fetcher.SupportedRegions() {
-		snapshot, err := p.IngestRegion(ctx, region, alias)
-		if err != nil {
-			return snapshots, fmt.Errorf("region %s: %w", region, err)
-		}
-		snapshots = append(snapshots, snapshot)
-	}
-	return snapshots, nil
+	return len(services)
 }
 
 // NormalizeAttributes canonicalizes attribute keys and values
 func NormalizeAttributes(raw map[string]string) map[string]string {
 	result := make(map[string]string)
 	for k, v := range raw {
-		// Normalize key
 		key := strings.ToLower(strings.ReplaceAll(k, " ", "_"))
-		// Normalize value
 		val := strings.ToLower(strings.TrimSpace(v))
 		result[key] = val
 	}
@@ -46175,6 +47719,168 @@ func ParsePrice(s string) (decimal.Decimal, error) {
 // MarshalRateKey converts a RateKey to JSON for storage
 func MarshalRateKey(k db.RateKey) ([]byte, error) {
 	return json.Marshal(k.Attributes)
+}
+
+################################################################################
+# FILE: :\good projects\cost estimation\db\ingestion\pipeline_test.go
+# TYPE: go
+# SIZE: 4606 bytes
+################################################################################
+// Package ingestion - Pipeline tests
+package ingestion
+
+import (
+	"testing"
+
+	"terraform-cost/db"
+
+	"github.com/shopspring/decimal"
+)
+
+func TestValidatePricesPositive(t *testing.T) {
+	validator := NewIngestionValidator()
+
+	// Valid prices
+	validRates := []NormalizedRate{
+		{Price: decimal.NewFromFloat(0.10)},
+		{Price: decimal.NewFromFloat(0.0)},
+		{Price: decimal.NewFromFloat(100.00)},
+	}
+	if err := validator.ValidatePricesPositive(validRates); err != nil {
+		t.Errorf("expected valid prices to pass, got: %v", err)
+	}
+
+	// Invalid negative price
+	invalidRates := []NormalizedRate{
+		{Price: decimal.NewFromFloat(-0.10)},
+	}
+	if err := validator.ValidatePricesPositive(invalidRates); err == nil {
+		t.Error("expected negative price to fail validation")
+	}
+}
+
+func TestValidateNoDuplicates(t *testing.T) {
+	validator := NewIngestionValidator()
+
+	// Unique rates
+	uniqueRates := []NormalizedRate{
+		{RateKey: db.RateKey{Cloud: db.AWS, Service: "EC2", Region: "us-east-1", Attributes: map[string]string{"type": "t3.micro"}}},
+		{RateKey: db.RateKey{Cloud: db.AWS, Service: "EC2", Region: "us-east-1", Attributes: map[string]string{"type": "t3.small"}}},
+	}
+	if err := validator.ValidateNoDuplicates(uniqueRates); err != nil {
+		t.Errorf("expected unique rates to pass, got: %v", err)
+	}
+
+	// Duplicate rates
+	duplicateRates := []NormalizedRate{
+		{RateKey: db.RateKey{Cloud: db.AWS, Service: "EC2", Region: "us-east-1", Attributes: map[string]string{"type": "t3.micro"}}},
+		{RateKey: db.RateKey{Cloud: db.AWS, Service: "EC2", Region: "us-east-1", Attributes: map[string]string{"type": "t3.micro"}}},
+	}
+	if err := validator.ValidateNoDuplicates(duplicateRates); err == nil {
+		t.Error("expected duplicate rates to fail validation")
+	}
+}
+
+func TestValidateCoverageNotDecreased(t *testing.T) {
+	validator := NewIngestionValidator()
+	validator.SetMinCoveragePercent(95.0)
+
+	// Coverage maintained
+	if err := validator.ValidateCoverageNotDecreased(100, 100); err != nil {
+		t.Errorf("expected same coverage to pass, got: %v", err)
+	}
+
+	// Coverage increased
+	if err := validator.ValidateCoverageNotDecreased(110, 100); err != nil {
+		t.Errorf("expected increased coverage to pass, got: %v", err)
+	}
+
+	// Coverage slightly decreased (still above 95%)
+	if err := validator.ValidateCoverageNotDecreased(96, 100); err != nil {
+		t.Errorf("expected 96%% coverage to pass, got: %v", err)
+	}
+
+	// Coverage decreased below threshold
+	if err := validator.ValidateCoverageNotDecreased(90, 100); err == nil {
+		t.Error("expected 90%% coverage to fail validation")
+	}
+}
+
+func TestBackupWriteRead(t *testing.T) {
+	backup := &SnapshotBackup{
+		Provider:      db.AWS,
+		Region:        "us-east-1",
+		Alias:         "default",
+		ContentHash:   "abc123",
+		RateCount:     2,
+		SchemaVersion: "1.0",
+		Rates: []NormalizedRate{
+			{
+				RateKey: db.RateKey{
+					Cloud:   db.AWS,
+					Service: "EC2",
+					Region:  "us-east-1",
+				},
+				Price: decimal.NewFromFloat(0.10),
+			},
+			{
+				RateKey: db.RateKey{
+					Cloud:   db.AWS,
+					Service: "RDS",
+					Region:  "us-east-1",
+				},
+				Price: decimal.NewFromFloat(0.20),
+			},
+		},
+	}
+
+	// Recalculate hash to match
+	backup.ContentHash = calculateHash(backup.Rates)
+
+	mgr := NewBackupManager()
+	
+	// Write to temp directory
+	path, err := mgr.WriteBackup(t.TempDir(), backup)
+	if err != nil {
+		t.Fatalf("failed to write backup: %v", err)
+	}
+
+	// Read back
+	readBackup, err := mgr.ReadBackup(path)
+	if err != nil {
+		t.Fatalf("failed to read backup: %v", err)
+	}
+
+	// Verify
+	if readBackup.Provider != backup.Provider {
+		t.Errorf("provider mismatch: got %s, want %s", readBackup.Provider, backup.Provider)
+	}
+	if readBackup.RateCount != backup.RateCount {
+		t.Errorf("rate count mismatch: got %d, want %d", readBackup.RateCount, backup.RateCount)
+	}
+	if len(readBackup.Rates) != len(backup.Rates) {
+		t.Errorf("rates length mismatch: got %d, want %d", len(readBackup.Rates), len(backup.Rates))
+	}
+}
+
+func TestPipelineResult(t *testing.T) {
+	// Verify PipelineResult structure
+	result := &PipelineResult{
+		Success:         true,
+		PhasesCompleted: []Phase{PhaseFetch, PhaseNormalize, PhaseValidate, PhaseBackup, PhaseCommit},
+		Stats: PipelineStats{
+			RawPricesCount:       100,
+			NormalizedRatesCount: 95,
+			UniqueServicesCount:  5,
+		},
+	}
+
+	if !result.Success {
+		t.Error("expected success")
+	}
+	if len(result.PhasesCompleted) != 5 {
+		t.Errorf("expected 5 phases, got %d", len(result.PhasesCompleted))
+	}
 }
 
 ################################################################################
@@ -54491,11 +56197,11 @@ resource "aws_s3_bucket_replication_configuration" "primary_to_west" {
                                 SUMMARY
 ================================================================================
 
-Total Files Combined: 265
-Generated: 2026-01-17 02:13:09
+Total Files Combined: 271
+Generated: 2026-01-17 12:44:55
 Project: cost estimation
 
-Files by Type:  .go : 203 files
+Files by Type:  .go : 209 files
   .tf : 46 files
   .json : 4 files
   .md : 3 files

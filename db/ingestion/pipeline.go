@@ -1,5 +1,5 @@
 // Package ingestion - Pricing data ingestion pipeline
-// Strictly separated from estimation: fetch → normalize → store
+// Strictly separated from estimation: fetch → normalize → validate → backup → commit
 package ingestion
 
 import (
@@ -18,113 +18,369 @@ import (
 	"github.com/shopspring/decimal"
 )
 
+// Phase represents a pipeline execution phase
+type Phase string
+
+const (
+	PhaseFetch     Phase = "fetch"
+	PhaseNormalize Phase = "normalize"
+	PhaseValidate  Phase = "validate"
+	PhaseBackup    Phase = "backup"
+	PhaseCommit    Phase = "commit"
+)
+
+// PipelineConfig configures the ingestion pipeline
+type PipelineConfig struct {
+	// Provider is the cloud provider (aws, azure, gcp)
+	Provider db.CloudProvider
+
+	// Region to ingest
+	Region string
+
+	// Alias for multi-account (default if empty)
+	Alias string
+
+	// DryRun validates only, no DB writes
+	DryRun bool
+
+	// BackupDir is where to write backups
+	BackupDir string
+
+	// MinCoveragePercent is the minimum required coverage (default 95%)
+	MinCoveragePercent float64
+
+	// Timeout for the entire pipeline
+	Timeout time.Duration
+}
+
+// DefaultPipelineConfig returns production defaults
+func DefaultPipelineConfig() *PipelineConfig {
+	return &PipelineConfig{
+		Alias:              "default",
+		DryRun:             false,
+		BackupDir:          "./pricing-backups",
+		MinCoveragePercent: 95.0, // Very high coverage required
+		Timeout:            30 * time.Minute,
+	}
+}
+
+// PipelineResult contains the outcome of a pipeline run
+type PipelineResult struct {
+	// Success indicates all phases completed
+	Success bool `json:"success"`
+
+	// SnapshotID of the created snapshot (nil if dry-run or failure)
+	SnapshotID *uuid.UUID `json:"snapshot_id,omitempty"`
+
+	// Phases completed
+	PhasesCompleted []Phase `json:"phases_completed"`
+
+	// FailedPhase if any
+	FailedPhase Phase `json:"failed_phase,omitempty"`
+
+	// Error message if failed
+	Error string `json:"error,omitempty"`
+
+	// Stats from the run
+	Stats PipelineStats `json:"stats"`
+
+	// BackupPath where backup was written
+	BackupPath string `json:"backup_path,omitempty"`
+
+	// Duration of the run
+	Duration time.Duration `json:"duration"`
+}
+
+// PipelineStats contains statistics from a run
+type PipelineStats struct {
+	RawPricesCount       int     `json:"raw_prices_count"`
+	NormalizedRatesCount int     `json:"normalized_rates_count"`
+	UniqueServicesCount  int     `json:"unique_services_count"`
+	CoveragePercent      float64 `json:"coverage_percent"`
+	ContentHash          string  `json:"content_hash"`
+}
+
 // RawPrice represents a raw price record from a cloud API
 type RawPrice struct {
-	SKU            string
-	ServiceCode    string
-	ProductFamily  string
-	Region         string
-	Unit           string
-	PricePerUnit   string
-	Currency       string
-	Attributes     map[string]string
-	TierStart      *float64
-	TierEnd        *float64
-	EffectiveDate  *time.Time
+	SKU           string            `json:"sku"`
+	ServiceCode   string            `json:"service_code"`
+	ProductFamily string            `json:"product_family"`
+	Region        string            `json:"region"`
+	Unit          string            `json:"unit"`
+	PricePerUnit  string            `json:"price_per_unit"`
+	Currency      string            `json:"currency"`
+	Attributes    map[string]string `json:"attributes"`
+	TierStart     *float64          `json:"tier_start,omitempty"`
+	TierEnd       *float64          `json:"tier_end,omitempty"`
+	EffectiveDate *time.Time        `json:"effective_date,omitempty"`
 }
 
 // NormalizedRate is the output of normalization
 type NormalizedRate struct {
-	RateKey    db.RateKey
-	Unit       string
-	Price      decimal.Decimal
-	Currency   string
-	Confidence float64
-	TierMin    *decimal.Decimal
-	TierMax    *decimal.Decimal
+	RateKey    db.RateKey      `json:"rate_key"`
+	Unit       string          `json:"unit"`
+	Price      decimal.Decimal `json:"price"`
+	Currency   string          `json:"currency"`
+	Confidence float64         `json:"confidence"`
+	TierMin    *decimal.Decimal `json:"tier_min,omitempty"`
+	TierMax    *decimal.Decimal `json:"tier_max,omitempty"`
 }
 
 // PriceFetcher fetches raw prices from a cloud API
 type PriceFetcher interface {
 	// Cloud returns the cloud provider
 	Cloud() db.CloudProvider
-	
-	// FetchRegion fetches all prices for a region
+
+	// FetchRegion fetches all prices for a region (NO DB WRITES)
 	FetchRegion(ctx context.Context, region string) ([]RawPrice, error)
-	
+
 	// SupportedRegions returns supported regions
 	SupportedRegions() []string
+
+	// SupportedServices returns services this fetcher covers
+	SupportedServices() []string
 }
 
 // PriceNormalizer converts raw prices to normalized rates
 type PriceNormalizer interface {
 	// Cloud returns the cloud provider
 	Cloud() db.CloudProvider
-	
+
 	// Normalize converts raw prices to normalized rates
 	Normalize(raw []RawPrice) ([]NormalizedRate, error)
 }
 
-// SnapshotBuilder builds and persists pricing snapshots
-type SnapshotBuilder struct {
-	store  db.PricingStore
+// Pipeline orchestrates the full ingestion flow with 5 strict phases
+type Pipeline struct {
+	fetcher    PriceFetcher
+	normalizer PriceNormalizer
+	validator  *IngestionValidator
+	backupMgr  *BackupManager
+	store      db.PricingStore
 }
 
-// NewSnapshotBuilder creates a new snapshot builder
-func NewSnapshotBuilder(store db.PricingStore) *SnapshotBuilder {
-	return &SnapshotBuilder{store: store}
+// NewPipeline creates a new ingestion pipeline
+func NewPipeline(
+	fetcher PriceFetcher,
+	normalizer PriceNormalizer,
+	store db.PricingStore,
+) *Pipeline {
+	return &Pipeline{
+		fetcher:    fetcher,
+		normalizer: normalizer,
+		validator:  NewIngestionValidator(),
+		backupMgr:  NewBackupManager(),
+		store:      store,
+	}
 }
 
-// BuildSnapshot creates a pricing snapshot from normalized rates
-func (b *SnapshotBuilder) BuildSnapshot(
-	ctx context.Context,
-	cloud db.CloudProvider,
-	region string,
-	alias string,
-	source string,
-	rates []NormalizedRate,
-) (*db.PricingSnapshot, error) {
-	// Calculate content hash
-	hash := b.calculateHash(rates)
-	
-	// Check if snapshot already exists
-	existing, err := b.findExistingSnapshot(ctx, cloud, region, alias, hash)
+// Execute runs the full 5-phase ingestion pipeline
+func (p *Pipeline) Execute(ctx context.Context, config *PipelineConfig) (*PipelineResult, error) {
+	if config == nil {
+		config = DefaultPipelineConfig()
+	}
+
+	start := time.Now()
+	result := &PipelineResult{
+		PhasesCompleted: make([]Phase, 0, 5),
+	}
+
+	// Apply timeout
+	if config.Timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, config.Timeout)
+		defer cancel()
+	}
+
+	// ========================================
+	// PHASE A: FETCH (NO DB WRITES)
+	// ========================================
+	rawPrices, err := p.phaseFetch(ctx, config)
 	if err != nil {
-		return nil, fmt.Errorf("failed to check existing snapshot: %w", err)
+		result.FailedPhase = PhaseFetch
+		result.Error = err.Error()
+		result.Duration = time.Since(start)
+		return result, nil
 	}
+	result.PhasesCompleted = append(result.PhasesCompleted, PhaseFetch)
+	result.Stats.RawPricesCount = len(rawPrices)
+
+	// ========================================
+	// PHASE B: NORMALIZE
+	// ========================================
+	normalizedRates, err := p.phaseNormalize(ctx, rawPrices)
+	if err != nil {
+		result.FailedPhase = PhaseNormalize
+		result.Error = err.Error()
+		result.Duration = time.Since(start)
+		return result, nil
+	}
+	result.PhasesCompleted = append(result.PhasesCompleted, PhaseNormalize)
+	result.Stats.NormalizedRatesCount = len(normalizedRates)
+	result.Stats.UniqueServicesCount = countUniqueServices(normalizedRates)
+	result.Stats.ContentHash = calculateHash(normalizedRates)
+
+	// ========================================
+	// PHASE C: VALIDATE (NON-NEGOTIABLE)
+	// ========================================
+	validationErr := p.phaseValidate(ctx, config, normalizedRates)
+	if validationErr != nil {
+		result.FailedPhase = PhaseValidate
+		result.Error = validationErr.Error()
+		result.Duration = time.Since(start)
+		return result, nil
+	}
+	result.PhasesCompleted = append(result.PhasesCompleted, PhaseValidate)
+
+	// ========================================
+	// PHASE D: BACKUP (MANDATORY)
+	// ========================================
+	backupPath, err := p.phaseBackup(ctx, config, normalizedRates, result.Stats)
+	if err != nil {
+		result.FailedPhase = PhaseBackup
+		result.Error = err.Error()
+		result.Duration = time.Since(start)
+		return result, nil
+	}
+	result.PhasesCompleted = append(result.PhasesCompleted, PhaseBackup)
+	result.BackupPath = backupPath
+
+	// ========================================
+	// DRY-RUN CHECK
+	// ========================================
+	if config.DryRun {
+		result.Success = true
+		result.Duration = time.Since(start)
+		return result, nil
+	}
+
+	// ========================================
+	// PHASE E: ATOMIC DATABASE COMMIT
+	// ========================================
+	snapshotID, err := p.phaseCommit(ctx, config, normalizedRates, result.Stats.ContentHash)
+	if err != nil {
+		result.FailedPhase = PhaseCommit
+		result.Error = err.Error()
+		result.Duration = time.Since(start)
+		return result, nil
+	}
+	result.PhasesCompleted = append(result.PhasesCompleted, PhaseCommit)
+	result.SnapshotID = &snapshotID
+
+	result.Success = true
+	result.Duration = time.Since(start)
+	return result, nil
+}
+
+// phaseFetch downloads raw pricing (NO DB WRITES)
+func (p *Pipeline) phaseFetch(ctx context.Context, config *PipelineConfig) ([]RawPrice, error) {
+	rawPrices, err := p.fetcher.FetchRegion(ctx, config.Region)
+	if err != nil {
+		return nil, fmt.Errorf("fetch failed for %s/%s: %w", config.Provider, config.Region, err)
+	}
+
+	if len(rawPrices) == 0 {
+		return nil, fmt.Errorf("fetch returned 0 prices for %s/%s", config.Provider, config.Region)
+	}
+
+	return rawPrices, nil
+}
+
+// phaseNormalize transforms raw prices to canonical rates
+func (p *Pipeline) phaseNormalize(ctx context.Context, rawPrices []RawPrice) ([]NormalizedRate, error) {
+	normalized, err := p.normalizer.Normalize(rawPrices)
+	if err != nil {
+		return nil, fmt.Errorf("normalization failed: %w", err)
+	}
+
+	if len(normalized) == 0 {
+		return nil, fmt.Errorf("normalization produced 0 rates")
+	}
+
+	return normalized, nil
+}
+
+// phaseValidate runs governance checks (abort on failure)
+func (p *Pipeline) phaseValidate(ctx context.Context, config *PipelineConfig, rates []NormalizedRate) error {
+	// Configure validator
+	p.validator.SetMinCoveragePercent(config.MinCoveragePercent)
+
+	// Get previous snapshot for coverage comparison
+	prevSnapshot, _ := p.store.GetActiveSnapshot(ctx, config.Provider, config.Region, config.Alias)
+	var prevRateCount int
+	if prevSnapshot != nil {
+		prevRateCount, _ = p.store.CountRates(ctx, prevSnapshot.ID)
+	}
+
+	// Run all validations
+	return p.validator.ValidateAll(rates, prevRateCount)
+}
+
+// phaseBackup writes snapshot dump to local file
+func (p *Pipeline) phaseBackup(ctx context.Context, config *PipelineConfig, rates []NormalizedRate, stats PipelineStats) (string, error) {
+	backup := &SnapshotBackup{
+		Provider:      config.Provider,
+		Region:        config.Region,
+		Alias:         config.Alias,
+		Timestamp:     time.Now(),
+		ContentHash:   stats.ContentHash,
+		RateCount:     len(rates),
+		SchemaVersion: "1.0",
+		Rates:         rates,
+	}
+
+	return p.backupMgr.WriteBackup(config.BackupDir, backup)
+}
+
+// phaseCommit atomically writes to database
+func (p *Pipeline) phaseCommit(ctx context.Context, config *PipelineConfig, rates []NormalizedRate, contentHash string) (uuid.UUID, error) {
+	// Check for existing snapshot with same hash (idempotency)
+	existing, _ := p.store.FindSnapshotByHash(ctx, config.Provider, config.Region, config.Alias, contentHash)
 	if existing != nil {
-		return existing, nil // Already ingested
+		// Already ingested, return existing
+		return existing.ID, nil
 	}
-	
-	// Create new snapshot
+
+	// Create snapshot in a single transaction
 	snapshot := &db.PricingSnapshot{
 		ID:            uuid.New(),
-		Cloud:         cloud,
-		Region:        region,
-		ProviderAlias: alias,
-		Source:        source,
+		Cloud:         config.Provider,
+		Region:        config.Region,
+		ProviderAlias: config.Alias,
+		Source:        "manual_ingestion_pipeline",
 		FetchedAt:     time.Now(),
 		ValidFrom:     time.Now(),
-		Hash:          hash,
+		Hash:          contentHash,
 		Version:       "1.0",
-		IsActive:      false,
+		IsActive:      false, // Not active until commit succeeds
 	}
-	
-	// Insert snapshot
-	if err := b.store.CreateSnapshot(ctx, snapshot); err != nil {
-		return nil, fmt.Errorf("failed to create snapshot: %w", err)
+
+	// Begin transaction
+	tx, err := p.store.BeginTx(ctx)
+	if err != nil {
+		return uuid.Nil, fmt.Errorf("failed to begin transaction: %w", err)
 	}
-	
-	// Insert rates
-	for _, nr := range rates {
-		// Upsert rate key
-		nr.RateKey.ID = uuid.New()
-		key, err := b.store.UpsertRateKey(ctx, &nr.RateKey)
+
+	// Rollback on any error
+	defer func() {
 		if err != nil {
-			return nil, fmt.Errorf("failed to upsert rate key: %w", err)
+			tx.Rollback()
 		}
-		
-		// Create rate
+	}()
+
+	// Insert snapshot
+	if err = tx.CreateSnapshot(ctx, snapshot); err != nil {
+		return uuid.Nil, fmt.Errorf("failed to create snapshot: %w", err)
+	}
+
+	// Insert all rates
+	for _, nr := range rates {
+		nr.RateKey.ID = uuid.New()
+		key, err := tx.UpsertRateKey(ctx, &nr.RateKey)
+		if err != nil {
+			return uuid.Nil, fmt.Errorf("failed to upsert rate key: %w", err)
+		}
+
 		rate := &db.PricingRate{
 			ID:         uuid.New(),
 			SnapshotID: snapshot.ID,
@@ -136,35 +392,42 @@ func (b *SnapshotBuilder) BuildSnapshot(
 			TierMin:    nr.TierMin,
 			TierMax:    nr.TierMax,
 		}
-		if err := b.store.CreateRate(ctx, rate); err != nil {
-			return nil, fmt.Errorf("failed to create rate: %w", err)
+		if err = tx.CreateRate(ctx, rate); err != nil {
+			return uuid.Nil, fmt.Errorf("failed to create rate: %w", err)
 		}
 	}
-	
-	return snapshot, nil
-}
 
-// ActivateSnapshot activates a snapshot
-func (b *SnapshotBuilder) ActivateSnapshot(ctx context.Context, snapshotID uuid.UUID) error {
-	return b.store.ActivateSnapshot(ctx, snapshotID)
+	// Mark snapshot as ready and activate
+	if err = tx.ActivateSnapshot(ctx, snapshot.ID); err != nil {
+		return uuid.Nil, fmt.Errorf("failed to activate snapshot: %w", err)
+	}
+
+	// Commit transaction
+	if err = tx.Commit(); err != nil {
+		return uuid.Nil, fmt.Errorf("commit failed: %w", err)
+	}
+
+	return snapshot.ID, nil
 }
 
 // calculateHash computes a deterministic hash of rates
-func (b *SnapshotBuilder) calculateHash(rates []NormalizedRate) string {
+func calculateHash(rates []NormalizedRate) string {
 	// Sort for determinism
-	sort.Slice(rates, func(i, j int) bool {
-		ki := rateKeyString(rates[i].RateKey)
-		kj := rateKeyString(rates[j].RateKey)
+	sorted := make([]NormalizedRate, len(rates))
+	copy(sorted, rates)
+	sort.Slice(sorted, func(i, j int) bool {
+		ki := rateKeyString(sorted[i].RateKey)
+		kj := rateKeyString(sorted[j].RateKey)
 		return ki < kj
 	})
-	
+
 	hasher := sha256.New()
-	for _, r := range rates {
+	for _, r := range sorted {
 		hasher.Write([]byte(rateKeyString(r.RateKey)))
 		hasher.Write([]byte(r.Unit))
 		hasher.Write([]byte(r.Price.String()))
 	}
-	
+
 	return hex.EncodeToString(hasher.Sum(nil))
 }
 
@@ -177,90 +440,19 @@ func rateKeyString(k db.RateKey) string {
 	return fmt.Sprintf("%s|%s|%s|%s|%s", k.Cloud, k.Service, k.ProductFamily, k.Region, strings.Join(attrs, ","))
 }
 
-func (b *SnapshotBuilder) findExistingSnapshot(ctx context.Context, cloud db.CloudProvider, region, alias, hash string) (*db.PricingSnapshot, error) {
-	snapshots, err := b.store.ListSnapshots(ctx, cloud, region)
-	if err != nil {
-		return nil, err
+func countUniqueServices(rates []NormalizedRate) int {
+	services := make(map[string]bool)
+	for _, r := range rates {
+		services[r.RateKey.Service] = true
 	}
-	for _, s := range snapshots {
-		if s.ProviderAlias == alias && s.Hash == hash {
-			return s, nil
-		}
-	}
-	return nil, nil
-}
-
-// Pipeline orchestrates the full ingestion flow
-type Pipeline struct {
-	fetcher    PriceFetcher
-	normalizer PriceNormalizer
-	builder    *SnapshotBuilder
-}
-
-// NewPipeline creates a new ingestion pipeline
-func NewPipeline(fetcher PriceFetcher, normalizer PriceNormalizer, store db.PricingStore) *Pipeline {
-	return &Pipeline{
-		fetcher:    fetcher,
-		normalizer: normalizer,
-		builder:    NewSnapshotBuilder(store),
-	}
-}
-
-// IngestRegion runs the full ingestion for a region
-func (p *Pipeline) IngestRegion(ctx context.Context, region, alias string) (*db.PricingSnapshot, error) {
-	// Fetch
-	raw, err := p.fetcher.FetchRegion(ctx, region)
-	if err != nil {
-		return nil, fmt.Errorf("fetch failed: %w", err)
-	}
-	
-	// Normalize
-	normalized, err := p.normalizer.Normalize(raw)
-	if err != nil {
-		return nil, fmt.Errorf("normalization failed: %w", err)
-	}
-	
-	// Build snapshot
-	snapshot, err := p.builder.BuildSnapshot(
-		ctx,
-		p.fetcher.Cloud(),
-		region,
-		alias,
-		"ingestion_pipeline",
-		normalized,
-	)
-	if err != nil {
-		return nil, fmt.Errorf("snapshot build failed: %w", err)
-	}
-	
-	// Activate
-	if err := p.builder.ActivateSnapshot(ctx, snapshot.ID); err != nil {
-		return nil, fmt.Errorf("activation failed: %w", err)
-	}
-	
-	return snapshot, nil
-}
-
-// IngestAllRegions ingests all supported regions
-func (p *Pipeline) IngestAllRegions(ctx context.Context, alias string) ([]*db.PricingSnapshot, error) {
-	var snapshots []*db.PricingSnapshot
-	for _, region := range p.fetcher.SupportedRegions() {
-		snapshot, err := p.IngestRegion(ctx, region, alias)
-		if err != nil {
-			return snapshots, fmt.Errorf("region %s: %w", region, err)
-		}
-		snapshots = append(snapshots, snapshot)
-	}
-	return snapshots, nil
+	return len(services)
 }
 
 // NormalizeAttributes canonicalizes attribute keys and values
 func NormalizeAttributes(raw map[string]string) map[string]string {
 	result := make(map[string]string)
 	for k, v := range raw {
-		// Normalize key
 		key := strings.ToLower(strings.ReplaceAll(k, " ", "_"))
-		// Normalize value
 		val := strings.ToLower(strings.TrimSpace(v))
 		result[key] = val
 	}
