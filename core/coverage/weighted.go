@@ -20,6 +20,9 @@ const (
 	// SpendSymbolic - known resource but cost cannot be computed
 	SpendSymbolic
 
+	// SpendIndirect - zero-cost resource (VPC, IAM, etc.)
+	SpendIndirect
+
 	// SpendUnsupported - resource type not modeled
 	SpendUnsupported
 )
@@ -31,6 +34,8 @@ func (c SpendCoverageType) String() string {
 		return "numeric"
 	case SpendSymbolic:
 		return "symbolic"
+	case SpendIndirect:
+		return "indirect"
 	case SpendUnsupported:
 		return "unsupported"
 	default:
@@ -58,9 +63,10 @@ type CostUnitCoverage struct {
 
 // WeightedCoverageReport is the cost-weighted coverage analysis
 type WeightedCoverageReport struct {
-	// Cost-weighted percentages
+	// Cost-weighted percentages (based on spend, not resource count)
 	NumericCostPercent     float64 `json:"numeric_cost_percent"`
 	SymbolicCostPercent    float64 `json:"symbolic_cost_percent"`
+	IndirectCostPercent    float64 `json:"indirect_cost_percent"`
 	UnsupportedCostPercent float64 `json:"unsupported_cost_percent"`
 
 	// Absolute amounts
@@ -72,6 +78,7 @@ type WeightedCoverageReport struct {
 	// Resource counts (secondary metric)
 	NumericResourceCount     int `json:"numeric_resource_count"`
 	SymbolicResourceCount    int `json:"symbolic_resource_count"`
+	IndirectResourceCount    int `json:"indirect_resource_count"`
 	UnsupportedResourceCount int `json:"unsupported_resource_count"`
 	TotalResourceCount       int `json:"total_resource_count"`
 
@@ -120,6 +127,18 @@ func (a *CoverageAggregator) AddSymbolic(address, resourceType, component string
 }
 
 // AddUnsupported adds an unsupported resource
+// AddIndirect adds a zero-cost indirect resource (VPC, IAM, etc.)
+func (a *CoverageAggregator) AddIndirect(address, resourceType string, reason string) {
+	a.units = append(a.units, CostUnitCoverage{
+		ResourceAddress: address,
+		ResourceType:    resourceType,
+		CoverageType:    SpendIndirect,
+		NumericCost:     0,
+		Reason:          reason,
+	})
+}
+
+// AddUnsupported adds an unsupported resource
 func (a *CoverageAggregator) AddUnsupported(address, resourceType string, estimatedCost float64, reason string) {
 	a.units = append(a.units, CostUnitCoverage{
 		ResourceAddress: address,
@@ -152,6 +171,10 @@ func (a *CoverageAggregator) Compute() *WeightedCoverageReport {
 					report.SymbolicReasons[unit.ResourceType], unit.Reason)
 			}
 
+		case SpendIndirect:
+			// Indirect resources have zero cost but are tracked
+			// They don't contribute to cost percentages
+
 		case SpendUnsupported:
 			report.TotalUnsupportedEst += unit.EstimatedBound
 			if !seenUnsupported[unit.ResourceType] {
@@ -163,7 +186,7 @@ func (a *CoverageAggregator) Compute() *WeightedCoverageReport {
 		// Track unique resources by address
 		key := unit.ResourceAddress
 		if existing, ok := seenResources[key]; ok {
-			// Upgrade: unsupported beats symbolic beats numeric
+			// Upgrade: unsupported beats symbolic beats indirect beats numeric
 			if unit.CoverageType > existing {
 				seenResources[key] = unit.CoverageType
 			}
@@ -180,6 +203,8 @@ func (a *CoverageAggregator) Compute() *WeightedCoverageReport {
 			report.NumericResourceCount++
 		case SpendSymbolic:
 			report.SymbolicResourceCount++
+		case SpendIndirect:
+			report.IndirectResourceCount++
 		case SpendUnsupported:
 			report.UnsupportedResourceCount++
 		}

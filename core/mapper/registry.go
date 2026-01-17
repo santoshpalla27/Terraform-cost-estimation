@@ -126,6 +126,20 @@ func (r *Registry) ListHighImpact() []MapperMetadata {
 	return result
 }
 
+// ListByTier returns all mappers in a coverage tier
+func (r *Registry) ListByTier(tier CoverageTier) []MapperMetadata {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	var result []MapperMetadata
+	for _, md := range r.metadata {
+		if md.Tier == tier {
+			result = append(result, md)
+		}
+	}
+	return result
+}
+
 // Stats returns registry statistics
 func (r *Registry) Stats() RegistryStats {
 	r.mu.RLock()
@@ -135,6 +149,7 @@ func (r *Registry) Stats() RegistryStats {
 		ByCloud:    make(map[CloudProvider]int),
 		ByCategory: make(map[string]int),
 		ByBehavior: make(map[CostBehaviorType]int),
+		ByTier:     make(map[CoverageTier]int),
 	}
 
 	for _, md := range r.metadata {
@@ -142,6 +157,7 @@ func (r *Registry) Stats() RegistryStats {
 		stats.ByCloud[md.Cloud]++
 		stats.ByCategory[md.Category]++
 		stats.ByBehavior[md.CostBehavior]++
+		stats.ByTier[md.Tier]++
 
 		if md.HighImpact {
 			stats.HighImpact++
@@ -162,6 +178,7 @@ type RegistryStats struct {
 	ByCloud       map[CloudProvider]int
 	ByCategory    map[string]int
 	ByBehavior    map[CostBehaviorType]int
+	ByTier        map[CoverageTier]int
 }
 
 // ValidateAllMappers validates all registered mappers

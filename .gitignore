@@ -132,7 +132,7 @@ build/
 
 
 # Secrets (NEVER commit these)
-secrets/
+
 *.pem
 *.key
 *.crt
