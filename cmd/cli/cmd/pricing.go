@@ -12,6 +12,7 @@ import (
 
 	"terraform-cost/db"
 	"terraform-cost/db/ingestion"
+	"terraform-cost/db/regions"
 
 	"github.com/spf13/cobra"
 )
@@ -74,7 +75,7 @@ func init() {
 
 	// Update command flags - REQUIRED for safety
 	pricingUpdateCmd.Flags().StringVarP(&pricingProvider, "provider", "p", "", "Cloud provider (aws, azure, gcp) [REQUIRED]")
-	pricingUpdateCmd.Flags().StringVarP(&pricingRegion, "region", "r", "", "Region to ingest (e.g., us-east-1) [REQUIRED]")
+	pricingUpdateCmd.Flags().StringVarP(&pricingRegion, "region", "r", "all", "Region to ingest (e.g., us-east-1, or 'all' for all regions)")
 	pricingUpdateCmd.Flags().StringVar(&pricingAlias, "alias", "default", "Provider alias for multi-account")
 	pricingUpdateCmd.Flags().BoolVar(&pricingDryRun, "dry-run", false, "Validate only, no database writes")
 	pricingUpdateCmd.Flags().StringVarP(&pricingOutputDir, "output-dir", "o", "./pricing-backups", "Directory for backup files")
@@ -87,7 +88,7 @@ func init() {
 	pricingUpdateCmd.Flags().BoolVar(&pricingStreaming, "streaming", true, "Use streaming mode for large datasets (recommended for low-memory)")
 
 	pricingUpdateCmd.MarkFlagRequired("provider")
-	pricingUpdateCmd.MarkFlagRequired("region")
+	// region defaults to 'all' - not required
 
 	// Restore command flags
 	pricingRestoreCmd.Flags().BoolVar(&pricingDryRun, "dry-run", false, "Validate only, no database writes")
@@ -134,6 +135,74 @@ func runStrictIngestion(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("unsupported provider: %s (use aws, azure, or gcp)", pricingProvider)
 	}
 
+	// Handle --region=all case
+	if pricingRegion == "all" {
+		return runMultiRegionIngestion(ctx, provider)
+	}
+
+	// Single region ingestion
+	return runSingleRegionIngestion(ctx, provider, pricingRegion)
+}
+
+// runMultiRegionIngestion ingests all billable regions for a provider
+func runMultiRegionIngestion(ctx context.Context, provider db.CloudProvider) error {
+	registry := regions.NewRegistry()
+	billableRegions := registry.GetBillableRegions(provider)
+
+	fmt.Println("")
+	fmt.Println("╔══════════════════════════════════════════════════════════════╗")
+	fmt.Println("║          MULTI-REGION PRICING INGESTION                       ║")
+	fmt.Println("╚══════════════════════════════════════════════════════════════╝")
+	fmt.Println("")
+	fmt.Printf("Provider: %s\n", provider)
+	fmt.Printf("Regions:  %d billable regions\n", len(billableRegions))
+	fmt.Printf("Dry-run:  %v\n", pricingDryRun)
+	fmt.Println("")
+
+	var successful, failed []string
+	startTime := time.Now()
+
+	for i, region := range billableRegions {
+		fmt.Println("═══════════════════════════════════════════════════════════════")
+		fmt.Printf("[%d/%d] Ingesting %s %s\n", i+1, len(billableRegions), provider, region.Region)
+		fmt.Println("═══════════════════════════════════════════════════════════════")
+
+		regionStart := time.Now()
+		err := runSingleRegionIngestion(ctx, provider, region.Region)
+		
+		if err != nil {
+			fmt.Printf("✗ %s failed: %v\n", region.Region, err)
+			failed = append(failed, region.Region)
+		} else {
+			fmt.Printf("✓ %s completed in %s\n", region.Region, time.Since(regionStart).Round(time.Second))
+			successful = append(successful, region.Region)
+		}
+		fmt.Println("")
+	}
+
+	// Print summary
+	fmt.Println("═══════════════════════════════════════════════════════════════")
+	fmt.Println("                    INGESTION COMPLETE")
+	fmt.Println("═══════════════════════════════════════════════════════════════")
+	fmt.Printf("Duration:   %s\n", time.Since(startTime).Round(time.Second))
+	fmt.Printf("Successful: %d regions\n", len(successful))
+	fmt.Printf("Failed:     %d regions\n", len(failed))
+	
+	if len(failed) > 0 {
+		fmt.Println("\nFailed regions:")
+		for _, r := range failed {
+			fmt.Printf("  ✗ %s\n", r)
+		}
+	}
+
+	if len(failed) > 0 {
+		return fmt.Errorf("%d regions failed", len(failed))
+	}
+	return nil
+}
+
+// runSingleRegionIngestion ingests a single region
+func runSingleRegionIngestion(ctx context.Context, provider db.CloudProvider, region string) error {
 	// Print header
 	printIngestionHeader(provider)
 
@@ -172,7 +241,7 @@ func runStrictIngestion(cmd *cobra.Command, args []string) error {
 	// Configure lifecycle
 	config := &ingestion.LifecycleConfig{
 		Provider:         provider,
-		Region:           pricingRegion,
+		Region:           region,
 		Alias:            pricingAlias,
 		Environment:      pricingEnvironment,
 		BackupDir:        pricingOutputDir,
