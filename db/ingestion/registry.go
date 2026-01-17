@@ -44,8 +44,8 @@ func (r *FetcherRegistry) RegisterDefaults() {
 	defer r.mu.Unlock()
 
 	// AWS - Production API client
-	r.fetchers[db.AWS] = NewAWSPricingAPIClient(nil)
-	r.normalizers[db.AWS] = NewAWSPricingNormalizer()
+	r.fetchers[db.AWS] = NewAWSPricingAPIFetcher()
+	r.normalizers[db.AWS] = NewAWSPricingAPINormalizer()
 
 	// Azure - Production API client
 	r.fetchers[db.Azure] = NewAzurePricingAPIClient(nil)

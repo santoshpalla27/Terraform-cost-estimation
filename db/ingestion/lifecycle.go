@@ -51,9 +51,9 @@ const (
 	StateArchived SnapshotState = "archived" // Superseded by newer snapshot
 )
 
-// IngestionState holds all in-memory state during ingestion
+// LifecycleState holds all in-memory state during ingestion
 // CRITICAL: No DB writes until PhaseCommitting
-type IngestionState struct {
+type LifecycleState struct {
 	Phase         IngestionPhase
 	Provider      db.CloudProvider
 	Region        string
@@ -107,7 +107,7 @@ func DefaultLifecycleConfig() *LifecycleConfig {
 // Lifecycle manages the strict ingestion state machine
 type Lifecycle struct {
 	mu        sync.Mutex
-	state     *IngestionState
+	state     *LifecycleState
 	config    *LifecycleConfig
 	fetcher   PriceFetcher
 	normalizer PriceNormalizer
@@ -128,7 +128,7 @@ func NewLifecycle(
 		validator:  NewIngestionValidator(),
 		backupMgr:  NewBackupManager(),
 		store:      store,
-		state: &IngestionState{
+		state: &LifecycleState{
 			Phase: PhaseInit,
 		},
 	}
@@ -145,7 +145,7 @@ func (l *Lifecycle) Execute(ctx context.Context, config *LifecycleConfig) (*Life
 	l.config = config
 
 	// Initialize state
-	l.state = &IngestionState{
+	l.state = &LifecycleState{
 		Phase:       PhaseInit,
 		Provider:    config.Provider,
 		Region:      config.Region,

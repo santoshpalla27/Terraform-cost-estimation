@@ -199,64 +199,6 @@ func (v *IngestionValidator) Validate(cloud db.CloudProvider, rates []Normalized
 	return result
 }
 
-// GovernedPipeline wraps Pipeline with governance
-type GovernedPipeline struct {
-	*Pipeline
-	validator *IngestionValidator
-}
-
-// NewGovernedPipeline creates a governed ingestion pipeline
-func NewGovernedPipeline(fetcher PriceFetcher, normalizer PriceNormalizer, store db.PricingStore) *GovernedPipeline {
-	return &GovernedPipeline{
-		Pipeline:  NewPipeline(fetcher, normalizer, store),
-		validator: NewIngestionValidator(),
-	}
-}
-
-// IngestWithValidation runs ingestion with contract validation
-func (p *GovernedPipeline) IngestWithValidation(ctx context.Context, region, alias string) (*db.PricingSnapshot, *ValidationResult, error) {
-	// Fetch
-	raw, err := p.fetcher.FetchRegion(ctx, region)
-	if err != nil {
-		return nil, nil, fmt.Errorf("fetch failed: %w", err)
-	}
-
-	// Normalize
-	normalized, err := p.normalizer.Normalize(raw)
-	if err != nil {
-		return nil, nil, fmt.Errorf("normalization failed: %w", err)
-	}
-
-	// Validate against contracts
-	validation := p.validator.Validate(p.fetcher.Cloud(), normalized)
-	if !validation.IsValid {
-		// Still build snapshot but mark as partial
-		// In strict mode, this would fail
-	}
-
-	// Build snapshot
-	snapshot, err := p.builder.BuildSnapshot(
-		ctx,
-		p.fetcher.Cloud(),
-		region,
-		alias,
-		fmt.Sprintf("ingestion_pipeline_%s", p.fetcher.Cloud()),
-		normalized,
-	)
-	if err != nil {
-		return nil, validation, fmt.Errorf("snapshot build failed: %w", err)
-	}
-
-	// Only activate if validation passed
-	if validation.IsValid {
-		if err := p.builder.ActivateSnapshot(ctx, snapshot.ID); err != nil {
-			return snapshot, validation, fmt.Errorf("activation failed: %w", err)
-		}
-	}
-
-	return snapshot, validation, nil
-}
-
 // CalculateChecksum computes checksum for rates
 func CalculateChecksum(rates []NormalizedRate) string {
 	hasher := sha256.New()
