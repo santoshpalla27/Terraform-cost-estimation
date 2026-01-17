@@ -325,16 +325,6 @@ func (s *PostgresStore) ResolveTieredRates(ctx context.Context, cloud CloudProvi
 	return tiers, nil
 }
 
-// Transaction interface for atomic operations
-type Tx interface {
-	CreateSnapshot(ctx context.Context, snapshot *PricingSnapshot) error
-	UpsertRateKey(ctx context.Context, key *RateKey) (*RateKey, error)
-	CreateRate(ctx context.Context, rate *PricingRate) error
-	ActivateSnapshot(ctx context.Context, id uuid.UUID) error
-	Commit() error
-	Rollback() error
-}
-
 // PostgresTx wraps a database transaction
 type PostgresTx struct {
 	tx *sql.Tx

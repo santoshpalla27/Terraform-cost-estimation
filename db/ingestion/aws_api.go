@@ -45,6 +45,16 @@ func (f *AWSPricingAPIFetcher) SupportedRegions() []string {
 	return f.regions
 }
 
+// SupportedServices returns the list of AWS services this fetcher can get pricing for
+func (f *AWSPricingAPIFetcher) SupportedServices() []string {
+	return []string{
+		"AmazonEC2", "AmazonRDS", "AWSLambda", "AmazonS3", "ElasticLoadBalancing",
+		"AmazonDynamoDB", "AmazonElastiCache", "AmazonCloudWatch", "AmazonRoute53",
+		"AWSSecretsManager", "AWSKMS", "AmazonSNS", "AmazonSQS", "AmazonECS",
+		"AmazonEKS", "AWSFargate", "AmazonCloudFront", "AWSCodeBuild",
+	}
+}
+
 // AWSPriceListIndex represents the top-level price list index
 type AWSPriceListIndex struct {
 	FormatVersion string `json:"formatVersion"`

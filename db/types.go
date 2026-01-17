@@ -88,6 +88,7 @@ type PricingStore interface {
 	GetActiveSnapshot(ctx context.Context, cloud CloudProvider, region, alias string) (*PricingSnapshot, error)
 	ActivateSnapshot(ctx context.Context, id uuid.UUID) error
 	ListSnapshots(ctx context.Context, cloud CloudProvider, region string) ([]*PricingSnapshot, error)
+	FindSnapshotByHash(ctx context.Context, cloud CloudProvider, region, alias, hash string) (*PricingSnapshot, error)
 
 	// Rate Keys
 	UpsertRateKey(ctx context.Context, key *RateKey) (*RateKey, error)
@@ -96,14 +97,28 @@ type PricingStore interface {
 	// Rates
 	CreateRate(ctx context.Context, rate *PricingRate) error
 	BulkCreateRates(ctx context.Context, rates []*PricingRate) error
+	CountRates(ctx context.Context, snapshotID uuid.UUID) (int, error)
 	
 	// Resolution
 	ResolveRate(ctx context.Context, cloud CloudProvider, service, productFamily, region string, attrs map[string]string, unit, alias string) (*ResolvedRate, error)
 	ResolveTieredRates(ctx context.Context, cloud CloudProvider, service, productFamily, region string, attrs map[string]string, unit, alias string) ([]TieredRate, error)
 
+	// Transactions
+	BeginTx(ctx context.Context) (Tx, error)
+
 	// Health
 	Ping(ctx context.Context) error
 	Close() error
+}
+
+// Tx is a transaction interface for atomic operations
+type Tx interface {
+	CreateSnapshot(ctx context.Context, snapshot *PricingSnapshot) error
+	UpsertRateKey(ctx context.Context, key *RateKey) (*RateKey, error)
+	CreateRate(ctx context.Context, rate *PricingRate) error
+	ActivateSnapshot(ctx context.Context, id uuid.UUID) error
+	Commit() error
+	Rollback() error
 }
 
 // SnapshotBuilder helps construct pricing snapshots
