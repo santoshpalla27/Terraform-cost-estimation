@@ -24,11 +24,11 @@ RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
     -o /build/terraform-cost \
     ./cmd/cli
 
-# Build the server binary (if exists)
-# RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
-#     -ldflags='-w -s -extldflags "-static"' \
-#     -o /build/terraform-cost-server \
-#     ./cmd/server
+# Build the server binary
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
+    -ldflags='-w -s -extldflags "-static"' \
+    -o /build/terraform-cost-server \
+    ./cmd/server
 
 # =========================
 # Production Stage
@@ -50,6 +50,7 @@ WORKDIR /app
 
 # Copy binary from builder
 COPY --from=builder /build/terraform-cost /app/terraform-cost
+COPY --from=builder /build/terraform-cost-server /app/terraform-cost-server
 
 # Copy examples for testing
 COPY --from=builder /build/examples /app/examples

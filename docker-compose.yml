@@ -102,7 +102,7 @@ services:
       start_period: 15s
     networks:
       - terraform-cost-network
-    command: ["serve", "--port", "8080"]
+    command: ["/app/terraform-cost-server", "-addr", ":8080"]
     restart: unless-stopped
     profiles:
       - api

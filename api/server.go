@@ -11,6 +11,8 @@ import (
 	"fmt"
 	"net/http"
 	"time"
+
+	"terraform-cost/db"
 )
 
 // Server is the API server
@@ -18,10 +20,16 @@ type Server struct {
 	handler *Handler
 	mux     *http.ServeMux
 	version string
+	store   db.PricingStore
 }
 
-// NewServer creates a new API server
+// NewServer creates a new API server (without database)
 func NewServer(version string) *Server {
+	return NewServerWithStore(version, nil)
+}
+
+// NewServerWithStore creates a new API server with database connection
+func NewServerWithStore(version string, store db.PricingStore) *Server {
 	handler := NewHandler()
 	mux := http.NewServeMux()
 
@@ -29,6 +37,7 @@ func NewServer(version string) *Server {
 		handler: handler,
 		mux:     mux,
 		version: version,
+		store:   store,
 	}
 
 	s.registerRoutes()
@@ -129,12 +138,42 @@ func (s *Server) handleVersion(w http.ResponseWriter, r *http.Request) {
 
 // handleListSnapshots handles GET /pricing-snapshots
 func (s *Server) handleListSnapshots(w http.ResponseWriter, r *http.Request) {
-	// Return available pricing snapshots
+	if s.store == nil {
+		s.writeJSON(w, map[string]interface{}{
+			"error": "Database not connected",
+			"snapshots": []map[string]string{},
+		}, http.StatusServiceUnavailable)
+		return
+	}
+
+	ctx := r.Context()
+	
+	// Query active snapshots for each cloud/region
+	type snapshotInfo struct {
+		ID        string `json:"id"`
+		Cloud     string `json:"cloud"`
+		Region    string `json:"region"`
+		RateCount int    `json:"rate_count"`
+		FetchedAt string `json:"fetched_at"`
+	}
+	
+	var snapshots []snapshotInfo
+	
+	// Check AWS us-east-1
+	if snap, err := s.store.GetActiveSnapshot(ctx, db.AWS, "us-east-1", "default"); err == nil && snap != nil {
+		count, _ := s.store.CountRates(ctx, snap.ID)
+		snapshots = append(snapshots, snapshotInfo{
+			ID:        snap.ID.String(),
+			Cloud:     "aws",
+			Region:    snap.Region,
+			RateCount: count,
+			FetchedAt: snap.FetchedAt.Format(time.RFC3339),
+		})
+	}
+	
 	s.writeJSON(w, map[string]interface{}{
-		"snapshots": []map[string]string{
-			{"id": "aws-us-east-1-2026-01-15", "region": "us-east-1", "provider": "aws"},
-			{"id": "aws-us-west-2-2026-01-15", "region": "us-west-2", "provider": "aws"},
-		},
+		"snapshots": snapshots,
+		"count":     len(snapshots),
 	}, http.StatusOK)
 }
 
