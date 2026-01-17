@@ -117,78 +117,32 @@ type AWSPriceDimension struct {
 // FetchRegion fetches all prices for a region from AWS Pricing API
 func (f *AWSPricingAPIFetcher) FetchRegion(ctx context.Context, region string) ([]RawPrice, error) {
 	var allPrices []RawPrice
-
-	// Fetch EC2 pricing
-	ec2Prices, err := f.fetchServicePricing(ctx, "AmazonEC2", region)
-	if err != nil {
-		return nil, fmt.Errorf("failed to fetch EC2 pricing: %w", err)
+	
+	// Core services to fetch - use correct AWS service codes
+	services := []string{
+		"AmazonEC2",
+		"AmazonRDS", 
+		"AWSLambda",
+		"AmazonS3",
+		"AWSELB",
 	}
-	allPrices = append(allPrices, ec2Prices...)
-
-	// Fetch RDS pricing
-	rdsPrices, err := f.fetchServicePricing(ctx, "AmazonRDS", region)
-	if err != nil {
-		return nil, fmt.Errorf("failed to fetch RDS pricing: %w", err)
+	
+	for _, service := range services {
+		prices, err := f.fetchServicePricing(ctx, service, region)
+		if err != nil {
+			// Log but continue with other services
+			fmt.Printf("Warning: failed to fetch %s pricing: %v\n", service, err)
+			continue
+		}
+		allPrices = append(allPrices, prices...)
+		fmt.Printf("Fetched %d prices for %s\n", len(prices), service)
 	}
-	allPrices = append(allPrices, rdsPrices...)
-
-	// Fetch Lambda pricing
-	lambdaPrices, err := f.fetchServicePricing(ctx, "AWSLambda", region)
-	if err != nil {
-		return nil, fmt.Errorf("failed to fetch Lambda pricing: %w", err)
-	}
-	allPrices = append(allPrices, lambdaPrices...)
-
-	// Fetch S3 pricing
-	s3Prices, err := f.fetchServicePricing(ctx, "AmazonS3", region)
-	if err != nil {
-		return nil, fmt.Errorf("failed to fetch S3 pricing: %w", err)
-	}
-	allPrices = append(allPrices, s3Prices...)
-
-	// Fetch ELB pricing
-	elbPrices, err := f.fetchServicePricing(ctx, "ElasticLoadBalancing", region)
-	if err != nil {
-		return nil, fmt.Errorf("failed to fetch ELB pricing: %w", err)
-	}
-	allPrices = append(allPrices, elbPrices...)
 
 	return allPrices, nil
 }
 
-// fetchServicePricing fetches pricing for a specific service
+// fetchServicePricing fetches pricing for a specific service using region_index
 func (f *AWSPricingAPIFetcher) fetchServicePricing(ctx context.Context, service, region string) ([]RawPrice, error) {
-	// Construct URL for regional pricing
-	// AWS provides regional price list files
-	priceListURL := fmt.Sprintf("%s/offers/v1.0/aws/%s/current/%s/index.json",
-		f.baseURL, service, mapRegionToAWSName(region))
-
-	req, err := http.NewRequestWithContext(ctx, "GET", priceListURL, nil)
-	if err != nil {
-		return nil, err
-	}
-
-	resp, err := f.httpClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("HTTP request failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		// Try bulk file format
-		return f.fetchBulkPricing(ctx, service, region)
-	}
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read response: %w", err)
-	}
-
-	return f.parsePriceList(body, service, region)
-}
-
-// fetchBulkPricing fetches from bulk price list files
-func (f *AWSPricingAPIFetcher) fetchBulkPricing(ctx context.Context, service, region string) ([]RawPrice, error) {
 	// Get the index first
 	indexURL := fmt.Sprintf("%s/offers/v1.0/aws/%s/current/region_index.json", f.baseURL, service)
 	
