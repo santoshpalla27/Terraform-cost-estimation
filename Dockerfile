@@ -42,8 +42,8 @@ RUN apk add --no-cache ca-certificates tzdata
 COPY --from=builder /etc/passwd /etc/passwd
 COPY --from=builder /etc/group /etc/group
 
-# Create directories
-RUN mkdir -p /app/data /app/cache /app/config && \
+# Create directories with proper permissions
+RUN mkdir -p /app/data /app/cache /app/config /app/pricing-backups && \
     chown -R appuser:appuser /app
 
 WORKDIR /app
