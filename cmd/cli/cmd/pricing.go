@@ -392,3 +392,45 @@ func autoDetectMemoryConfig() *ingestion.StreamingConfig {
 	// For now, default to "default" profile
 	return ingestion.DefaultStreamingConfig()
 }
+
+// getDBStore returns the database store from environment configuration
+func getDBStore() (db.PricingStore, error) {
+	dbURL := os.Getenv("DATABASE_URL")
+	if dbURL == "" {
+		// Try individual environment variables
+		host := os.Getenv("DB_HOST")
+		if host == "" {
+			host = "localhost"
+		}
+		port := 5432
+		user := os.Getenv("DB_USER")
+		if user == "" {
+			user = "terraform_cost"
+		}
+		password := os.Getenv("DB_PASSWORD")
+		if password == "" {
+			password = "terraform_cost_dev"
+		}
+		database := os.Getenv("DB_NAME")
+		if database == "" {
+			database = "terraform_cost"
+		}
+		sslmode := os.Getenv("DB_SSLMODE")
+		if sslmode == "" {
+			sslmode = "disable"
+		}
+
+		return db.NewPostgresStore(db.Config{
+			Host:     host,
+			Port:     port,
+			User:     user,
+			Password: password,
+			Database: database,
+			SSLMode:  sslmode,
+		})
+	}
+
+	// Parse DATABASE_URL
+	// Format: postgres://user:password@host:port/dbname?sslmode=disable
+	return db.NewPostgresStoreFromURL(dbURL)
+}

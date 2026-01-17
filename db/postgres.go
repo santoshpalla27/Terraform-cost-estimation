@@ -53,6 +53,27 @@ func NewPostgresStore(cfg Config) (*PostgresStore, error) {
 	return &PostgresStore{db: db}, nil
 }
 
+// NewPostgresStoreFromURL creates a new PostgreSQL pricing store from a URL
+// URL format: postgres://user:password@host:port/dbname?sslmode=disable
+func NewPostgresStoreFromURL(databaseURL string) (*PostgresStore, error) {
+	db, err := sql.Open("postgres", databaseURL)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open database: %w", err)
+	}
+
+	// Configure connection pool
+	db.SetMaxOpenConns(25)
+	db.SetMaxIdleConns(5)
+	db.SetConnMaxLifetime(5 * time.Minute)
+
+	// Verify connection
+	if err := db.Ping(); err != nil {
+		return nil, fmt.Errorf("failed to ping database: %w", err)
+	}
+
+	return &PostgresStore{db: db}, nil
+}
+
 // Ping checks database connectivity
 func (s *PostgresStore) Ping(ctx context.Context) error {
 	return s.db.PingContext(ctx)
