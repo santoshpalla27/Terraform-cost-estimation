@@ -1,7 +1,6 @@
 import { useState } from 'react'
-import type { ResourceCost, CostComponent } from '../../types'
+import type { ResourceCost } from '../../types'
 import { CostNode } from './CostNode'
-import { CostLineagePopover } from './CostLineagePopover'
 
 interface Props {
     resources: ResourceCost[]
