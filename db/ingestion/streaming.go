@@ -143,11 +143,12 @@ func (s *StreamingLifecycle) Execute(ctx context.Context, config *LifecycleConfi
 	s.lcConfig = config
 
 	startTime := time.Now()
+	s.logProgress("STARTING", "Initializing streaming ingestion lifecycle...")
 
 	// Check for existing checkpoint
 	if s.config.EnableCheckpointing {
 		if err := s.loadCheckpoint(); err == nil {
-			fmt.Println("Resuming from checkpoint...")
+			s.logProgress("CHECKPOINT", "Resuming from previous checkpoint")
 		}
 	}
 
@@ -158,43 +159,55 @@ func (s *StreamingLifecycle) Execute(ctx context.Context, config *LifecycleConfi
 		defer cancel()
 	}
 
-	fmt.Printf("Streaming config: batch=%d, maxMem=%dMB, concurrency=%d\n",
-		s.config.BatchSize, s.config.MaxMemoryMB, s.config.ConcurrentFetches)
+	s.logProgress("CONFIG", fmt.Sprintf("batch=%d, maxMem=%dMB, concurrency=%d",
+		s.config.BatchSize, s.config.MaxMemoryMB, s.config.ConcurrentFetches))
 
 	// Phase 1: Stream fetch and normalize to temp files
+	s.logPhaseStart(1, 4, "FETCH & NORMALIZE", "Fetching pricing from cloud APIs...")
 	if err := s.streamFetchAndNormalize(ctx); err != nil {
 		s.cleanup()
 		return s.fail(err, startTime)
 	}
+	s.logPhaseComplete(1, 4, "FETCH & NORMALIZE", fmt.Sprintf("Fetched %d raw prices", s.totalFetched))
 
 	// Phase 2: Merge and validate
+	s.logPhaseStart(2, 4, "MERGE & VALIDATE", "Merging temp files and validating...")
 	allRates, err := s.mergeAndValidate(ctx)
 	if err != nil {
 		s.cleanup()
 		return s.fail(err, startTime)
 	}
+	s.logPhaseComplete(2, 4, "MERGE & VALIDATE", fmt.Sprintf("Validated %d normalized rates", len(allRates)))
 
 	// Phase 3: Backup
+	s.logPhaseStart(3, 4, "BACKUP", "Writing backup file...")
 	backupPath, err := s.writeBackup(allRates)
 	if err != nil {
 		s.cleanup()
 		return s.fail(fmt.Errorf("backup failed: %w", err), startTime)
 	}
+	s.logPhaseComplete(3, 4, "BACKUP", fmt.Sprintf("Backup saved to %s", backupPath))
 
 	// Phase 4: Commit (if not dry-run)
 	var snapshotID *uuid.UUID
 	if !config.DryRun {
+		s.logPhaseStart(4, 4, "COMMIT", "Committing to database...")
 		sid, err := s.streamCommit(ctx, allRates)
 		if err != nil {
 			s.cleanup()
 			return s.fail(fmt.Errorf("commit failed: %w", err), startTime)
 		}
 		snapshotID = &sid
+		s.logPhaseComplete(4, 4, "COMMIT", fmt.Sprintf("Snapshot %s activated", sid))
+	} else {
+		s.logProgress("DRY-RUN", "Skipping database commit (dry-run mode)")
 	}
 
 	// Cleanup
 	s.cleanup()
 	s.deleteCheckpoint()
+
+	s.logProgress("COMPLETE", fmt.Sprintf("Ingestion finished in %s", time.Since(startTime).Round(time.Second)))
 
 	return &LifecycleResult{
 		Success:         true,
@@ -211,7 +224,6 @@ func (s *StreamingLifecycle) Execute(ctx context.Context, config *LifecycleConfi
 
 // streamFetchAndNormalize fetches pricing in batches and writes to temp files
 func (s *StreamingLifecycle) streamFetchAndNormalize(ctx context.Context) error {
-	fmt.Println("\nPhase 1: Streaming fetch and normalize...")
 
 	// Get services to fetch
 	services := s.fetcher.SupportedServices()
@@ -332,20 +344,21 @@ func (s *StreamingLifecycle) fetchServicePricing(ctx context.Context, service st
 
 // mergeAndValidate reads temp files and validates
 func (s *StreamingLifecycle) mergeAndValidate(ctx context.Context) ([]NormalizedRate, error) {
-	fmt.Println("\nPhase 2: Merge and validate...")
-
 	var allRates []NormalizedRate
 
-	for _, tempFile := range s.tempFiles {
+	totalFiles := len(s.tempFiles)
+	for i, tempFile := range s.tempFiles {
+		s.logProgress("READING", fmt.Sprintf("[%d/%d] Processing temp file...", i+1, totalFiles))
 		rates, err := s.readTempFile(tempFile)
 		if err != nil {
-			fmt.Printf("Warning: failed to read %s: %v\n", tempFile, err)
+			s.logProgress("WARNING", fmt.Sprintf("Failed to read temp file: %v", err))
 			continue
 		}
 		allRates = append(allRates, rates...)
+		s.logProgress("MERGED", fmt.Sprintf("Loaded %d rates (total: %d)", len(rates), len(allRates)))
 	}
 
-	fmt.Printf("  Total rates: %d\n", len(allRates))
+	s.logProgress("VALIDATING", fmt.Sprintf("Validating %d total rates...", len(allRates)))
 
 	// Validate
 	validator := NewIngestionValidator()
@@ -354,8 +367,6 @@ func (s *StreamingLifecycle) mergeAndValidate(ctx context.Context) ([]Normalized
 	if err := validator.ValidateAll(allRates, 0); err != nil {
 		return nil, fmt.Errorf("validation failed: %w", err)
 	}
-
-	fmt.Println("  ✓ Validation passed")
 
 	return allRates, nil
 }
@@ -419,7 +430,8 @@ func (s *StreamingLifecycle) writeBackup(rates []NormalizedRate) (string, error)
 
 // streamCommit commits rates in batches to reduce memory
 func (s *StreamingLifecycle) streamCommit(ctx context.Context, rates []NormalizedRate) (uuid.UUID, error) {
-	fmt.Println("\nPhase 4: Stream commit...")
+	totalRates := len(rates)
+	s.logProgress("COMMIT", fmt.Sprintf("Starting database commit of %d rates...", totalRates))
 
 	snapshotID := uuid.New()
 	snapshot := &db.PricingSnapshot{
@@ -483,7 +495,8 @@ func (s *StreamingLifecycle) streamCommit(ctx context.Context, rates []Normalize
 		}
 
 		s.totalWritten += (end - i)
-		fmt.Printf("  Committed %d/%d rates\n", s.totalWritten, len(rates))
+		progress := float64(s.totalWritten) / float64(len(rates)) * 100
+		s.logProgress("WRITING", fmt.Sprintf("%s %d/%d rates (%.1f%%)", s.progressBar(progress), s.totalWritten, len(rates), progress))
 
 		// GC between batches
 		if (i/batchSize)%s.config.GCInterval == 0 {
@@ -511,9 +524,49 @@ func (s *StreamingLifecycle) checkMemoryAndGC() {
 
 	usedMB := m.Alloc / 1024 / 1024
 	if int(usedMB) > s.config.MaxMemoryMB*80/100 { // 80% threshold
-		fmt.Printf("  Memory: %dMB (triggering GC)\n", usedMB)
+		s.logProgress("MEMORY", fmt.Sprintf("Usage: %dMB (threshold: %dMB) - triggering GC", usedMB, s.config.MaxMemoryMB))
 		runtime.GC()
 	}
+}
+
+// logProgress prints a timestamped progress message
+func (s *StreamingLifecycle) logProgress(stage, message string) {
+	timestamp := time.Now().Format("15:04:05")
+	fmt.Printf("[%s] %-12s │ %s\n", timestamp, stage, message)
+}
+
+// logPhaseStart prints a phase start banner
+func (s *StreamingLifecycle) logPhaseStart(current, total int, name, description string) {
+	timestamp := time.Now().Format("15:04:05")
+	fmt.Printf("\n[%s] ══════════════════════════════════════════════════════════\n", timestamp)
+	fmt.Printf("[%s] PHASE %d/%d: %s\n", timestamp, current, total, name)
+	fmt.Printf("[%s] %s\n", timestamp, description)
+	fmt.Printf("[%s] ══════════════════════════════════════════════════════════\n", timestamp)
+}
+
+// logPhaseComplete prints a phase completion message
+func (s *StreamingLifecycle) logPhaseComplete(current, total int, name, result string) {
+	timestamp := time.Now().Format("15:04:05")
+	fmt.Printf("[%s] ✓ PHASE %d/%d COMPLETE: %s\n", timestamp, current, total, result)
+}
+
+// progressBar generates a progress bar string
+func (s *StreamingLifecycle) progressBar(percent float64) string {
+	const width = 20
+	filled := int(percent / 100 * width)
+	if filled > width {
+		filled = width
+	}
+	empty := width - filled
+	return "[" + repeatChar('█', filled) + repeatChar('░', empty) + "]"
+}
+
+func repeatChar(ch rune, count int) string {
+	result := make([]rune, count)
+	for i := range result {
+		result[i] = ch
+	}
+	return string(result)
 }
 
 // cleanup removes temp files
