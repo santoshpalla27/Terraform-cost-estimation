@@ -225,50 +225,20 @@ func (s *StreamingLifecycle) Execute(ctx context.Context, config *LifecycleConfi
 // streamFetchAndNormalize fetches pricing in batches and writes to temp files
 func (s *StreamingLifecycle) streamFetchAndNormalize(ctx context.Context) error {
 
-	// Get services to fetch
-	services := s.fetcher.SupportedServices()
-
-	// Process services with limited concurrency
-	sem := make(chan struct{}, s.config.ConcurrentFetches)
-	errChan := make(chan error, len(services))
-	var wg sync.WaitGroup
-
-	for _, service := range services {
-		// Skip if already completed (checkpoint)
-		if s.isServiceCompleted(service) {
-			fmt.Printf("  Skipping %s (already completed)\n", service)
-			continue
-		}
-
-		wg.Add(1)
-		go func(svc string) {
-			defer wg.Done()
-
-			sem <- struct{}{}
-			defer func() { <-sem }()
-
-			if err := s.streamService(ctx, svc); err != nil {
-				errChan <- fmt.Errorf("service %s: %w", svc, err)
-			}
-		}(service)
+	s.logProgress("FETCHING", "Fetching all pricing data from cloud API...")
+	
+	// Fetch ALL prices once (not per-service to avoid duplication)
+	rawPrices, err := s.fetcher.FetchRegion(ctx, s.lcConfig.Region)
+	if err != nil {
+		return fmt.Errorf("failed to fetch pricing: %w", err)
 	}
-
-	wg.Wait()
-	close(errChan)
-
-	// Collect errors (allow partial success)
-	for err := range errChan {
-		fmt.Printf("Warning: %v\n", err)
-	}
-
-	return nil
-}
-
-// streamService fetches and normalizes a single service in batches
-func (s *StreamingLifecycle) streamService(ctx context.Context, service string) error {
-	// Create temp file for this service
+	
+	totalPrices := len(rawPrices)
+	s.logProgress("FETCHED", fmt.Sprintf("Retrieved %d raw prices", totalPrices))
+	
+	// Create temp file for normalized rates
 	tempFile := filepath.Join(s.config.WorkDir, fmt.Sprintf("pricing_%s_%s_%d.jsonl.gz",
-		s.lcConfig.Provider, service, time.Now().UnixNano()))
+		s.lcConfig.Provider, s.lcConfig.Region, time.Now().UnixNano()))
 
 	f, err := os.Create(tempFile)
 	if err != nil {
@@ -280,14 +250,10 @@ func (s *StreamingLifecycle) streamService(ctx context.Context, service string) 
 	defer gzw.Close()
 
 	writer := bufio.NewWriter(gzw)
+	
+	s.logProgress("NORMALIZING", fmt.Sprintf("Processing %d prices in batches of %d...", totalPrices, s.config.BatchSize))
 
-	// Fetch raw prices
-	rawPrices, err := s.fetchServicePricing(ctx, service)
-	if err != nil {
-		return err
-	}
-
-	// Process in batches
+	// Process in batches to control memory
 	batchNum := 0
 	for i := 0; i < len(rawPrices); i += s.config.BatchSize {
 		end := i + s.config.BatchSize
@@ -300,6 +266,7 @@ func (s *StreamingLifecycle) streamService(ctx context.Context, service string) 
 		// Normalize batch
 		normalized, err := s.normalizer.Normalize(batch)
 		if err != nil {
+			s.logProgress("WARNING", fmt.Sprintf("Batch %d normalization error: %v", batchNum, err))
 			continue
 		}
 
@@ -317,20 +284,25 @@ func (s *StreamingLifecycle) streamService(ctx context.Context, service string) 
 		s.totalFetched += len(batch)
 		batchNum++
 
-		// Memory management
+		// Progress update
+		progress := float64(i+len(batch)) / float64(totalPrices) * 100
+		s.logProgress("PROCESSING", fmt.Sprintf("%s %d/%d prices (%.1f%%)", s.progressBar(progress), i+len(batch), totalPrices, progress))
+
+		// Memory management - flush and GC
 		if batchNum%s.config.GCInterval == 0 {
+			writer.Flush()
 			s.checkMemoryAndGC()
 		}
 	}
 
 	writer.Flush()
-
-	s.mu.Lock()
+	
+	// Clear raw prices from memory
+	rawPrices = nil
+	runtime.GC()
+	
 	s.tempFiles = append(s.tempFiles, tempFile)
-	s.markServiceCompleted(service)
-	s.mu.Unlock()
-
-	fmt.Printf("  ✓ %s: %d prices\n", service, s.totalFetched)
+	s.logProgress("NORMALIZED", fmt.Sprintf("Written %d normalized rates to temp file", s.totalNormalized))
 
 	return nil
 }
