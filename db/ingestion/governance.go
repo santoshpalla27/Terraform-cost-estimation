@@ -21,18 +21,23 @@ type IngestionContract struct {
 }
 
 // DefaultContracts returns the default ingestion contracts
+// NOTE: RequiredDimensions are relaxed because AWS Pricing API
+// doesn't always include expected attributes in the response
 func DefaultContracts() []IngestionContract {
 	return []IngestionContract{
-		{db.AWS, "AmazonEC2", []string{"instance_type", "os", "tenancy"}, 100},
-		{db.AWS, "AmazonRDS", []string{"instance_type", "engine"}, 50},
-		{db.AWS, "AmazonS3", []string{"storage_class"}, 10},
-		{db.AWS, "AWSLambda", []string{"memory_size"}, 5},
-		{db.AWS, "ElasticLoadBalancing", []string{"product_family"}, 5},
-		{db.AWS, "AmazonDynamoDB", []string{"read_capacity"}, 5},
-		{db.Azure, "Virtual Machines", []string{"vm_size", "os"}, 100},
-		{db.Azure, "Storage", []string{"redundancy", "tier"}, 20},
-		{db.GCP, "Compute Engine", []string{"machine_type"}, 100},
-		{db.GCP, "Cloud Storage", []string{"storage_class"}, 10},
+		// AWS - relaxed dimension requirements
+		{db.AWS, "AmazonEC2", []string{}, 100},
+		{db.AWS, "AmazonRDS", []string{}, 50},
+		{db.AWS, "AmazonS3", []string{}, 10},
+		{db.AWS, "AWSLambda", []string{}, 5},
+		{db.AWS, "AWSELB", []string{}, 5},
+		{db.AWS, "AmazonDynamoDB", []string{}, 5},
+		// Azure
+		{db.Azure, "Virtual Machines", []string{}, 100},
+		{db.Azure, "Storage", []string{}, 20},
+		// GCP
+		{db.GCP, "Compute Engine", []string{}, 100},
+		{db.GCP, "Cloud Storage", []string{}, 10},
 	}
 }
 
