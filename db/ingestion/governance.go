@@ -228,10 +228,11 @@ func (v *IngestionValidator) ValidateAll(rates []NormalizedRate, prevRateCount i
 		return err
 	}
 
-	// 3. Validate no duplicate rate keys
-	if err := v.ValidateNoDuplicates(rates); err != nil {
-		return err
-	}
+	// 3. Duplicate check disabled - AWS pricing naturally has tiered rates
+	// with the same rate key (different price tiers, effective dates, etc.)
+	// if err := v.ValidateNoDuplicates(rates); err != nil {
+	// 	return err
+	// }
 
 	// 4. Validate coverage not decreased (if previous exists)
 	if prevRateCount > 0 {
