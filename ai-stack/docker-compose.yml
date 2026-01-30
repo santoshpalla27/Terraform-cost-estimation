@@ -1,0 +1,353 @@
+version: "3.9"
+
+# =============================================================================
+# Personal AI Operating System - Docker Compose Stack
+# =============================================================================
+# 6-Layer Architecture:
+#   L1: Interface Layer (external clients)
+#   L2: Gateway Layer (reverse-proxy)
+#   L3: Core Intelligence (brain, memory, stt, tts, ollama)
+#   L4: Autonomous Systems (agents, scheduler, info, notifications)
+#   L5: Persistence (postgres, redis)
+#   L6: Infrastructure (this compose file)
+# =============================================================================
+
+services:
+  # ===========================================================================
+  # LAYER 5: PERSISTENCE
+  # ===========================================================================
+  
+  memory-db:
+    image: pgvector/pgvector:pg16
+    container_name: ai-memory-db
+    restart: always
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-ai_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-ai_secret_password}
+      POSTGRES_DB: ${POSTGRES_DB:-ai_memory}
+    volumes:
+      - memory-data:/var/lib/postgresql/data
+      - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    networks:
+      - ai-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-ai_user} -d ${POSTGRES_DB:-ai_memory}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  redis:
+    image: redis:7-alpine
+    container_name: ai-redis
+    restart: always
+    command: redis-server --appendonly yes --maxmemory 128mb --maxmemory-policy allkeys-lru
+    volumes:
+      - redis-data:/data
+    networks:
+      - ai-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ===========================================================================
+  # LAYER 3: CORE INTELLIGENCE - LLM RUNTIME
+  # ===========================================================================
+  
+  ollama-runtime:
+    image: ollama/ollama:latest
+    container_name: ai-ollama
+    restart: always
+    volumes:
+      - ollama-models:/root/.ollama
+    networks:
+      - ai-network
+    environment:
+      - OLLAMA_HOST=0.0.0.0
+      - OLLAMA_KEEP_ALIVE=24h
+    # Uncomment below for GPU support
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:11434/api/version || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  # ===========================================================================
+  # LAYER 3: CORE INTELLIGENCE - MEMORY SERVICE
+  # ===========================================================================
+  
+  memory-service:
+    build:
+      context: ./memory
+      dockerfile: Dockerfile
+    container_name: ai-memory-service
+    restart: always
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-ai_user}:${POSTGRES_PASSWORD:-ai_secret_password}@memory-db:5432/${POSTGRES_DB:-ai_memory}
+      REDIS_URL: redis://redis:6379
+    depends_on:
+      memory-db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - ai-network
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8002/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # ===========================================================================
+  # LAYER 3: CORE INTELLIGENCE - AI BRAIN
+  # ===========================================================================
+  
+  ai-brain:
+    build:
+      context: ./brain
+      dockerfile: Dockerfile
+    container_name: ai-brain
+    restart: always
+    environment:
+      OLLAMA_URL: http://ollama-runtime:11434
+      MEMORY_SERVICE_URL: http://memory-service:8002
+      REDIS_URL: redis://redis:6379
+      LLM_MODEL: ${LLM_MODEL:-qwen2.5:3b}
+    depends_on:
+      ollama-runtime:
+        condition: service_healthy
+      memory-service:
+        condition: service_healthy
+    networks:
+      - ai-network
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8001/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # ===========================================================================
+  # LAYER 3: CORE INTELLIGENCE - VOICE SERVICES
+  # ===========================================================================
+  
+  stt-service:
+    build:
+      context: ./stt
+      dockerfile: Dockerfile
+    container_name: ai-stt
+    restart: unless-stopped
+    environment:
+      WHISPER_MODEL: ${WHISPER_MODEL:-tiny}
+    volumes:
+      - stt-models:/app/models
+    networks:
+      - ai-network
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8003/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    profiles:
+      - voice
+
+  tts-service:
+    build:
+      context: ./tts
+      dockerfile: Dockerfile
+    container_name: ai-tts
+    restart: unless-stopped
+    volumes:
+      - tts-models:/app/models
+    networks:
+      - ai-network
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8004/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    profiles:
+      - voice
+
+  # ===========================================================================
+  # LAYER 4: AUTONOMOUS SYSTEMS
+  # ===========================================================================
+  
+  agent-engine:
+    build:
+      context: ./agents
+      dockerfile: Dockerfile
+    container_name: ai-agents
+    restart: always
+    environment:
+      REDIS_URL: redis://redis:6379
+      BRAIN_URL: http://ai-brain:8001
+      MEMORY_URL: http://memory-service:8002
+    depends_on:
+      ai-brain:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - ai-network
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8005/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  scheduler:
+    build:
+      context: ./scheduler
+      dockerfile: Dockerfile
+    container_name: ai-scheduler
+    restart: always
+    environment:
+      REDIS_URL: redis://redis:6379
+      AGENT_ENGINE_URL: http://agent-engine:8005
+      MEMORY_URL: http://memory-service:8002
+    depends_on:
+      redis:
+        condition: service_healthy
+      agent-engine:
+        condition: service_healthy
+    networks:
+      - ai-network
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8006/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  info-engine:
+    build:
+      context: ./info
+      dockerfile: Dockerfile
+    container_name: ai-info
+    restart: always
+    environment:
+      REDIS_URL: redis://redis:6379
+      MEMORY_URL: http://memory-service:8002
+    depends_on:
+      redis:
+        condition: service_healthy
+      memory-service:
+        condition: service_healthy
+    networks:
+      - ai-network
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8007/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    profiles:
+      - proactive
+
+  notification-service:
+    build:
+      context: ./notifications
+      dockerfile: Dockerfile
+    container_name: ai-notifications
+    restart: always
+    environment:
+      REDIS_URL: redis://redis:6379
+      API_GATEWAY_URL: http://api-gateway:8000
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - ai-network
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8008/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    profiles:
+      - proactive
+
+  # ===========================================================================
+  # LAYER 2: GATEWAY LAYER
+  # ===========================================================================
+  
+  api-gateway:
+    build:
+      context: ./api
+      dockerfile: Dockerfile
+    container_name: ai-api-gateway
+    restart: always
+    environment:
+      BRAIN_URL: http://ai-brain:8001
+      MEMORY_URL: http://memory-service:8002
+      STT_URL: http://stt-service:8003
+      TTS_URL: http://tts-service:8004
+      REDIS_URL: redis://redis:6379
+    depends_on:
+      ai-brain:
+        condition: service_healthy
+      memory-service:
+        condition: service_healthy
+    networks:
+      - ai-network
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8000/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  reverse-proxy:
+    image: nginx:alpine
+    container_name: ai-reverse-proxy
+    restart: always
+    ports:
+      - "${HTTP_PORT:-80}:80"
+      - "${HTTPS_PORT:-443}:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/ssl:/etc/nginx/ssl:ro
+      - nginx-logs:/var/log/nginx
+    depends_on:
+      api-gateway:
+        condition: service_healthy
+    networks:
+      - ai-network
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+# =============================================================================
+# NETWORKS
+# =============================================================================
+
+networks:
+  ai-network:
+    name: ai-network
+    driver: bridge
+
+# =============================================================================
+# VOLUMES - Persistent Storage
+# =============================================================================
+
+volumes:
+  memory-data:
+    name: ai-memory-data
+  redis-data:
+    name: ai-redis-data
+  ollama-models:
+    name: ai-ollama-models
+  stt-models:
+    name: ai-stt-models
+  tts-models:
+    name: ai-tts-models
+  nginx-logs:
+    name: ai-nginx-logs

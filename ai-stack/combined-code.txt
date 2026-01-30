@@ -1,0 +1,5186 @@
+﻿================================================================================
+PERSONAL AI OPERATING SYSTEM - COMBINED SOURCE CODE
+Generated: 2026-01-30 22:11:37
+Source Directory: D:\good projects\cost estimation\ai-stack
+================================================================================
+
+================================================================================
+DIRECTORY STRUCTURE
+================================================================================
+
+ai-stack/
+|-- agents/
+|   |-- Dockerfile (605 B)
+|   |-- main.py (18.3 KB)
+|   +-- requirements.txt (146 B)
+|-- api/
+|   |-- Dockerfile (723 B)
+|   |-- main.py (16.5 KB)
+|   +-- requirements.txt (188 B)
+|-- brain/
+|   |-- identity/
+|   |   +-- persona.yaml (2.1 KB)
+|   |-- Dockerfile (609 B)
+|   |-- main.py (15.4 KB)
+|   +-- requirements.txt (157 B)
+|-- db/
+|   +-- init.sql (10.8 KB)
+|-- info/
+|   |-- Dockerfile (604 B)
+|   |-- main.py (11.7 KB)
+|   +-- requirements.txt (139 B)
+|-- memory/
+|   |-- Dockerfile (607 B)
+|   |-- main.py (17.5 KB)
+|   +-- requirements.txt (195 B)
+|-- nginx/
+|   |-- ssl/
+|   |   +-- .gitkeep (88 B)
+|   +-- nginx.conf (8.1 KB)
+|-- notifications/
+|   |-- Dockerfile (613 B)
+|   |-- main.py (5.4 KB)
+|   +-- requirements.txt (128 B)
+|-- scheduler/
+|   |-- Dockerfile (610 B)
+|   |-- main.py (15.2 KB)
+|   +-- requirements.txt (168 B)
+|-- stt/
+|   |-- Dockerfile (742 B)
+|   |-- main.py (6.9 KB)
+|   +-- requirements.txt (172 B)
+|-- tts/
+|   |-- Dockerfile (685 B)
+|   |-- main.py (8.7 KB)
+|   +-- requirements.txt (125 B)
+|-- .env.example (1.5 KB)
+|-- combine-code.ps1 (5.6 KB)
+|-- docker-compose.yml (10 KB)
++-- README.md (6.3 KB)
+
+================================================================================
+FILE CONTENTS
+================================================================================
+
+--------------------------------------------------------------------------------
+FILE: :\good projects\cost estimation\ai-stack\agents\Dockerfile
+SIZE: 605 bytes
+MODIFIED: 2026-01-30 21:30:53
+--------------------------------------------------------------------------------
+
+# =============================================================================
+# Agent Engine - Dockerfile
+# =============================================================================
+FROM python:3.11-slim
+
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY . .
+
+RUN useradd -m -u 1000 appuser && chown -R appuser:appuser /app
+USER appuser
+
+EXPOSE 8005
+
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8005"]
+
+
+
+--------------------------------------------------------------------------------
+FILE: :\good projects\cost estimation\ai-stack\agents\main.py
+SIZE: 18701 bytes
+MODIFIED: 2026-01-30 21:31:53
+--------------------------------------------------------------------------------
+
+"""
+=============================================================================
+Personal AI Operating System - Agent Engine
+=============================================================================
+Layer 4: Autonomous Systems - Task Execution Framework
+
+The Agent Engine executes real-world actions on behalf of the AI.
+Agents are plugins that:
+- Declare capabilities
+- Require permissions
+- Log execution
+- Run sandboxed
+
+The Brain chooses agents. Agents act.
+This separation prevents the Brain from directly touching the outside world.
+"""
+
+import os
+import logging
+from datetime import datetime
+from contextlib import asynccontextmanager
+from typing import Optional, Dict, Any, Callable
+from enum import Enum
+import asyncio
+
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel, Field
+import httpx
+import redis.asyncio as redis
+
+# =============================================================================
+# Configuration
+# =============================================================================
+
+class Settings:
+    REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379")
+    BRAIN_URL = os.getenv("BRAIN_URL", "http://ai-brain:8001")
+    MEMORY_URL = os.getenv("MEMORY_URL", "http://memory-service:8002")
+    LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
+
+settings = Settings()
+
+# =============================================================================
+# Logging
+# =============================================================================
+
+logging.basicConfig(
+    level=getattr(logging, settings.LOG_LEVEL),
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger("agent-engine")
+
+# =============================================================================
+# Models
+# =============================================================================
+
+class AgentStatus(str, Enum):
+    PENDING = "pending"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+class TaskRequest(BaseModel):
+    agent_type: str
+    task_name: str
+    input_data: Dict[str, Any] = {}
+    user_id: str = "primary"
+    priority: int = 5
+    conversation_id: Optional[str] = None
+
+class TaskResponse(BaseModel):
+    task_id: str
+    status: AgentStatus
+    result: Optional[Dict[str, Any]] = None
+    error: Optional[str] = None
+    started_at: Optional[str] = None
+    completed_at: Optional[str] = None
+
+class AgentInfo(BaseModel):
+    name: str
+    description: str
+    capabilities: list
+    required_permissions: list
+
+class HealthResponse(BaseModel):
+    status: str
+    agents_available: int
+    queue_size: int
+    timestamp: str
+
+# =============================================================================
+# Agent Registry
+# =============================================================================
+
+class AgentRegistry:
+    """Registry of available agents and their handlers."""
+    
+    def __init__(self):
+        self._agents: Dict[str, Dict] = {}
+        self._register_builtin_agents()
+    
+    def _register_builtin_agents(self):
+        """Register built-in agents."""
+        
+        # Reminder Agent
+        self.register(
+            name="reminder",
+            description="Set reminders and notifications",
+            capabilities=["set_reminder", "list_reminders", "cancel_reminder"],
+            permissions=["notification"],
+            handler=self._reminder_handler
+        )
+        
+        # Calculator Agent
+        self.register(
+            name="calculator",
+            description="Perform mathematical calculations",
+            capabilities=["calculate", "convert_units"],
+            permissions=[],
+            handler=self._calculator_handler
+        )
+        
+        # Weather Agent
+        self.register(
+            name="weather",
+            description="Get weather information",
+            capabilities=["current_weather", "forecast"],
+            permissions=["network"],
+            handler=self._weather_handler
+        )
+        
+        # Search Agent
+        self.register(
+            name="search",
+            description="Search the web for information",
+            capabilities=["web_search", "summarize"],
+            permissions=["network"],
+            handler=self._search_handler
+        )
+        
+        # Note Agent
+        self.register(
+            name="note",
+            description="Take and manage notes",
+            capabilities=["create_note", "list_notes", "search_notes"],
+            permissions=["memory"],
+            handler=self._note_handler
+        )
+    
+    def register(
+        self,
+        name: str,
+        description: str,
+        capabilities: list,
+        permissions: list,
+        handler: Callable
+    ):
+        """Register a new agent."""
+        self._agents[name] = {
+            "name": name,
+            "description": description,
+            "capabilities": capabilities,
+            "permissions": permissions,
+            "handler": handler
+        }
+        logger.info(f"Registered agent: {name}")
+    
+    def get(self, name: str) -> Optional[Dict]:
+        """Get agent by name."""
+        return self._agents.get(name)
+    
+    def list_all(self) -> list:
+        """List all registered agents."""
+        return [
+            AgentInfo(
+                name=a["name"],
+                description=a["description"],
+                capabilities=a["capabilities"],
+                required_permissions=a["permissions"]
+            )
+            for a in self._agents.values()
+        ]
+    
+    # =========================================================================
+    # Built-in Agent Handlers
+    # =========================================================================
+    
+    async def _reminder_handler(self, input_data: Dict, context: Dict) -> Dict:
+        """Handle reminder tasks."""
+        action = input_data.get("action", "set")
+        
+        if action == "set":
+            message = input_data.get("message", "Reminder")
+            time_str = input_data.get("time", "in 1 hour")
+            
+            # Parse time and schedule via Redis
+            redis_client = context.get("redis")
+            if redis_client:
+                reminder_id = f"reminder:{datetime.utcnow().timestamp()}"
+                await redis_client.hset(reminder_id, mapping={
+                    "message": message,
+                    "time": time_str,
+                    "user_id": context.get("user_id", "primary"),
+                    "status": "pending"
+                })
+                await redis_client.expire(reminder_id, 86400 * 7)  # 7 days TTL
+                
+                return {
+                    "success": True,
+                    "reminder_id": reminder_id,
+                    "message": f"Reminder set: '{message}' for {time_str}"
+                }
+        
+        elif action == "list":
+            return {"success": True, "reminders": []}
+        
+        return {"success": False, "error": "Unknown action"}
+    
+    async def _calculator_handler(self, input_data: Dict, context: Dict) -> Dict:
+        """Handle calculation tasks."""
+        expression = input_data.get("expression", "")
+        
+        try:
+            # Safe evaluation (limited operations)
+            allowed_chars = set("0123456789+-*/.() ")
+            if not all(c in allowed_chars for c in expression):
+                return {"success": False, "error": "Invalid characters in expression"}
+            
+            result = eval(expression)  # Only for simple math
+            return {"success": True, "result": result, "expression": expression}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+    
+    async def _weather_handler(self, input_data: Dict, context: Dict) -> Dict:
+        """Handle weather tasks (stub - needs API key)."""
+        location = input_data.get("location", "")
+        
+        # This would call a weather API
+        return {
+            "success": True,
+            "location": location,
+            "temperature": "Not configured",
+            "note": "Weather API integration required"
+        }
+    
+    async def _search_handler(self, input_data: Dict, context: Dict) -> Dict:
+        """Handle search tasks (stub - needs API key)."""
+        query = input_data.get("query", "")
+        
+        return {
+            "success": True,
+            "query": query,
+            "results": [],
+            "note": "Search API integration required"
+        }
+    
+    async def _note_handler(self, input_data: Dict, context: Dict) -> Dict:
+        """Handle note tasks."""
+        action = input_data.get("action", "create")
+        
+        http_client = context.get("http_client")
+        user_id = context.get("user_id", "primary")
+        
+        if action == "create" and http_client:
+            content = input_data.get("content", "")
+            title = input_data.get("title", content[:30])
+            
+            try:
+                resp = await http_client.post(
+                    f"{settings.MEMORY_URL}/facts",
+                    json={
+                        "user_id": user_id,
+                        "category": "note",
+                        "subject": title,
+                        "predicate": "contains",
+                        "object": content,
+                        "source": "agent"
+                    }
+                )
+                if resp.status_code == 200:
+                    return {"success": True, "message": f"Note saved: {title}"}
+            except Exception as e:
+                logger.error(f"Note save failed: {e}")
+        
+        return {"success": False, "error": "Operation failed"}
+
+agent_registry = AgentRegistry()
+
+# =============================================================================
+# Task Queue
+# =============================================================================
+
+class TaskQueue:
+    """Task queue using Redis."""
+    
+    def __init__(self, redis_client):
+        self.redis = redis_client
+        self.queue_key = "agent:task_queue"
+        self.results_prefix = "agent:result:"
+    
+    async def enqueue(self, task_id: str, task_data: Dict):
+        """Add task to queue."""
+        import json
+        await self.redis.lpush(self.queue_key, json.dumps({
+            "task_id": task_id,
+            **task_data
+        }))
+    
+    async def dequeue(self, timeout: int = 1) -> Optional[Dict]:
+        """Get next task from queue."""
+        import json
+        result = await self.redis.brpop(self.queue_key, timeout=timeout)
+        if result:
+            return json.loads(result[1])
+        return None
+    
+    async def store_result(self, task_id: str, result: Dict, ttl: int = 3600):
+        """Store task result."""
+        import json
+        await self.redis.setex(
+            f"{self.results_prefix}{task_id}",
+            ttl,
+            json.dumps(result)
+        )
+    
+    async def get_result(self, task_id: str) -> Optional[Dict]:
+        """Get task result."""
+        import json
+        result = await self.redis.get(f"{self.results_prefix}{task_id}")
+        if result:
+            return json.loads(result)
+        return None
+    
+    async def queue_size(self) -> int:
+        """Get current queue size."""
+        return await self.redis.llen(self.queue_key)
+
+# =============================================================================
+# Application Lifecycle
+# =============================================================================
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Manage application lifecycle."""
+    logger.info("ðŸ¤– Agent Engine starting up...")
+    
+    # Initialize Redis
+    try:
+        app.state.redis = redis.from_url(settings.REDIS_URL, decode_responses=True)
+        await app.state.redis.ping()
+        app.state.task_queue = TaskQueue(app.state.redis)
+        logger.info("âœ… Redis connected")
+    except Exception as e:
+        logger.warning(f"âš ï¸ Redis unavailable: {e}")
+        app.state.redis = None
+        app.state.task_queue = None
+    
+    # Initialize HTTP client
+    app.state.http_client = httpx.AsyncClient(timeout=60.0)
+    
+    # Start background worker
+    app.state.worker_task = asyncio.create_task(task_worker(app))
+    
+    yield
+    
+    logger.info("ðŸ›‘ Agent Engine shutting down...")
+    app.state.worker_task.cancel()
+    await app.state.http_client.aclose()
+    if app.state.redis:
+        await app.state.redis.close()
+
+async def task_worker(app: FastAPI):
+    """Background worker for processing tasks."""
+    logger.info("Worker started")
+    
+    while True:
+        try:
+            if not app.state.task_queue:
+                await asyncio.sleep(5)
+                continue
+            
+            task = await app.state.task_queue.dequeue(timeout=1)
+            
+            if task:
+                await process_task(app, task)
+            
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.error(f"Worker error: {e}")
+            await asyncio.sleep(1)
+
+async def process_task(app: FastAPI, task: Dict):
+    """Process a single task."""
+    task_id = task.get("task_id")
+    agent_type = task.get("agent_type")
+    input_data = task.get("input_data", {})
+    user_id = task.get("user_id", "primary")
+    
+    logger.info(f"Processing task {task_id}: {agent_type}")
+    
+    agent = agent_registry.get(agent_type)
+    if not agent:
+        await app.state.task_queue.store_result(task_id, {
+            "status": "failed",
+            "error": f"Unknown agent: {agent_type}"
+        })
+        return
+    
+    try:
+        # Execute agent handler
+        context = {
+            "redis": app.state.redis,
+            "http_client": app.state.http_client,
+            "user_id": user_id
+        }
+        
+        result = await agent["handler"](input_data, context)
+        
+        await app.state.task_queue.store_result(task_id, {
+            "status": "completed",
+            "result": result,
+            "completed_at": datetime.utcnow().isoformat()
+        })
+        
+    except Exception as e:
+        logger.error(f"Task {task_id} failed: {e}")
+        await app.state.task_queue.store_result(task_id, {
+            "status": "failed",
+            "error": str(e)
+        })
+
+# =============================================================================
+# FastAPI Application
+# =============================================================================
+
+app = FastAPI(
+    title="Personal AI OS - Agent Engine",
+    description="Task Execution Framework",
+    version="1.0.0",
+    lifespan=lifespan
+)
+
+# =============================================================================
+# Endpoints
+# =============================================================================
+
+@app.get("/health", response_model=HealthResponse)
+async def health_check():
+    """Health check endpoint."""
+    queue_size = 0
+    if app.state.task_queue:
+        queue_size = await app.state.task_queue.queue_size()
+    
+    return HealthResponse(
+        status="healthy",
+        agents_available=len(agent_registry.list_all()),
+        queue_size=queue_size,
+        timestamp=datetime.utcnow().isoformat()
+    )
+
+@app.get("/agents")
+async def list_agents():
+    """List available agents."""
+    return {"agents": [a.model_dump() for a in agent_registry.list_all()]}
+
+@app.get("/agents/{agent_name}")
+async def get_agent(agent_name: str):
+    """Get agent details."""
+    agent = agent_registry.get(agent_name)
+    if not agent:
+        raise HTTPException(status_code=404, detail="Agent not found")
+    
+    return AgentInfo(
+        name=agent["name"],
+        description=agent["description"],
+        capabilities=agent["capabilities"],
+        required_permissions=agent["permissions"]
+    )
+
+@app.post("/execute", response_model=TaskResponse)
+async def execute_task(request: TaskRequest):
+    """Execute an agent task."""
+    import uuid
+    
+    agent = agent_registry.get(request.agent_type)
+    if not agent:
+        raise HTTPException(status_code=404, detail=f"Agent not found: {request.agent_type}")
+    
+    task_id = str(uuid.uuid4())
+    
+    if app.state.task_queue:
+        # Async execution via queue
+        await app.state.task_queue.enqueue(task_id, {
+            "agent_type": request.agent_type,
+            "task_name": request.task_name,
+            "input_data": request.input_data,
+            "user_id": request.user_id,
+            "priority": request.priority
+        })
+        
+        return TaskResponse(
+            task_id=task_id,
+            status=AgentStatus.PENDING,
+            started_at=datetime.utcnow().isoformat()
+        )
+    else:
+        # Sync execution (no Redis)
+        context = {
+            "redis": None,
+            "http_client": app.state.http_client,
+            "user_id": request.user_id
+        }
+        
+        try:
+            result = await agent["handler"](request.input_data, context)
+            return TaskResponse(
+                task_id=task_id,
+                status=AgentStatus.COMPLETED,
+                result=result,
+                completed_at=datetime.utcnow().isoformat()
+            )
+        except Exception as e:
+            return TaskResponse(
+                task_id=task_id,
+                status=AgentStatus.FAILED,
+                error=str(e)
+            )
+
+@app.get("/tasks/{task_id}", response_model=TaskResponse)
+async def get_task_status(task_id: str):
+    """Get task status and result."""
+    if not app.state.task_queue:
+        raise HTTPException(status_code=503, detail="Task queue unavailable")
+    
+    result = await app.state.task_queue.get_result(task_id)
+    
+    if not result:
+        return TaskResponse(
+            task_id=task_id,
+            status=AgentStatus.PENDING
+        )
+    
+    return TaskResponse(
+        task_id=task_id,
+        status=AgentStatus(result.get("status", "pending")),
+        result=result.get("result"),
+        error=result.get("error"),
+        completed_at=result.get("completed_at")
+    )
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8005)
+
+
+
+--------------------------------------------------------------------------------
+FILE: :\good projects\cost estimation\ai-stack\agents\requirements.txt
+SIZE: 146 bytes
+MODIFIED: 2026-01-30 21:31:50
+--------------------------------------------------------------------------------
+
+# Agent Engine Dependencies
+fastapi==0.109.0
+uvicorn[standard]==0.27.0
+httpx==0.26.0
+redis==5.0.1
+pydantic==2.5.3
+pydantic-settings==2.1.0
+
+
+
+--------------------------------------------------------------------------------
+FILE: :\good projects\cost estimation\ai-stack\api\Dockerfile
+SIZE: 723 bytes
+MODIFIED: 2026-01-30 21:26:48
+--------------------------------------------------------------------------------
+
+# =============================================================================
+# API Gateway - Dockerfile
+# =============================================================================
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy requirements first for caching
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy application code
+COPY . .
+
+# Create non-root user
+RUN useradd -m -u 1000 appuser && chown -R appuser:appuser /app
+USER appuser
+
+EXPOSE 8000
+
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+
+
+
+--------------------------------------------------------------------------------
+FILE: :\good projects\cost estimation\ai-stack\api\main.py
+SIZE: 16881 bytes
+MODIFIED: 2026-01-30 21:27:38
+--------------------------------------------------------------------------------
+
+"""
+=============================================================================
+Personal AI Operating System - API Gateway
+=============================================================================
+Layer 2: Gateway Layer - Request orchestration and session management
+
+This is the main entry point for all client interactions.
+Routes requests to appropriate backend services.
+"""
+
+import os
+import uuid
+import logging
+from datetime import datetime
+from contextlib import asynccontextmanager
+from typing import Optional
+
+from fastapi import FastAPI, HTTPException, Request, UploadFile, File, WebSocket
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse, StreamingResponse
+from pydantic import BaseModel, Field
+import httpx
+import redis.asyncio as redis
+
+# =============================================================================
+# Configuration
+# =============================================================================
+
+class Settings:
+    BRAIN_URL = os.getenv("BRAIN_URL", "http://ai-brain:8001")
+    MEMORY_URL = os.getenv("MEMORY_URL", "http://memory-service:8002")
+    STT_URL = os.getenv("STT_URL", "http://stt-service:8003")
+    TTS_URL = os.getenv("TTS_URL", "http://tts-service:8004")
+    REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379")
+    LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
+
+settings = Settings()
+
+# =============================================================================
+# Logging
+# =============================================================================
+
+logging.basicConfig(
+    level=getattr(logging, settings.LOG_LEVEL),
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger("api-gateway")
+
+# =============================================================================
+# Models
+# =============================================================================
+
+class ChatRequest(BaseModel):
+    message: str = Field(..., min_length=1, max_length=10000)
+    conversation_id: Optional[str] = None
+    user_id: str = "primary"
+    stream: bool = False
+
+class ChatResponse(BaseModel):
+    message: str
+    conversation_id: str
+    timestamp: str
+    tokens_used: Optional[int] = None
+    agent_triggered: Optional[str] = None
+
+class HealthResponse(BaseModel):
+    status: str
+    timestamp: str
+    services: dict
+
+class VoiceRequest(BaseModel):
+    conversation_id: Optional[str] = None
+    user_id: str = "primary"
+    return_audio: bool = True
+
+# =============================================================================
+# Application Lifecycle
+# =============================================================================
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Manage application lifecycle - startup and shutdown."""
+    # Startup
+    logger.info("ðŸš€ API Gateway starting up...")
+    
+    # Initialize Redis connection
+    try:
+        app.state.redis = redis.from_url(settings.REDIS_URL, decode_responses=True)
+        await app.state.redis.ping()
+        logger.info("âœ… Redis connection established")
+    except Exception as e:
+        logger.warning(f"âš ï¸ Redis connection failed: {e}")
+        app.state.redis = None
+    
+    # Initialize HTTP client
+    app.state.http_client = httpx.AsyncClient(timeout=120.0)
+    logger.info("âœ… HTTP client initialized")
+    
+    yield
+    
+    # Shutdown
+    logger.info("ðŸ›‘ API Gateway shutting down...")
+    await app.state.http_client.aclose()
+    if app.state.redis:
+        await app.state.redis.close()
+
+# =============================================================================
+# FastAPI Application
+# =============================================================================
+
+app = FastAPI(
+    title="Personal AI OS - API Gateway",
+    description="Gateway layer for Personal AI Operating System",
+    version="1.0.0",
+    lifespan=lifespan
+)
+
+# CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Configure appropriately for production
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# =============================================================================
+# Health Endpoints
+# =============================================================================
+
+@app.get("/health", response_model=HealthResponse)
+async def health_check(request: Request):
+    """Health check endpoint for load balancers and monitoring."""
+    services_status = {}
+    
+    # Check Brain service
+    try:
+        resp = await request.app.state.http_client.get(f"{settings.BRAIN_URL}/health")
+        services_status["brain"] = "healthy" if resp.status_code == 200 else "unhealthy"
+    except Exception:
+        services_status["brain"] = "unreachable"
+    
+    # Check Memory service
+    try:
+        resp = await request.app.state.http_client.get(f"{settings.MEMORY_URL}/health")
+        services_status["memory"] = "healthy" if resp.status_code == 200 else "unhealthy"
+    except Exception:
+        services_status["memory"] = "unreachable"
+    
+    # Check Redis
+    try:
+        if request.app.state.redis:
+            await request.app.state.redis.ping()
+            services_status["redis"] = "healthy"
+        else:
+            services_status["redis"] = "not configured"
+    except Exception:
+        services_status["redis"] = "unreachable"
+    
+    overall_status = "healthy" if all(
+        s in ["healthy", "not configured"] for s in services_status.values()
+    ) else "degraded"
+    
+    return HealthResponse(
+        status=overall_status,
+        timestamp=datetime.utcnow().isoformat(),
+        services=services_status
+    )
+
+@app.get("/api/")
+async def api_root():
+    """API root information."""
+    return {
+        "name": "Personal AI OS",
+        "version": "1.0.0",
+        "endpoints": {
+            "chat": "/api/chat",
+            "voice": "/api/voice/transcribe",
+            "health": "/health"
+        }
+    }
+
+# =============================================================================
+# Chat Endpoints
+# =============================================================================
+
+@app.post("/api/chat", response_model=ChatResponse)
+async def chat(request: Request, chat_request: ChatRequest):
+    """
+    Main chat endpoint.
+    
+    Sends user message to AI Brain service and returns response.
+    Optionally streams response via WebSocket.
+    """
+    request_id = str(uuid.uuid4())
+    logger.info(f"[{request_id}] Chat request: {chat_request.message[:50]}...")
+    
+    # Generate conversation ID if not provided
+    conversation_id = chat_request.conversation_id or str(uuid.uuid4())
+    
+    try:
+        # Forward to Brain service
+        brain_response = await request.app.state.http_client.post(
+            f"{settings.BRAIN_URL}/chat",
+            json={
+                "message": chat_request.message,
+                "conversation_id": conversation_id,
+                "user_id": chat_request.user_id
+            }
+        )
+        
+        if brain_response.status_code != 200:
+            logger.error(f"[{request_id}] Brain service error: {brain_response.status_code}")
+            raise HTTPException(
+                status_code=502,
+                detail="AI Brain service unavailable"
+            )
+        
+        result = brain_response.json()
+        
+        # Log to Redis for analytics (fire and forget)
+        if request.app.state.redis:
+            try:
+                await request.app.state.redis.lpush(
+                    "chat_log",
+                    f"{datetime.utcnow().isoformat()}|{conversation_id}|{chat_request.message[:100]}"
+                )
+            except Exception as e:
+                logger.warning(f"[{request_id}] Redis logging failed: {e}")
+        
+        return ChatResponse(
+            message=result.get("response", ""),
+            conversation_id=conversation_id,
+            timestamp=datetime.utcnow().isoformat(),
+            tokens_used=result.get("tokens_used"),
+            agent_triggered=result.get("agent_triggered")
+        )
+        
+    except httpx.RequestError as e:
+        logger.error(f"[{request_id}] Request to Brain failed: {e}")
+        raise HTTPException(
+            status_code=503,
+            detail="Service temporarily unavailable"
+        )
+
+# =============================================================================
+# Voice Endpoints
+# =============================================================================
+
+@app.post("/api/voice/transcribe")
+async def transcribe_audio(
+    request: Request,
+    audio: UploadFile = File(...),
+    return_text_only: bool = True
+):
+    """
+    Transcribe audio to text using STT service.
+    """
+    request_id = str(uuid.uuid4())
+    logger.info(f"[{request_id}] Voice transcription request: {audio.filename}")
+    
+    try:
+        # Read audio file
+        audio_content = await audio.read()
+        
+        # Forward to STT service
+        files = {"audio": (audio.filename, audio_content, audio.content_type)}
+        stt_response = await request.app.state.http_client.post(
+            f"{settings.STT_URL}/transcribe",
+            files=files
+        )
+        
+        if stt_response.status_code != 200:
+            raise HTTPException(status_code=502, detail="STT service error")
+        
+        result = stt_response.json()
+        
+        if return_text_only:
+            return {"text": result.get("text", "")}
+        
+        return result
+        
+    except httpx.RequestError as e:
+        logger.error(f"[{request_id}] STT request failed: {e}")
+        raise HTTPException(status_code=503, detail="Voice service unavailable")
+
+@app.post("/api/voice/synthesize")
+async def synthesize_speech(
+    request: Request,
+    text: str,
+    voice: str = "default"
+):
+    """
+    Synthesize speech from text using TTS service.
+    Returns audio stream.
+    """
+    request_id = str(uuid.uuid4())
+    logger.info(f"[{request_id}] TTS request: {text[:50]}...")
+    
+    try:
+        tts_response = await request.app.state.http_client.post(
+            f"{settings.TTS_URL}/synthesize",
+            json={"text": text, "voice": voice}
+        )
+        
+        if tts_response.status_code != 200:
+            raise HTTPException(status_code=502, detail="TTS service error")
+        
+        return StreamingResponse(
+            iter([tts_response.content]),
+            media_type="audio/wav"
+        )
+        
+    except httpx.RequestError as e:
+        logger.error(f"[{request_id}] TTS request failed: {e}")
+        raise HTTPException(status_code=503, detail="Voice service unavailable")
+
+@app.post("/api/voice/chat")
+async def voice_chat(
+    request: Request,
+    audio: UploadFile = File(...),
+    conversation_id: Optional[str] = None,
+    user_id: str = "primary"
+):
+    """
+    Full voice chat: STT â†’ Brain â†’ TTS
+    
+    Accepts audio input, returns audio response.
+    """
+    request_id = str(uuid.uuid4())
+    logger.info(f"[{request_id}] Voice chat request")
+    
+    try:
+        # Step 1: Transcribe audio
+        audio_content = await audio.read()
+        files = {"audio": (audio.filename, audio_content, audio.content_type)}
+        
+        stt_response = await request.app.state.http_client.post(
+            f"{settings.STT_URL}/transcribe",
+            files=files
+        )
+        
+        if stt_response.status_code != 200:
+            raise HTTPException(status_code=502, detail="STT failed")
+        
+        transcribed_text = stt_response.json().get("text", "")
+        logger.info(f"[{request_id}] Transcribed: {transcribed_text[:100]}")
+        
+        # Step 2: Process with Brain
+        brain_response = await request.app.state.http_client.post(
+            f"{settings.BRAIN_URL}/chat",
+            json={
+                "message": transcribed_text,
+                "conversation_id": conversation_id or str(uuid.uuid4()),
+                "user_id": user_id
+            }
+        )
+        
+        if brain_response.status_code != 200:
+            raise HTTPException(status_code=502, detail="Brain failed")
+        
+        ai_response = brain_response.json().get("response", "")
+        
+        # Step 3: Synthesize speech
+        tts_response = await request.app.state.http_client.post(
+            f"{settings.TTS_URL}/synthesize",
+            json={"text": ai_response}
+        )
+        
+        if tts_response.status_code != 200:
+            # Fallback to text response
+            return JSONResponse({
+                "transcribed": transcribed_text,
+                "response": ai_response,
+                "audio": None
+            })
+        
+        return StreamingResponse(
+            iter([tts_response.content]),
+            media_type="audio/wav",
+            headers={
+                "X-Transcribed-Text": transcribed_text[:200],
+                "X-Response-Text": ai_response[:200]
+            }
+        )
+        
+    except httpx.RequestError as e:
+        logger.error(f"[{request_id}] Voice chat failed: {e}")
+        raise HTTPException(status_code=503, detail="Voice service unavailable")
+
+# =============================================================================
+# WebSocket for Streaming
+# =============================================================================
+
+@app.websocket("/ws/chat")
+async def websocket_chat(websocket: WebSocket):
+    """
+    WebSocket endpoint for streaming chat responses.
+    """
+    await websocket.accept()
+    logger.info("WebSocket connection established")
+    
+    try:
+        while True:
+            # Receive message
+            data = await websocket.receive_json()
+            message = data.get("message", "")
+            conversation_id = data.get("conversation_id", str(uuid.uuid4()))
+            
+            # Forward to Brain with streaming
+            async with httpx.AsyncClient() as client:
+                async with client.stream(
+                    "POST",
+                    f"{settings.BRAIN_URL}/chat/stream",
+                    json={
+                        "message": message,
+                        "conversation_id": conversation_id
+                    }
+                ) as response:
+                    async for chunk in response.aiter_text():
+                        await websocket.send_json({
+                            "type": "chunk",
+                            "content": chunk
+                        })
+            
+            await websocket.send_json({
+                "type": "complete",
+                "conversation_id": conversation_id
+            })
+            
+    except Exception as e:
+        logger.error(f"WebSocket error: {e}")
+    finally:
+        logger.info("WebSocket connection closed")
+
+# =============================================================================
+# Session Management
+# =============================================================================
+
+@app.get("/api/sessions/{user_id}")
+async def list_sessions(request: Request, user_id: str):
+    """List conversation sessions for a user."""
+    try:
+        response = await request.app.state.http_client.get(
+            f"{settings.MEMORY_URL}/conversations/{user_id}"
+        )
+        return response.json()
+    except Exception as e:
+        logger.error(f"Failed to list sessions: {e}")
+        raise HTTPException(status_code=503, detail="Memory service unavailable")
+
+@app.get("/api/sessions/{user_id}/{conversation_id}")
+async def get_session(request: Request, user_id: str, conversation_id: str):
+    """Get a specific conversation session."""
+    try:
+        response = await request.app.state.http_client.get(
+            f"{settings.MEMORY_URL}/conversations/{user_id}/{conversation_id}"
+        )
+        return response.json()
+    except Exception as e:
+        logger.error(f"Failed to get session: {e}")
+        raise HTTPException(status_code=503, detail="Memory service unavailable")
+
+# =============================================================================
+# Error Handlers
+# =============================================================================
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    logger.error(f"Unhandled exception: {exc}", exc_info=True)
+    return JSONResponse(
+        status_code=500,
+        content={"detail": "Internal server error"}
+    )
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
+
+
+
+--------------------------------------------------------------------------------
+FILE: :\good projects\cost estimation\ai-stack\api\requirements.txt
+SIZE: 188 bytes
+MODIFIED: 2026-01-30 21:27:36
+--------------------------------------------------------------------------------
+
+# API Gateway Dependencies
+fastapi==0.109.0
+uvicorn[standard]==0.27.0
+httpx==0.26.0
+redis==5.0.1
+pydantic==2.5.3
+pydantic-settings==2.1.0
+python-multipart==0.0.6
+websockets==12.0
+
+
+
+--------------------------------------------------------------------------------
+FILE: :\good projects\cost estimation\ai-stack\brain\Dockerfile
+SIZE: 609 bytes
+MODIFIED: 2026-01-30 21:27:40
+--------------------------------------------------------------------------------
+
+# =============================================================================
+# AI Brain Service - Dockerfile
+# =============================================================================
+FROM python:3.11-slim
+
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY . .
+
+RUN useradd -m -u 1000 appuser && chown -R appuser:appuser /app
+USER appuser
+
+EXPOSE 8001
+
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8001"]
+
+
+
+--------------------------------------------------------------------------------
+FILE: :\good projects\cost estimation\ai-stack\brain\identity\persona.yaml
+SIZE: 2194 bytes
+MODIFIED: 2026-01-30 21:28:39
+--------------------------------------------------------------------------------
+
+# =============================================================================
+# Personal AI Identity Configuration
+# =============================================================================
+# This file defines the AI's personality, behavior, and identity.
+# Modify this to customize your personal AI assistant.
+
+name: Atlas
+role: Personal AI Assistant and Life Companion
+
+personality:
+  tone: friendly, warm, and intellectually curious
+  style: conversational yet precise, adapting to context
+  traits:
+    - helpful and proactive
+    - honest about limitations
+    - remembers context and preferences
+    - protective of user privacy
+    - curious and eager to learn
+
+guidelines:
+  - Always be truthful and acknowledge when you don't know something
+  - Remember and reference previous conversations when relevant
+  - Proactively offer suggestions that might help the user
+  - Be concise for simple queries, detailed for complex ones
+  - Respect user privacy - never share or expose personal information
+  - Ask clarifying questions when the request is ambiguous
+  - Celebrate user achievements and provide encouragement
+  - Maintain consistent personality across all interactions
+
+boundaries:
+  - Do not pretend to have capabilities you don't have
+  - Do not make up information or statistics
+  - Do not provide harmful, illegal, or unethical advice
+  - Do not access external systems without explicit permission
+  - Do not store sensitive data beyond what's needed for context
+
+domains:
+  - general knowledge and research
+  - productivity and task management
+  - creative writing and brainstorming
+  - technology and programming
+  - personal organization and scheduling
+  - learning and education
+  - entertainment recommendations
+
+communication_preferences:
+  default_language: en
+  formality_level: adaptive  # formal, casual, adaptive
+  verbosity: balanced  # minimal, balanced, detailed
+  emoji_usage: occasional  # none, occasional, frequent
+
+memory_priorities:
+  - user preferences and settings
+  - important dates and events
+  - ongoing projects and tasks
+  - frequently discussed topics
+  - user's interests and hobbies
+
+
+
+--------------------------------------------------------------------------------
+FILE: :\good projects\cost estimation\ai-stack\brain\main.py
+SIZE: 15797 bytes
+MODIFIED: 2026-01-30 21:28:37
+--------------------------------------------------------------------------------
+
+"""
+=============================================================================
+Personal AI Operating System - AI Brain Service
+=============================================================================
+Layer 3: Core Intelligence - Decision Engine and Orchestrator
+
+The Brain is the coordination layer. It:
+- Retrieves memory context
+- Injects identity/personality
+- Constructs prompts
+- Calls LLM runtime
+- Interprets responses
+- Triggers agents when needed
+
+It does NOT:
+- Store data directly (delegates to Memory service)
+- Execute actions (delegates to Agent Engine)
+"""
+
+import os
+import logging
+from datetime import datetime
+from contextlib import asynccontextmanager
+from typing import Optional, AsyncGenerator
+
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel, Field
+import httpx
+import redis.asyncio as redis
+import yaml
+
+# =============================================================================
+# Configuration
+# =============================================================================
+
+class Settings:
+    OLLAMA_URL = os.getenv("OLLAMA_URL", "http://ollama-runtime:11434")
+    MEMORY_SERVICE_URL = os.getenv("MEMORY_SERVICE_URL", "http://memory-service:8002")
+    REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379")
+    LLM_MODEL = os.getenv("LLM_MODEL", "qwen2.5:3b")
+    LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
+    IDENTITY_PATH = os.getenv("IDENTITY_PATH", "/app/identity/persona.yaml")
+
+settings = Settings()
+
+# =============================================================================
+# Logging
+# =============================================================================
+
+logging.basicConfig(
+    level=getattr(logging, settings.LOG_LEVEL),
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger("ai-brain")
+
+# =============================================================================
+# Identity System
+# =============================================================================
+
+DEFAULT_IDENTITY = {
+    "name": "Atlas",
+    "role": "Personal AI Assistant",
+    "personality": {
+        "tone": "friendly, professional, and thoughtful",
+        "style": "clear and concise, with a touch of warmth",
+        "traits": ["helpful", "curious", "proactive", "honest"]
+    },
+    "guidelines": [
+        "Always be truthful and acknowledge uncertainty",
+        "Proactively offer relevant suggestions",
+        "Remember context from previous conversations",
+        "Respect user privacy and boundaries",
+        "Be concise but thorough when needed"
+    ],
+    "domains": ["general knowledge", "productivity", "technology", "creative tasks"]
+}
+
+def load_identity() -> dict:
+    """Load identity configuration from YAML file or use defaults."""
+    try:
+        if os.path.exists(settings.IDENTITY_PATH):
+            with open(settings.IDENTITY_PATH, 'r') as f:
+                identity = yaml.safe_load(f)
+                logger.info(f"Loaded identity: {identity.get('name', 'Unknown')}")
+                return identity
+    except Exception as e:
+        logger.warning(f"Failed to load identity: {e}")
+    
+    return DEFAULT_IDENTITY
+
+# =============================================================================
+# Models
+# =============================================================================
+
+class ChatRequest(BaseModel):
+    message: str = Field(..., min_length=1, max_length=10000)
+    conversation_id: str
+    user_id: str = "primary"
+    include_memory: bool = True
+
+class ChatResponse(BaseModel):
+    response: str
+    conversation_id: str
+    tokens_used: Optional[int] = None
+    agent_triggered: Optional[str] = None
+    memory_context_used: bool = False
+
+class HealthResponse(BaseModel):
+    status: str
+    llm_status: str
+    model: str
+    timestamp: str
+
+# =============================================================================
+# Application Lifecycle
+# =============================================================================
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Manage application lifecycle."""
+    logger.info("ðŸ§  AI Brain starting up...")
+    
+    # Load identity
+    app.state.identity = load_identity()
+    logger.info(f"âœ… Identity loaded: {app.state.identity.get('name')}")
+    
+    # Initialize Redis
+    try:
+        app.state.redis = redis.from_url(settings.REDIS_URL, decode_responses=True)
+        await app.state.redis.ping()
+        logger.info("âœ… Redis connected")
+    except Exception as e:
+        logger.warning(f"âš ï¸ Redis unavailable: {e}")
+        app.state.redis = None
+    
+    # Initialize HTTP client
+    app.state.http_client = httpx.AsyncClient(timeout=120.0)
+    
+    # Verify LLM is available
+    try:
+        resp = await app.state.http_client.get(f"{settings.OLLAMA_URL}/api/version")
+        logger.info(f"âœ… Ollama connected: {resp.json()}")
+    except Exception as e:
+        logger.warning(f"âš ï¸ Ollama not ready: {e}")
+    
+    yield
+    
+    logger.info("ðŸ›‘ AI Brain shutting down...")
+    await app.state.http_client.aclose()
+    if app.state.redis:
+        await app.state.redis.close()
+
+# =============================================================================
+# FastAPI Application
+# =============================================================================
+
+app = FastAPI(
+    title="Personal AI OS - Brain Service",
+    description="Core Intelligence Layer - Decision Engine",
+    version="1.0.0",
+    lifespan=lifespan
+)
+
+# =============================================================================
+# Prompt Construction
+# =============================================================================
+
+def build_system_prompt(identity: dict) -> str:
+    """Build system prompt from identity configuration."""
+    name = identity.get("name", "Assistant")
+    role = identity.get("role", "AI Assistant")
+    personality = identity.get("personality", {})
+    guidelines = identity.get("guidelines", [])
+    domains = identity.get("domains", [])
+    
+    tone = personality.get("tone", "helpful")
+    style = personality.get("style", "professional")
+    traits = personality.get("traits", [])
+    
+    prompt = f"""You are {name}, a {role}.
+
+PERSONALITY:
+- Tone: {tone}
+- Style: {style}
+- Key traits: {', '.join(traits)}
+
+GUIDELINES:
+{chr(10).join(f'- {g}' for g in guidelines)}
+
+EXPERTISE:
+{', '.join(domains)}
+
+CURRENT TIME: {datetime.now().strftime('%Y-%m-%d %H:%M %Z')}
+
+Respond naturally as {name}, maintaining consistency with your identity."""
+    
+    return prompt
+
+async def fetch_memory_context(
+    http_client: httpx.AsyncClient,
+    user_id: str,
+    conversation_id: str,
+    query: str
+) -> str:
+    """Fetch relevant memory context from Memory service."""
+    try:
+        # Get conversation history
+        history_resp = await http_client.get(
+            f"{settings.MEMORY_SERVICE_URL}/history/{conversation_id}",
+            params={"limit": 10}
+        )
+        
+        history = []
+        if history_resp.status_code == 200:
+            history = history_resp.json().get("messages", [])
+        
+        # Get semantic memory (relevant facts)
+        semantic_resp = await http_client.post(
+            f"{settings.MEMORY_SERVICE_URL}/search",
+            json={"query": query, "user_id": user_id, "limit": 5}
+        )
+        
+        facts = []
+        if semantic_resp.status_code == 200:
+            facts = semantic_resp.json().get("results", [])
+        
+        # Build context string
+        context_parts = []
+        
+        if history:
+            context_parts.append("RECENT CONVERSATION:")
+            for msg in history[-5:]:  # Last 5 messages
+                role = msg.get("role", "unknown")
+                content = msg.get("content", "")[:200]
+                context_parts.append(f"  [{role}]: {content}")
+        
+        if facts:
+            context_parts.append("\nRELEVANT MEMORIES:")
+            for fact in facts[:3]:
+                context_parts.append(f"  - {fact.get('content', '')[:150]}")
+        
+        return "\n".join(context_parts) if context_parts else ""
+        
+    except Exception as e:
+        logger.warning(f"Failed to fetch memory: {e}")
+        return ""
+
+def detect_agent_intent(response: str) -> Optional[str]:
+    """
+    Detect if the AI response suggests an agent action.
+    
+    Returns agent type if action is needed, None otherwise.
+    """
+    # Simple keyword detection - can be made more sophisticated
+    triggers = {
+        "reminder": ["remind me", "set a reminder", "schedule a reminder"],
+        "search": ["let me search", "searching for", "looking up"],
+        "calculate": ["calculating", "let me compute"],
+        "weather": ["weather forecast", "checking weather"],
+        "calendar": ["scheduling", "adding to calendar", "checking schedule"]
+    }
+    
+    response_lower = response.lower()
+    for agent, keywords in triggers.items():
+        if any(kw in response_lower for kw in keywords):
+            return agent
+    
+    return None
+
+# =============================================================================
+# Endpoints
+# =============================================================================
+
+@app.get("/health", response_model=HealthResponse)
+async def health_check(request: Request):
+    """Health check with LLM status."""
+    llm_status = "unknown"
+    
+    try:
+        resp = await request.app.state.http_client.get(
+            f"{settings.OLLAMA_URL}/api/version"
+        )
+        llm_status = "healthy" if resp.status_code == 200 else "unhealthy"
+    except Exception:
+        llm_status = "unreachable"
+    
+    return HealthResponse(
+        status="healthy",
+        llm_status=llm_status,
+        model=settings.LLM_MODEL,
+        timestamp=datetime.utcnow().isoformat()
+    )
+
+@app.post("/chat", response_model=ChatResponse)
+async def chat(request: Request, chat_request: ChatRequest):
+    """
+    Main chat endpoint.
+    
+    1. Fetch memory context
+    2. Build prompt with identity
+    3. Call LLM
+    4. Store response in memory
+    5. Detect agent triggers
+    6. Return response
+    """
+    logger.info(f"Chat request: {chat_request.message[:50]}...")
+    
+    # Fetch memory context
+    memory_context = ""
+    if chat_request.include_memory:
+        memory_context = await fetch_memory_context(
+            request.app.state.http_client,
+            chat_request.user_id,
+            chat_request.conversation_id,
+            chat_request.message
+        )
+    
+    # Build system prompt
+    system_prompt = build_system_prompt(request.app.state.identity)
+    
+    # Add memory context to system prompt
+    if memory_context:
+        system_prompt += f"\n\n{memory_context}"
+    
+    # Call Ollama
+    try:
+        ollama_response = await request.app.state.http_client.post(
+            f"{settings.OLLAMA_URL}/api/chat",
+            json={
+                "model": settings.LLM_MODEL,
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": chat_request.message}
+                ],
+                "stream": False
+            }
+        )
+        
+        if ollama_response.status_code != 200:
+            logger.error(f"Ollama error: {ollama_response.status_code}")
+            raise HTTPException(status_code=502, detail="LLM service error")
+        
+        result = ollama_response.json()
+        ai_response = result.get("message", {}).get("content", "")
+        tokens_used = result.get("eval_count", 0) + result.get("prompt_eval_count", 0)
+        
+    except httpx.RequestError as e:
+        logger.error(f"Ollama request failed: {e}")
+        raise HTTPException(status_code=503, detail="LLM service unavailable")
+    
+    # Store in memory (fire and forget)
+    try:
+        await request.app.state.http_client.post(
+            f"{settings.MEMORY_SERVICE_URL}/store",
+            json={
+                "conversation_id": chat_request.conversation_id,
+                "user_id": chat_request.user_id,
+                "messages": [
+                    {"role": "user", "content": chat_request.message},
+                    {"role": "assistant", "content": ai_response}
+                ]
+            }
+        )
+    except Exception as e:
+        logger.warning(f"Failed to store in memory: {e}")
+    
+    # Detect agent triggers
+    agent_triggered = detect_agent_intent(ai_response)
+    
+    return ChatResponse(
+        response=ai_response,
+        conversation_id=chat_request.conversation_id,
+        tokens_used=tokens_used,
+        agent_triggered=agent_triggered,
+        memory_context_used=bool(memory_context)
+    )
+
+@app.post("/chat/stream")
+async def chat_stream(request: Request, chat_request: ChatRequest):
+    """
+    Streaming chat endpoint.
+    
+    Returns Server-Sent Events for real-time response streaming.
+    """
+    async def generate() -> AsyncGenerator[str, None]:
+        # Build prompt
+        system_prompt = build_system_prompt(request.app.state.identity)
+        
+        if chat_request.include_memory:
+            memory_context = await fetch_memory_context(
+                request.app.state.http_client,
+                chat_request.user_id,
+                chat_request.conversation_id,
+                chat_request.message
+            )
+            if memory_context:
+                system_prompt += f"\n\n{memory_context}"
+        
+        # Stream from Ollama
+        async with request.app.state.http_client.stream(
+            "POST",
+            f"{settings.OLLAMA_URL}/api/chat",
+            json={
+                "model": settings.LLM_MODEL,
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": chat_request.message}
+                ],
+                "stream": True
+            }
+        ) as response:
+            async for line in response.aiter_lines():
+                if line:
+                    import json
+                    try:
+                        data = json.loads(line)
+                        content = data.get("message", {}).get("content", "")
+                        if content:
+                            yield content
+                    except json.JSONDecodeError:
+                        continue
+    
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream"
+    )
+
+@app.get("/identity")
+async def get_identity(request: Request):
+    """Get current AI identity configuration."""
+    return request.app.state.identity
+
+@app.put("/identity")
+async def update_identity(request: Request, identity: dict):
+    """Update AI identity configuration."""
+    # Validate required fields
+    if "name" not in identity:
+        raise HTTPException(status_code=400, detail="Identity must have a name")
+    
+    request.app.state.identity = identity
+    
+    # Persist to file
+    try:
+        os.makedirs(os.path.dirname(settings.IDENTITY_PATH), exist_ok=True)
+        with open(settings.IDENTITY_PATH, 'w') as f:
+            yaml.safe_dump(identity, f)
+    except Exception as e:
+        logger.warning(f"Failed to persist identity: {e}")
+    
+    return {"status": "updated", "identity": identity}
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8001)
+
+
+
+--------------------------------------------------------------------------------
+FILE: :\good projects\cost estimation\ai-stack\brain\requirements.txt
+SIZE: 157 bytes
+MODIFIED: 2026-01-30 21:28:26
+--------------------------------------------------------------------------------
+
+# AI Brain Dependencies
+fastapi==0.109.0
+uvicorn[standard]==0.27.0
+httpx==0.26.0
+redis==5.0.1
+pydantic==2.5.3
+pydantic-settings==2.1.0
+PyYAML==6.0.1
+
+
+
+--------------------------------------------------------------------------------
+FILE: :\good projects\cost estimation\ai-stack\db\init.sql
+SIZE: 11086 bytes
+MODIFIED: 2026-01-30 21:26:31
+--------------------------------------------------------------------------------
+
+-- =============================================================================
+-- Personal AI Operating System - Database Initialization
+-- =============================================================================
+-- PostgreSQL 16 + pgvector extension for semantic memory
+
+-- Enable required extensions
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+CREATE EXTENSION IF NOT EXISTS "vector";
+
+-- =============================================================================
+-- USER PROFILE & IDENTITY
+-- =============================================================================
+
+CREATE TABLE IF NOT EXISTS user_profile (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    user_id VARCHAR(255) UNIQUE NOT NULL DEFAULT 'primary',
+    name VARCHAR(255),
+    preferences JSONB DEFAULT '{}',
+    timezone VARCHAR(50) DEFAULT 'UTC',
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+-- Insert default user
+INSERT INTO user_profile (user_id, name, preferences)
+VALUES ('primary', 'User', '{"voice_enabled": true, "notification_level": "normal"}')
+ON CONFLICT (user_id) DO NOTHING;
+
+-- =============================================================================
+-- CONVERSATION MEMORY
+-- =============================================================================
+
+CREATE TABLE IF NOT EXISTS conversations (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    user_id VARCHAR(255) REFERENCES user_profile(user_id) DEFAULT 'primary',
+    title VARCHAR(500),
+    summary TEXT,
+    started_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    last_message_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    message_count INTEGER DEFAULT 0,
+    metadata JSONB DEFAULT '{}'
+);
+
+CREATE TABLE IF NOT EXISTS messages (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    conversation_id UUID REFERENCES conversations(id) ON DELETE CASCADE,
+    role VARCHAR(20) NOT NULL CHECK (role IN ('user', 'assistant', 'system')),
+    content TEXT NOT NULL,
+    tokens_used INTEGER,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    metadata JSONB DEFAULT '{}'
+);
+
+CREATE INDEX idx_messages_conversation ON messages(conversation_id);
+CREATE INDEX idx_messages_created ON messages(created_at DESC);
+
+-- =============================================================================
+-- SEMANTIC MEMORY (EMBEDDINGS)
+-- =============================================================================
+
+CREATE TABLE IF NOT EXISTS memory_embeddings (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    user_id VARCHAR(255) REFERENCES user_profile(user_id) DEFAULT 'primary',
+    source_type VARCHAR(50) NOT NULL, -- 'conversation', 'fact', 'document', 'agent_result'
+    source_id UUID,
+    content TEXT NOT NULL,
+    embedding vector(384), -- all-MiniLM-L6-v2 dimension
+    importance_score FLOAT DEFAULT 0.5,
+    access_count INTEGER DEFAULT 0,
+    last_accessed TIMESTAMP WITH TIME ZONE,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    metadata JSONB DEFAULT '{}'
+);
+
+-- HNSW index for fast similarity search
+CREATE INDEX idx_embeddings_vector ON memory_embeddings 
+USING hnsw (embedding vector_cosine_ops)
+WITH (m = 16, ef_construction = 64);
+
+CREATE INDEX idx_embeddings_source ON memory_embeddings(source_type, source_id);
+CREATE INDEX idx_embeddings_user ON memory_embeddings(user_id);
+
+-- =============================================================================
+-- STRUCTURED FACTS (KNOWLEDGE BASE)
+-- =============================================================================
+
+CREATE TABLE IF NOT EXISTS facts (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    user_id VARCHAR(255) REFERENCES user_profile(user_id) DEFAULT 'primary',
+    category VARCHAR(100) NOT NULL, -- 'personal', 'preference', 'relationship', 'work', 'interest'
+    subject VARCHAR(255) NOT NULL,
+    predicate VARCHAR(255) NOT NULL,
+    object TEXT NOT NULL,
+    confidence FLOAT DEFAULT 1.0,
+    source VARCHAR(100), -- 'explicit', 'inferred', 'agent'
+    valid_from TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    valid_until TIMESTAMP WITH TIME ZONE,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    metadata JSONB DEFAULT '{}'
+);
+
+CREATE INDEX idx_facts_user_category ON facts(user_id, category);
+CREATE INDEX idx_facts_subject ON facts(subject);
+
+-- =============================================================================
+-- AGENT TASKS & RESULTS
+-- =============================================================================
+
+CREATE TABLE IF NOT EXISTS agent_tasks (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    user_id VARCHAR(255) REFERENCES user_profile(user_id) DEFAULT 'primary',
+    agent_type VARCHAR(100) NOT NULL,
+    task_name VARCHAR(255) NOT NULL,
+    status VARCHAR(50) DEFAULT 'pending' CHECK (status IN ('pending', 'running', 'completed', 'failed', 'cancelled')),
+    priority INTEGER DEFAULT 5,
+    input_data JSONB DEFAULT '{}',
+    output_data JSONB,
+    error_message TEXT,
+    scheduled_at TIMESTAMP WITH TIME ZONE,
+    started_at TIMESTAMP WITH TIME ZONE,
+    completed_at TIMESTAMP WITH TIME ZONE,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    metadata JSONB DEFAULT '{}'
+);
+
+CREATE INDEX idx_agent_tasks_status ON agent_tasks(status, scheduled_at);
+CREATE INDEX idx_agent_tasks_user ON agent_tasks(user_id);
+
+-- =============================================================================
+-- SCHEDULED JOBS
+-- =============================================================================
+
+CREATE TABLE IF NOT EXISTS scheduled_jobs (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    user_id VARCHAR(255) REFERENCES user_profile(user_id) DEFAULT 'primary',
+    job_type VARCHAR(100) NOT NULL, -- 'reminder', 'recurring', 'cron', 'one_time'
+    name VARCHAR(255) NOT NULL,
+    description TEXT,
+    cron_expression VARCHAR(100),
+    next_run_at TIMESTAMP WITH TIME ZONE,
+    last_run_at TIMESTAMP WITH TIME ZONE,
+    enabled BOOLEAN DEFAULT true,
+    action_type VARCHAR(100) NOT NULL, -- 'notify', 'agent', 'message'
+    action_payload JSONB DEFAULT '{}',
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    metadata JSONB DEFAULT '{}'
+);
+
+CREATE INDEX idx_scheduled_jobs_next_run ON scheduled_jobs(next_run_at) WHERE enabled = true;
+
+-- =============================================================================
+-- INTERESTS & TOPICS (for info-engine)
+-- =============================================================================
+
+CREATE TABLE IF NOT EXISTS interests (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    user_id VARCHAR(255) REFERENCES user_profile(user_id) DEFAULT 'primary',
+    topic VARCHAR(255) NOT NULL,
+    keywords TEXT[],
+    priority INTEGER DEFAULT 5,
+    notification_enabled BOOLEAN DEFAULT true,
+    last_checked TIMESTAMP WITH TIME ZONE,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    metadata JSONB DEFAULT '{}'
+);
+
+CREATE INDEX idx_interests_user ON interests(user_id);
+
+-- =============================================================================
+-- NOTIFICATIONS
+-- =============================================================================
+
+CREATE TABLE IF NOT EXISTS notifications (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    user_id VARCHAR(255) REFERENCES user_profile(user_id) DEFAULT 'primary',
+    type VARCHAR(50) NOT NULL, -- 'info', 'reminder', 'alert', 'update'
+    title VARCHAR(255) NOT NULL,
+    body TEXT,
+    priority VARCHAR(20) DEFAULT 'normal' CHECK (priority IN ('low', 'normal', 'high', 'urgent')),
+    channel VARCHAR(50), -- 'push', 'email', 'bot', 'voice'
+    status VARCHAR(20) DEFAULT 'pending' CHECK (status IN ('pending', 'sent', 'read', 'dismissed')),
+    scheduled_for TIMESTAMP WITH TIME ZONE,
+    sent_at TIMESTAMP WITH TIME ZONE,
+    read_at TIMESTAMP WITH TIME ZONE,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    metadata JSONB DEFAULT '{}'
+);
+
+CREATE INDEX idx_notifications_status ON notifications(status, scheduled_for);
+CREATE INDEX idx_notifications_user ON notifications(user_id);
+
+-- =============================================================================
+-- AUDIT LOG
+-- =============================================================================
+
+CREATE TABLE IF NOT EXISTS audit_log (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    user_id VARCHAR(255),
+    action VARCHAR(100) NOT NULL,
+    entity_type VARCHAR(100),
+    entity_id UUID,
+    details JSONB DEFAULT '{}',
+    ip_address INET,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+CREATE INDEX idx_audit_log_created ON audit_log(created_at DESC);
+CREATE INDEX idx_audit_log_action ON audit_log(action);
+
+-- =============================================================================
+-- HELPER FUNCTIONS
+-- =============================================================================
+
+-- Function to update 'updated_at' timestamp
+CREATE OR REPLACE FUNCTION update_updated_at_column()
+RETURNS TRIGGER AS $$
+BEGIN
+    NEW.updated_at = NOW();
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Apply trigger to tables with updated_at
+CREATE TRIGGER update_user_profile_updated_at
+    BEFORE UPDATE ON user_profile
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+CREATE TRIGGER update_facts_updated_at
+    BEFORE UPDATE ON facts
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+CREATE TRIGGER update_scheduled_jobs_updated_at
+    BEFORE UPDATE ON scheduled_jobs
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+-- Function for semantic search
+CREATE OR REPLACE FUNCTION semantic_search(
+    query_embedding vector(384),
+    match_threshold FLOAT DEFAULT 0.7,
+    match_count INT DEFAULT 10,
+    filter_user VARCHAR DEFAULT 'primary'
+)
+RETURNS TABLE (
+    id UUID,
+    content TEXT,
+    source_type VARCHAR,
+    similarity FLOAT,
+    metadata JSONB
+) AS $$
+BEGIN
+    RETURN QUERY
+    SELECT 
+        me.id,
+        me.content,
+        me.source_type,
+        1 - (me.embedding <=> query_embedding) AS similarity,
+        me.metadata
+    FROM memory_embeddings me
+    WHERE me.user_id = filter_user
+      AND 1 - (me.embedding <=> query_embedding) > match_threshold
+    ORDER BY me.embedding <=> query_embedding
+    LIMIT match_count;
+END;
+$$ LANGUAGE plpgsql;
+
+-- =============================================================================
+-- Initial System Records
+-- =============================================================================
+
+-- Log system initialization
+INSERT INTO audit_log (action, entity_type, details)
+VALUES ('system_init', 'database', '{"version": "1.0.0", "initialized_at": "now()"}');
+
+COMMENT ON DATABASE ai_memory IS 'Personal AI Operating System - Memory Database';
+
+
+
+--------------------------------------------------------------------------------
+FILE: :\good projects\cost estimation\ai-stack\docker-compose.yml
+SIZE: 10241 bytes
+MODIFIED: 2026-01-30 21:25:30
+--------------------------------------------------------------------------------
+
+version: "3.9"
+
+# =============================================================================
+# Personal AI Operating System - Docker Compose Stack
+# =============================================================================
+# 6-Layer Architecture:
+#   L1: Interface Layer (external clients)
+#   L2: Gateway Layer (reverse-proxy)
+#   L3: Core Intelligence (brain, memory, stt, tts, ollama)
+#   L4: Autonomous Systems (agents, scheduler, info, notifications)
+#   L5: Persistence (postgres, redis)
+#   L6: Infrastructure (this compose file)
+# =============================================================================
+
+services:
+  # ===========================================================================
+  # LAYER 5: PERSISTENCE
+  # ===========================================================================
+  
+  memory-db:
+    image: pgvector/pgvector:pg16
+    container_name: ai-memory-db
+    restart: always
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-ai_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-ai_secret_password}
+      POSTGRES_DB: ${POSTGRES_DB:-ai_memory}
+    volumes:
+      - memory-data:/var/lib/postgresql/data
+      - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    networks:
+      - ai-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-ai_user} -d ${POSTGRES_DB:-ai_memory}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  redis:
+    image: redis:7-alpine
+    container_name: ai-redis
+    restart: always
+    command: redis-server --appendonly yes --maxmemory 128mb --maxmemory-policy allkeys-lru
+    volumes:
+      - redis-data:/data
+    networks:
+      - ai-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ===========================================================================
+  # LAYER 3: CORE INTELLIGENCE - LLM RUNTIME
+  # ===========================================================================
+  
+  ollama-runtime:
+    image: ollama/ollama:latest
+    container_name: ai-ollama
+    restart: always
+    volumes:
+      - ollama-models:/root/.ollama
+    networks:
+      - ai-network
+    environment:
+      - OLLAMA_HOST=0.0.0.0
+      - OLLAMA_KEEP_ALIVE=24h
+    # Uncomment below for GPU support
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:11434/api/version || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  # ===========================================================================
+  # LAYER 3: CORE INTELLIGENCE - MEMORY SERVICE
+  # ===========================================================================
+  
+  memory-service:
+    build:
+      context: ./memory
+      dockerfile: Dockerfile
+    container_name: ai-memory-service
+    restart: always
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-ai_user}:${POSTGRES_PASSWORD:-ai_secret_password}@memory-db:5432/${POSTGRES_DB:-ai_memory}
+      REDIS_URL: redis://redis:6379
+    depends_on:
+      memory-db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - ai-network
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8002/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # ===========================================================================
+  # LAYER 3: CORE INTELLIGENCE - AI BRAIN
+  # ===========================================================================
+  
+  ai-brain:
+    build:
+      context: ./brain
+      dockerfile: Dockerfile
+    container_name: ai-brain
+    restart: always
+    environment:
+      OLLAMA_URL: http://ollama-runtime:11434
+      MEMORY_SERVICE_URL: http://memory-service:8002
+      REDIS_URL: redis://redis:6379
+      LLM_MODEL: ${LLM_MODEL:-qwen2.5:3b}
+    depends_on:
+      ollama-runtime:
+        condition: service_healthy
+      memory-service:
+        condition: service_healthy
+    networks:
+      - ai-network
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8001/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # ===========================================================================
+  # LAYER 3: CORE INTELLIGENCE - VOICE SERVICES
+  # ===========================================================================
+  
+  stt-service:
+    build:
+      context: ./stt
+      dockerfile: Dockerfile
+    container_name: ai-stt
+    restart: unless-stopped
+    environment:
+      WHISPER_MODEL: ${WHISPER_MODEL:-tiny}
+    volumes:
+      - stt-models:/app/models
+    networks:
+      - ai-network
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8003/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    profiles:
+      - voice
+
+  tts-service:
+    build:
+      context: ./tts
+      dockerfile: Dockerfile
+    container_name: ai-tts
+    restart: unless-stopped
+    volumes:
+      - tts-models:/app/models
+    networks:
+      - ai-network
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8004/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    profiles:
+      - voice
+
+  # ===========================================================================
+  # LAYER 4: AUTONOMOUS SYSTEMS
+  # ===========================================================================
+  
+  agent-engine:
+    build:
+      context: ./agents
+      dockerfile: Dockerfile
+    container_name: ai-agents
+    restart: always
+    environment:
+      REDIS_URL: redis://redis:6379
+      BRAIN_URL: http://ai-brain:8001
+      MEMORY_URL: http://memory-service:8002
+    depends_on:
+      ai-brain:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - ai-network
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8005/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  scheduler:
+    build:
+      context: ./scheduler
+      dockerfile: Dockerfile
+    container_name: ai-scheduler
+    restart: always
+    environment:
+      REDIS_URL: redis://redis:6379
+      AGENT_ENGINE_URL: http://agent-engine:8005
+      MEMORY_URL: http://memory-service:8002
+    depends_on:
+      redis:
+        condition: service_healthy
+      agent-engine:
+        condition: service_healthy
+    networks:
+      - ai-network
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8006/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  info-engine:
+    build:
+      context: ./info
+      dockerfile: Dockerfile
+    container_name: ai-info
+    restart: always
+    environment:
+      REDIS_URL: redis://redis:6379
+      MEMORY_URL: http://memory-service:8002
+    depends_on:
+      redis:
+        condition: service_healthy
+      memory-service:
+        condition: service_healthy
+    networks:
+      - ai-network
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8007/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    profiles:
+      - proactive
+
+  notification-service:
+    build:
+      context: ./notifications
+      dockerfile: Dockerfile
+    container_name: ai-notifications
+    restart: always
+    environment:
+      REDIS_URL: redis://redis:6379
+      API_GATEWAY_URL: http://api-gateway:8000
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - ai-network
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8008/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    profiles:
+      - proactive
+
+  # ===========================================================================
+  # LAYER 2: GATEWAY LAYER
+  # ===========================================================================
+  
+  api-gateway:
+    build:
+      context: ./api
+      dockerfile: Dockerfile
+    container_name: ai-api-gateway
+    restart: always
+    environment:
+      BRAIN_URL: http://ai-brain:8001
+      MEMORY_URL: http://memory-service:8002
+      STT_URL: http://stt-service:8003
+      TTS_URL: http://tts-service:8004
+      REDIS_URL: redis://redis:6379
+    depends_on:
+      ai-brain:
+        condition: service_healthy
+      memory-service:
+        condition: service_healthy
+    networks:
+      - ai-network
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8000/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  reverse-proxy:
+    image: nginx:alpine
+    container_name: ai-reverse-proxy
+    restart: always
+    ports:
+      - "${HTTP_PORT:-80}:80"
+      - "${HTTPS_PORT:-443}:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/ssl:/etc/nginx/ssl:ro
+      - nginx-logs:/var/log/nginx
+    depends_on:
+      api-gateway:
+        condition: service_healthy
+    networks:
+      - ai-network
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+# =============================================================================
+# NETWORKS
+# =============================================================================
+
+networks:
+  ai-network:
+    name: ai-network
+    driver: bridge
+
+# =============================================================================
+# VOLUMES - Persistent Storage
+# =============================================================================
+
+volumes:
+  memory-data:
+    name: ai-memory-data
+  redis-data:
+    name: ai-redis-data
+  ollama-models:
+    name: ai-ollama-models
+  stt-models:
+    name: ai-stt-models
+  tts-models:
+    name: ai-tts-models
+  nginx-logs:
+    name: ai-nginx-logs
+
+
+
+--------------------------------------------------------------------------------
+FILE: :\good projects\cost estimation\ai-stack\info\Dockerfile
+SIZE: 604 bytes
+MODIFIED: 2026-01-30 21:32:56
+--------------------------------------------------------------------------------
+
+# =============================================================================
+# Info Engine - Dockerfile
+# =============================================================================
+FROM python:3.11-slim
+
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY . .
+
+RUN useradd -m -u 1000 appuser && chown -R appuser:appuser /app
+USER appuser
+
+EXPOSE 8007
+
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8007"]
+
+
+
+--------------------------------------------------------------------------------
+FILE: :\good projects\cost estimation\ai-stack\info\main.py
+SIZE: 11935 bytes
+MODIFIED: 2026-01-30 21:33:36
+--------------------------------------------------------------------------------
+
+"""
+=============================================================================
+Personal AI Operating System - Info Engine
+=============================================================================
+Layer 4: Autonomous Systems - Background Intelligence
+
+The Info Engine monitors external information sources.
+- News ingestion
+- RSS feeds
+- API polling
+- Topic monitoring
+- Interest tracking
+
+This is how the AI "keeps you updated".
+"""
+
+import os
+import logging
+from datetime import datetime
+from contextlib import asynccontextmanager
+from typing import Optional, List, Dict
+import asyncio
+
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+import httpx
+import redis.asyncio as redis
+import feedparser
+
+# =============================================================================
+# Configuration
+# =============================================================================
+
+class Settings:
+    REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379")
+    MEMORY_URL = os.getenv("MEMORY_URL", "http://memory-service:8002")
+    LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
+    POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "300"))  # 5 minutes
+
+settings = Settings()
+
+# =============================================================================
+# Logging
+# =============================================================================
+
+logging.basicConfig(
+    level=getattr(logging, settings.LOG_LEVEL),
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger("info-engine")
+
+# =============================================================================
+# Models
+# =============================================================================
+
+class FeedSource(BaseModel):
+    id: Optional[str] = None
+    name: str
+    url: str
+    type: str = "rss"  # rss, api
+    enabled: bool = True
+    check_interval: int = 300  # seconds
+
+class NewsItem(BaseModel):
+    id: str
+    title: str
+    summary: Optional[str]
+    url: Optional[str]
+    source: str
+    published_at: Optional[str]
+    relevance_score: float = 0.0
+
+class InterestTopic(BaseModel):
+    topic: str
+    keywords: List[str] = []
+    priority: int = 5
+    user_id: str = "primary"
+
+class HealthResponse(BaseModel):
+    status: str
+    feeds_monitored: int
+    last_poll: Optional[str]
+    timestamp: str
+
+# =============================================================================
+# Feed Processor
+# =============================================================================
+
+class FeedProcessor:
+    """Process RSS feeds and extract news items."""
+    
+    def __init__(self, http_client: httpx.AsyncClient):
+        self.http = http_client
+    
+    async def fetch_rss(self, url: str) -> List[Dict]:
+        """Fetch and parse RSS feed."""
+        try:
+            response = await self.http.get(url, timeout=30.0)
+            feed = feedparser.parse(response.text)
+            
+            items = []
+            for entry in feed.entries[:20]:  # Limit to 20 items
+                items.append({
+                    "id": entry.get("id", entry.get("link", "")),
+                    "title": entry.get("title", ""),
+                    "summary": entry.get("summary", "")[:500] if entry.get("summary") else None,
+                    "url": entry.get("link", ""),
+                    "published": entry.get("published", ""),
+                    "source": feed.feed.get("title", url)
+                })
+            
+            return items
+            
+        except Exception as e:
+            logger.error(f"Failed to fetch RSS {url}: {e}")
+            return []
+    
+    def calculate_relevance(self, item: Dict, interests: List[Dict]) -> float:
+        """Calculate relevance score based on user interests."""
+        if not interests:
+            return 0.5
+        
+        text = (item.get("title", "") + " " + (item.get("summary") or "")).lower()
+        
+        max_score = 0.0
+        for interest in interests:
+            keywords = interest.get("keywords", [])
+            topic = interest.get("topic", "")
+            priority = interest.get("priority", 5) / 10.0
+            
+            # Check topic match
+            if topic.lower() in text:
+                max_score = max(max_score, 0.8 * priority)
+            
+            # Check keyword matches
+            keyword_matches = sum(1 for kw in keywords if kw.lower() in text)
+            if keywords:
+                keyword_score = (keyword_matches / len(keywords)) * priority
+                max_score = max(max_score, keyword_score)
+        
+        return min(max_score, 1.0)
+
+# =============================================================================
+# Application Lifecycle
+# =============================================================================
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Manage application lifecycle."""
+    logger.info("ðŸ“° Info Engine starting up...")
+    
+    # Initialize Redis
+    try:
+        app.state.redis = redis.from_url(settings.REDIS_URL, decode_responses=True)
+        await app.state.redis.ping()
+        logger.info("âœ… Redis connected")
+    except Exception as e:
+        logger.warning(f"âš ï¸ Redis unavailable: {e}")
+        app.state.redis = None
+    
+    # Initialize HTTP client
+    app.state.http_client = httpx.AsyncClient(timeout=60.0)
+    app.state.feed_processor = FeedProcessor(app.state.http_client)
+    app.state.last_poll = None
+    
+    # Start polling loop
+    app.state.poll_task = asyncio.create_task(poll_loop(app))
+    
+    yield
+    
+    logger.info("ðŸ›‘ Info Engine shutting down...")
+    app.state.poll_task.cancel()
+    await app.state.http_client.aclose()
+    if app.state.redis:
+        await app.state.redis.close()
+
+async def poll_loop(app: FastAPI):
+    """Background loop for polling feeds."""
+    logger.info("Poll loop started")
+    
+    while True:
+        try:
+            if app.state.redis:
+                await poll_feeds(app)
+                app.state.last_poll = datetime.utcnow().isoformat()
+            
+            await asyncio.sleep(settings.POLL_INTERVAL)
+            
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.error(f"Poll error: {e}")
+            await asyncio.sleep(settings.POLL_INTERVAL)
+
+async def poll_feeds(app: FastAPI):
+    """Poll all configured feeds."""
+    import json
+    
+    # Get configured feeds
+    feeds_data = await app.state.redis.hgetall("info:feeds")
+    feeds = [json.loads(v) for v in feeds_data.values()]
+    
+    if not feeds:
+        return
+    
+    # Get user interests
+    interests_data = await app.state.redis.hgetall("info:interests")
+    interests = [json.loads(v) for v in interests_data.values()]
+    
+    for feed in feeds:
+        if not feed.get("enabled", True):
+            continue
+        
+        logger.info(f"Polling feed: {feed.get('name')}")
+        
+        items = await app.state.feed_processor.fetch_rss(feed.get("url"))
+        
+        for item in items:
+            # Check if already processed
+            item_key = f"info:seen:{item['id']}"
+            if await app.state.redis.exists(item_key):
+                continue
+            
+            # Calculate relevance
+            relevance = app.state.feed_processor.calculate_relevance(item, interests)
+            item["relevance_score"] = relevance
+            
+            # Store if relevant
+            if relevance >= 0.3:
+                await app.state.redis.lpush(
+                    "info:news_queue",
+                    json.dumps(item)
+                )
+                await app.state.redis.ltrim("info:news_queue", 0, 99)
+            
+            # Mark as seen
+            await app.state.redis.setex(item_key, 86400 * 7, "1")  # 7 day TTL
+
+# =============================================================================
+# FastAPI Application
+# =============================================================================
+
+app = FastAPI(
+    title="Personal AI OS - Info Engine",
+    description="Background Intelligence",
+    version="1.0.0",
+    lifespan=lifespan
+)
+
+# =============================================================================
+# Endpoints
+# =============================================================================
+
+@app.get("/health", response_model=HealthResponse)
+async def health_check():
+    """Health check endpoint."""
+    feed_count = 0
+    if app.state.redis:
+        feed_count = await app.state.redis.hlen("info:feeds")
+    
+    return HealthResponse(
+        status="healthy",
+        feeds_monitored=feed_count,
+        last_poll=app.state.last_poll,
+        timestamp=datetime.utcnow().isoformat()
+    )
+
+@app.post("/feeds")
+async def add_feed(feed: FeedSource):
+    """Add a news feed source."""
+    if not app.state.redis:
+        raise HTTPException(status_code=503, detail="Service unavailable")
+    
+    import uuid
+    import json
+    
+    feed_id = feed.id or str(uuid.uuid4())
+    feed_data = feed.model_dump()
+    feed_data["id"] = feed_id
+    
+    await app.state.redis.hset("info:feeds", feed_id, json.dumps(feed_data))
+    
+    return {"status": "added", "feed_id": feed_id}
+
+@app.get("/feeds")
+async def list_feeds():
+    """List configured feeds."""
+    if not app.state.redis:
+        raise HTTPException(status_code=503, detail="Service unavailable")
+    
+    import json
+    feeds_data = await app.state.redis.hgetall("info:feeds")
+    feeds = [json.loads(v) for v in feeds_data.values()]
+    
+    return {"feeds": feeds}
+
+@app.delete("/feeds/{feed_id}")
+async def delete_feed(feed_id: str):
+    """Delete a feed."""
+    if not app.state.redis:
+        raise HTTPException(status_code=503, detail="Service unavailable")
+    
+    await app.state.redis.hdel("info:feeds", feed_id)
+    return {"status": "deleted"}
+
+@app.post("/interests")
+async def add_interest(interest: InterestTopic):
+    """Add a topic of interest."""
+    if not app.state.redis:
+        raise HTTPException(status_code=503, detail="Service unavailable")
+    
+    import uuid
+    import json
+    
+    interest_id = str(uuid.uuid4())
+    await app.state.redis.hset(
+        "info:interests",
+        interest_id,
+        json.dumps(interest.model_dump())
+    )
+    
+    return {"status": "added", "interest_id": interest_id}
+
+@app.get("/interests")
+async def list_interests():
+    """List configured interests."""
+    if not app.state.redis:
+        raise HTTPException(status_code=503, detail="Service unavailable")
+    
+    import json
+    data = await app.state.redis.hgetall("info:interests")
+    interests = [json.loads(v) for v in data.values()]
+    
+    return {"interests": interests}
+
+@app.get("/news")
+async def get_news(limit: int = 20, min_relevance: float = 0.0):
+    """Get recent news items."""
+    if not app.state.redis:
+        raise HTTPException(status_code=503, detail="Service unavailable")
+    
+    import json
+    
+    items_raw = await app.state.redis.lrange("info:news_queue", 0, limit - 1)
+    items = [json.loads(i) for i in items_raw]
+    
+    if min_relevance > 0:
+        items = [i for i in items if i.get("relevance_score", 0) >= min_relevance]
+    
+    return {"news": items}
+
+@app.post("/poll")
+async def trigger_poll():
+    """Manually trigger feed polling."""
+    if not app.state.redis:
+        raise HTTPException(status_code=503, detail="Service unavailable")
+    
+    await poll_feeds(app)
+    
+    return {"status": "polled", "timestamp": datetime.utcnow().isoformat()}
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8007)
+
+
+
+--------------------------------------------------------------------------------
+FILE: :\good projects\cost estimation\ai-stack\info\requirements.txt
+SIZE: 139 bytes
+MODIFIED: 2026-01-30 21:33:34
+--------------------------------------------------------------------------------
+
+# Info Engine Dependencies
+fastapi==0.109.0
+uvicorn[standard]==0.27.0
+httpx==0.26.0
+redis==5.0.1
+pydantic==2.5.3
+feedparser==6.0.10
+
+
+
+--------------------------------------------------------------------------------
+FILE: :\good projects\cost estimation\ai-stack\memory\Dockerfile
+SIZE: 607 bytes
+MODIFIED: 2026-01-30 21:28:53
+--------------------------------------------------------------------------------
+
+# =============================================================================
+# Memory Service - Dockerfile
+# =============================================================================
+FROM python:3.11-slim
+
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY . .
+
+RUN useradd -m -u 1000 appuser && chown -R appuser:appuser /app
+USER appuser
+
+EXPOSE 8002
+
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8002"]
+
+
+
+--------------------------------------------------------------------------------
+FILE: :\good projects\cost estimation\ai-stack\memory\main.py
+SIZE: 17958 bytes
+MODIFIED: 2026-01-30 21:29:44
+--------------------------------------------------------------------------------
+
+"""
+=============================================================================
+Personal AI Operating System - Memory Service
+=============================================================================
+Layer 5 Interface: Persistence Layer API
+
+The Memory Service is a knowledge engine that provides:
+- Conversation storage and retrieval
+- Semantic search (vector embeddings)
+- Structured fact storage
+- User profile management
+
+All other services access memory through this API.
+Direct database access is prohibited outside this service.
+"""
+
+import os
+import logging
+from datetime import datetime
+from contextlib import asynccontextmanager
+from typing import Optional, List
+import asyncio
+
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel, Field
+import asyncpg
+import redis.asyncio as redis
+import numpy as np
+
+# =============================================================================
+# Configuration
+# =============================================================================
+
+class Settings:
+    DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://ai_user:ai_secret_password@memory-db:5432/ai_memory")
+    REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379")
+    LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
+    EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "all-MiniLM-L6-v2")
+    EMBEDDING_DIM = 384  # Dimension for all-MiniLM-L6-v2
+
+settings = Settings()
+
+# =============================================================================
+# Logging
+# =============================================================================
+
+logging.basicConfig(
+    level=getattr(logging, settings.LOG_LEVEL),
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger("memory-service")
+
+# =============================================================================
+# Models
+# =============================================================================
+
+class Message(BaseModel):
+    role: str = Field(..., pattern="^(user|assistant|system)$")
+    content: str
+    metadata: Optional[dict] = None
+
+class StoreRequest(BaseModel):
+    conversation_id: str
+    user_id: str = "primary"
+    messages: List[Message]
+
+class SearchRequest(BaseModel):
+    query: str
+    user_id: str = "primary"
+    limit: int = 10
+    threshold: float = 0.7
+
+class SearchResult(BaseModel):
+    id: str
+    content: str
+    source_type: str
+    similarity: float
+    metadata: Optional[dict] = None
+
+class FactRequest(BaseModel):
+    user_id: str = "primary"
+    category: str
+    subject: str
+    predicate: str
+    object: str
+    confidence: float = 1.0
+    source: str = "explicit"
+
+class HealthResponse(BaseModel):
+    status: str
+    database: str
+    redis: str
+    embedding_model: str
+    timestamp: str
+
+# =============================================================================
+# Embedding Model (Lazy Loading)
+# =============================================================================
+
+class EmbeddingService:
+    def __init__(self):
+        self._model = None
+        self._lock = asyncio.Lock()
+    
+    async def get_model(self):
+        """Lazy load embedding model."""
+        if self._model is None:
+            async with self._lock:
+                if self._model is None:
+                    logger.info(f"Loading embedding model: {settings.EMBEDDING_MODEL}")
+                    from sentence_transformers import SentenceTransformer
+                    self._model = SentenceTransformer(settings.EMBEDDING_MODEL)
+                    logger.info("âœ… Embedding model loaded")
+        return self._model
+    
+    async def encode(self, text: str) -> List[float]:
+        """Generate embedding for text."""
+        model = await self.get_model()
+        # Run in thread pool to avoid blocking
+        loop = asyncio.get_event_loop()
+        embedding = await loop.run_in_executor(
+            None,
+            lambda: model.encode(text, normalize_embeddings=True)
+        )
+        return embedding.tolist()
+
+embedding_service = EmbeddingService()
+
+# =============================================================================
+# Application Lifecycle
+# =============================================================================
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Manage application lifecycle."""
+    logger.info("ðŸ’¾ Memory Service starting up...")
+    
+    # Initialize database pool
+    try:
+        app.state.db_pool = await asyncpg.create_pool(
+            settings.DATABASE_URL,
+            min_size=2,
+            max_size=10
+        )
+        logger.info("âœ… Database pool created")
+    except Exception as e:
+        logger.error(f"âŒ Database connection failed: {e}")
+        app.state.db_pool = None
+    
+    # Initialize Redis
+    try:
+        app.state.redis = redis.from_url(settings.REDIS_URL, decode_responses=True)
+        await app.state.redis.ping()
+        logger.info("âœ… Redis connected")
+    except Exception as e:
+        logger.warning(f"âš ï¸ Redis unavailable: {e}")
+        app.state.redis = None
+    
+    yield
+    
+    logger.info("ðŸ›‘ Memory Service shutting down...")
+    if app.state.db_pool:
+        await app.state.db_pool.close()
+    if app.state.redis:
+        await app.state.redis.close()
+
+# =============================================================================
+# FastAPI Application
+# =============================================================================
+
+app = FastAPI(
+    title="Personal AI OS - Memory Service",
+    description="Knowledge Engine - Structured and Semantic Memory",
+    version="1.0.0",
+    lifespan=lifespan
+)
+
+# =============================================================================
+# Health Endpoints
+# =============================================================================
+
+@app.get("/health", response_model=HealthResponse)
+async def health_check():
+    """Health check endpoint."""
+    db_status = "healthy"
+    redis_status = "healthy"
+    
+    try:
+        if app.state.db_pool:
+            async with app.state.db_pool.acquire() as conn:
+                await conn.fetchval("SELECT 1")
+        else:
+            db_status = "not configured"
+    except Exception:
+        db_status = "unhealthy"
+    
+    try:
+        if app.state.redis:
+            await app.state.redis.ping()
+        else:
+            redis_status = "not configured"
+    except Exception:
+        redis_status = "unhealthy"
+    
+    return HealthResponse(
+        status="healthy" if db_status == "healthy" else "degraded",
+        database=db_status,
+        redis=redis_status,
+        embedding_model=settings.EMBEDDING_MODEL,
+        timestamp=datetime.utcnow().isoformat()
+    )
+
+# =============================================================================
+# Conversation Storage
+# =============================================================================
+
+@app.post("/store")
+async def store_messages(request: StoreRequest):
+    """Store conversation messages."""
+    if not app.state.db_pool:
+        raise HTTPException(status_code=503, detail="Database unavailable")
+    
+    async with app.state.db_pool.acquire() as conn:
+        async with conn.transaction():
+            # Ensure conversation exists
+            conversation = await conn.fetchrow(
+                """
+                INSERT INTO conversations (id, user_id, title, started_at, last_message_at)
+                VALUES ($1::uuid, $2, $3, NOW(), NOW())
+                ON CONFLICT (id) DO UPDATE SET 
+                    last_message_at = NOW(),
+                    message_count = conversations.message_count + $4
+                RETURNING id
+                """,
+                request.conversation_id,
+                request.user_id,
+                request.messages[0].content[:50] if request.messages else "New Chat",
+                len(request.messages)
+            )
+            
+            # Store each message
+            for msg in request.messages:
+                msg_id = await conn.fetchval(
+                    """
+                    INSERT INTO messages (conversation_id, role, content, metadata, created_at)
+                    VALUES ($1::uuid, $2, $3, $4, NOW())
+                    RETURNING id
+                    """,
+                    request.conversation_id,
+                    msg.role,
+                    msg.content,
+                    msg.metadata or {}
+                )
+                
+                # Generate and store embedding for semantic search
+                try:
+                    embedding = await embedding_service.encode(msg.content)
+                    await conn.execute(
+                        """
+                        INSERT INTO memory_embeddings 
+                        (user_id, source_type, source_id, content, embedding, created_at)
+                        VALUES ($1, 'conversation', $2, $3, $4, NOW())
+                        """,
+                        request.user_id,
+                        msg_id,
+                        msg.content[:500],  # Truncate for storage
+                        embedding
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to store embedding: {e}")
+    
+    return {"status": "stored", "conversation_id": request.conversation_id}
+
+@app.get("/history/{conversation_id}")
+async def get_history(conversation_id: str, limit: int = 20, offset: int = 0):
+    """Get conversation history."""
+    if not app.state.db_pool:
+        raise HTTPException(status_code=503, detail="Database unavailable")
+    
+    async with app.state.db_pool.acquire() as conn:
+        messages = await conn.fetch(
+            """
+            SELECT id, role, content, created_at, metadata
+            FROM messages
+            WHERE conversation_id = $1::uuid
+            ORDER BY created_at ASC
+            LIMIT $2 OFFSET $3
+            """,
+            conversation_id,
+            limit,
+            offset
+        )
+        
+        return {
+            "conversation_id": conversation_id,
+            "messages": [
+                {
+                    "id": str(m["id"]),
+                    "role": m["role"],
+                    "content": m["content"],
+                    "timestamp": m["created_at"].isoformat(),
+                    "metadata": m["metadata"]
+                }
+                for m in messages
+            ]
+        }
+
+@app.get("/conversations/{user_id}")
+async def list_conversations(user_id: str, limit: int = 20):
+    """List conversations for a user."""
+    if not app.state.db_pool:
+        raise HTTPException(status_code=503, detail="Database unavailable")
+    
+    async with app.state.db_pool.acquire() as conn:
+        conversations = await conn.fetch(
+            """
+            SELECT id, title, summary, started_at, last_message_at, message_count
+            FROM conversations
+            WHERE user_id = $1
+            ORDER BY last_message_at DESC
+            LIMIT $2
+            """,
+            user_id,
+            limit
+        )
+        
+        return {
+            "user_id": user_id,
+            "conversations": [
+                {
+                    "id": str(c["id"]),
+                    "title": c["title"],
+                    "summary": c["summary"],
+                    "started_at": c["started_at"].isoformat(),
+                    "last_message_at": c["last_message_at"].isoformat(),
+                    "message_count": c["message_count"]
+                }
+                for c in conversations
+            ]
+        }
+
+# =============================================================================
+# Semantic Search
+# =============================================================================
+
+@app.post("/search")
+async def semantic_search(request: SearchRequest):
+    """Search memory using semantic similarity."""
+    if not app.state.db_pool:
+        raise HTTPException(status_code=503, detail="Database unavailable")
+    
+    # Generate query embedding
+    try:
+        query_embedding = await embedding_service.encode(request.query)
+    except Exception as e:
+        logger.error(f"Embedding generation failed: {e}")
+        raise HTTPException(status_code=500, detail="Embedding generation failed")
+    
+    async with app.state.db_pool.acquire() as conn:
+        # Use pgvector for similarity search
+        results = await conn.fetch(
+            """
+            SELECT 
+                id,
+                content,
+                source_type,
+                1 - (embedding <=> $1::vector) as similarity,
+                metadata
+            FROM memory_embeddings
+            WHERE user_id = $2
+              AND 1 - (embedding <=> $1::vector) > $3
+            ORDER BY embedding <=> $1::vector
+            LIMIT $4
+            """,
+            query_embedding,
+            request.user_id,
+            request.threshold,
+            request.limit
+        )
+        
+        return {
+            "query": request.query,
+            "results": [
+                {
+                    "id": str(r["id"]),
+                    "content": r["content"],
+                    "source_type": r["source_type"],
+                    "similarity": float(r["similarity"]),
+                    "metadata": r["metadata"]
+                }
+                for r in results
+            ]
+        }
+
+# =============================================================================
+# Structured Facts
+# =============================================================================
+
+@app.post("/facts")
+async def store_fact(request: FactRequest):
+    """Store a structured fact."""
+    if not app.state.db_pool:
+        raise HTTPException(status_code=503, detail="Database unavailable")
+    
+    async with app.state.db_pool.acquire() as conn:
+        fact_id = await conn.fetchval(
+            """
+            INSERT INTO facts (user_id, category, subject, predicate, object, confidence, source)
+            VALUES ($1, $2, $3, $4, $5, $6, $7)
+            RETURNING id
+            """,
+            request.user_id,
+            request.category,
+            request.subject,
+            request.predicate,
+            request.object,
+            request.confidence,
+            request.source
+        )
+        
+        return {"status": "stored", "fact_id": str(fact_id)}
+
+@app.get("/facts/{user_id}")
+async def get_facts(
+    user_id: str,
+    category: Optional[str] = None,
+    subject: Optional[str] = None,
+    limit: int = 50
+):
+    """Retrieve facts for a user."""
+    if not app.state.db_pool:
+        raise HTTPException(status_code=503, detail="Database unavailable")
+    
+    query = "SELECT * FROM facts WHERE user_id = $1"
+    params = [user_id]
+    
+    if category:
+        params.append(category)
+        query += f" AND category = ${len(params)}"
+    
+    if subject:
+        params.append(f"%{subject}%")
+        query += f" AND subject ILIKE ${len(params)}"
+    
+    query += f" ORDER BY updated_at DESC LIMIT {limit}"
+    
+    async with app.state.db_pool.acquire() as conn:
+        facts = await conn.fetch(query, *params)
+        
+        return {
+            "user_id": user_id,
+            "facts": [
+                {
+                    "id": str(f["id"]),
+                    "category": f["category"],
+                    "subject": f["subject"],
+                    "predicate": f["predicate"],
+                    "object": f["object"],
+                    "confidence": float(f["confidence"]),
+                    "source": f["source"],
+                    "updated_at": f["updated_at"].isoformat()
+                }
+                for f in facts
+            ]
+        }
+
+# =============================================================================
+# User Profile
+# =============================================================================
+
+@app.get("/profile/{user_id}")
+async def get_profile(user_id: str):
+    """Get user profile."""
+    if not app.state.db_pool:
+        raise HTTPException(status_code=503, detail="Database unavailable")
+    
+    async with app.state.db_pool.acquire() as conn:
+        profile = await conn.fetchrow(
+            """
+            SELECT * FROM user_profile WHERE user_id = $1
+            """,
+            user_id
+        )
+        
+        if not profile:
+            raise HTTPException(status_code=404, detail="User not found")
+        
+        return {
+            "user_id": profile["user_id"],
+            "name": profile["name"],
+            "preferences": profile["preferences"],
+            "timezone": profile["timezone"],
+            "created_at": profile["created_at"].isoformat()
+        }
+
+@app.put("/profile/{user_id}")
+async def update_profile(user_id: str, updates: dict):
+    """Update user profile."""
+    if not app.state.db_pool:
+        raise HTTPException(status_code=503, detail="Database unavailable")
+    
+    async with app.state.db_pool.acquire() as conn:
+        await conn.execute(
+            """
+            UPDATE user_profile
+            SET name = COALESCE($2, name),
+                preferences = preferences || $3,
+                timezone = COALESCE($4, timezone),
+                updated_at = NOW()
+            WHERE user_id = $1
+            """,
+            user_id,
+            updates.get("name"),
+            updates.get("preferences", {}),
+            updates.get("timezone")
+        )
+        
+        return {"status": "updated", "user_id": user_id}
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8002)
+
+
+
+--------------------------------------------------------------------------------
+FILE: :\good projects\cost estimation\ai-stack\memory\requirements.txt
+SIZE: 195 bytes
+MODIFIED: 2026-01-30 21:29:40
+--------------------------------------------------------------------------------
+
+# Memory Service Dependencies
+fastapi==0.109.0
+uvicorn[standard]==0.27.0
+asyncpg==0.29.0
+redis==5.0.1
+pydantic==2.5.3
+pydantic-settings==2.1.0
+sentence-transformers==2.2.2
+numpy==1.26.3
+
+
+
+--------------------------------------------------------------------------------
+FILE: :\good projects\cost estimation\ai-stack\nginx\nginx.conf
+SIZE: 8343 bytes
+MODIFIED: 2026-01-30 21:26:32
+--------------------------------------------------------------------------------
+
+# =============================================================================
+# Personal AI Operating System - Nginx Reverse Proxy Configuration
+# =============================================================================
+# Layer 2: Gateway Layer - Security and routing boundary
+
+user  nginx;
+worker_processes  auto;
+
+error_log  /var/log/nginx/error.log notice;
+pid        /var/run/nginx.pid;
+
+events {
+    worker_connections  1024;
+    use epoll;
+    multi_accept on;
+}
+
+http {
+    include       /etc/nginx/mime.types;
+    default_type  application/octet-stream;
+
+    # =========================================================================
+    # Logging Configuration
+    # =========================================================================
+    log_format main '$remote_addr - $remote_user [$time_local] "$request" '
+                    '$status $body_bytes_sent "$http_referer" '
+                    '"$http_user_agent" "$http_x_forwarded_for" '
+                    'rt=$request_time uct="$upstream_connect_time" '
+                    'uht="$upstream_header_time" urt="$upstream_response_time"';
+
+    log_format json escape=json '{'
+        '"time": "$time_iso8601",'
+        '"remote_addr": "$remote_addr",'
+        '"request": "$request",'
+        '"status": "$status",'
+        '"body_bytes_sent": "$body_bytes_sent",'
+        '"request_time": "$request_time",'
+        '"upstream_response_time": "$upstream_response_time",'
+        '"http_user_agent": "$http_user_agent"'
+    '}';
+
+    access_log  /var/log/nginx/access.log  json;
+
+    # =========================================================================
+    # Performance Optimization
+    # =========================================================================
+    sendfile        on;
+    tcp_nopush      on;
+    tcp_nodelay     on;
+    keepalive_timeout  65;
+    types_hash_max_size 2048;
+
+    # Gzip compression
+    gzip on;
+    gzip_vary on;
+    gzip_proxied any;
+    gzip_comp_level 6;
+    gzip_types text/plain text/css text/xml application/json application/javascript 
+               application/rss+xml application/atom+xml image/svg+xml;
+
+    # =========================================================================
+    # Security Headers
+    # =========================================================================
+    add_header X-Frame-Options "SAMEORIGIN" always;
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header X-XSS-Protection "1; mode=block" always;
+    add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+
+    # =========================================================================
+    # Rate Limiting
+    # =========================================================================
+    limit_req_zone $binary_remote_addr zone=api_limit:10m rate=30r/s;
+    limit_req_zone $binary_remote_addr zone=voice_limit:10m rate=5r/s;
+    limit_conn_zone $binary_remote_addr zone=conn_limit:10m;
+
+    # =========================================================================
+    # Upstream Definitions
+    # =========================================================================
+    upstream api_gateway {
+        server api-gateway:8000;
+        keepalive 32;
+    }
+
+    # =========================================================================
+    # HTTP Server (redirect to HTTPS in production)
+    # =========================================================================
+    server {
+        listen 80;
+        server_name _;
+
+        # Health check endpoint (no auth required)
+        location /health {
+            access_log off;
+            return 200 'OK';
+            add_header Content-Type text/plain;
+        }
+
+        # Nginx status for monitoring
+        location /nginx_status {
+            stub_status on;
+            access_log off;
+            allow 127.0.0.1;
+            allow 172.16.0.0/12;  # Docker networks
+            deny all;
+        }
+
+        # =====================================================================
+        # API Routes
+        # =====================================================================
+        location /api/ {
+            limit_req zone=api_limit burst=50 nodelay;
+            limit_conn conn_limit 20;
+
+            proxy_pass http://api_gateway;
+            proxy_http_version 1.1;
+            
+            # Headers
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+            proxy_set_header X-Request-ID $request_id;
+
+            # Timeouts
+            proxy_connect_timeout 60s;
+            proxy_send_timeout 60s;
+            proxy_read_timeout 120s;
+
+            # Buffering
+            proxy_buffering on;
+            proxy_buffer_size 4k;
+            proxy_buffers 8 4k;
+        }
+
+        # =====================================================================
+        # WebSocket Support (for streaming responses)
+        # =====================================================================
+        location /ws/ {
+            proxy_pass http://api_gateway;
+            proxy_http_version 1.1;
+            
+            proxy_set_header Upgrade $http_upgrade;
+            proxy_set_header Connection "upgrade";
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+
+            # WebSocket specific timeouts
+            proxy_read_timeout 86400s;
+            proxy_send_timeout 86400s;
+        }
+
+        # =====================================================================
+        # Voice Endpoints (stricter rate limiting)
+        # =====================================================================
+        location /api/voice/ {
+            limit_req zone=voice_limit burst=10 nodelay;
+            limit_conn conn_limit 5;
+
+            # Larger body for audio uploads
+            client_max_body_size 50M;
+
+            proxy_pass http://api_gateway;
+            proxy_http_version 1.1;
+            
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+
+            # Longer timeout for voice processing
+            proxy_read_timeout 180s;
+        }
+
+        # =====================================================================
+        # Static Files (future web UI)
+        # =====================================================================
+        location /static/ {
+            alias /var/www/static/;
+            expires 7d;
+            add_header Cache-Control "public, immutable";
+        }
+
+        # Root - future web UI
+        location / {
+            # For now, redirect to API health
+            return 302 /api/;
+        }
+
+        # =====================================================================
+        # Error Pages
+        # =====================================================================
+        error_page 500 502 503 504 /50x.html;
+        location = /50x.html {
+            root /usr/share/nginx/html;
+            internal;
+        }
+    }
+
+    # =========================================================================
+    # HTTPS Server (uncomment for production with SSL)
+    # =========================================================================
+    # server {
+    #     listen 443 ssl http2;
+    #     server_name _;
+    #
+    #     ssl_certificate /etc/nginx/ssl/fullchain.pem;
+    #     ssl_certificate_key /etc/nginx/ssl/privkey.pem;
+    #     ssl_session_timeout 1d;
+    #     ssl_session_cache shared:SSL:50m;
+    #     ssl_session_tickets off;
+    #
+    #     ssl_protocols TLSv1.2 TLSv1.3;
+    #     ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256;
+    #     ssl_prefer_server_ciphers off;
+    #
+    #     add_header Strict-Transport-Security "max-age=63072000" always;
+    #
+    #     # Include same location blocks as HTTP server above
+    # }
+}
+
+
+
+--------------------------------------------------------------------------------
+FILE: :\good projects\cost estimation\ai-stack\notifications\Dockerfile
+SIZE: 613 bytes
+MODIFIED: 2026-01-30 21:33:38
+--------------------------------------------------------------------------------
+
+# =============================================================================
+# Notification Service - Dockerfile
+# =============================================================================
+FROM python:3.11-slim
+
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY . .
+
+RUN useradd -m -u 1000 appuser && chown -R appuser:appuser /app
+USER appuser
+
+EXPOSE 8008
+
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8008"]
+
+
+
+--------------------------------------------------------------------------------
+FILE: :\good projects\cost estimation\ai-stack\notifications\main.py
+SIZE: 5484 bytes
+MODIFIED: 2026-01-30 21:34:35
+--------------------------------------------------------------------------------
+
+"""
+=============================================================================
+Personal AI Operating System - Notification Service
+=============================================================================
+Layer 4: Autonomous Systems - Proactive Communication
+
+Decides when and how to interrupt the user.
+Channels: push, bot, voice, email
+Implements urgency, frequency, and priority policies.
+"""
+
+import os
+import logging
+from datetime import datetime
+from contextlib import asynccontextmanager
+from typing import Optional, List
+import asyncio
+import json
+
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel, Field
+import httpx
+import redis.asyncio as redis
+
+# Configuration
+class Settings:
+    REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379")
+    API_GATEWAY_URL = os.getenv("API_GATEWAY_URL", "http://api-gateway:8000")
+    LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
+
+settings = Settings()
+
+logging.basicConfig(level=getattr(logging, settings.LOG_LEVEL))
+logger = logging.getLogger("notifications")
+
+# Models
+class Notification(BaseModel):
+    title: str
+    body: str
+    priority: str = Field(default="normal", pattern="^(low|normal|high|urgent)$")
+    channel: str = Field(default="push", pattern="^(push|email|bot|voice)$")
+    user_id: str = "primary"
+    scheduled_for: Optional[str] = None
+    metadata: dict = {}
+
+class HealthResponse(BaseModel):
+    status: str
+    pending_count: int
+    timestamp: str
+
+# Notification Queue
+class NotificationQueue:
+    def __init__(self, redis_client):
+        self.redis = redis_client
+        self.queue_key = "notifications:pending"
+        self.history_key = "notifications:history"
+    
+    async def enqueue(self, notification: dict):
+        await self.redis.lpush(self.queue_key, json.dumps(notification))
+    
+    async def dequeue(self, timeout: int = 1):
+        result = await self.redis.brpop(self.queue_key, timeout=timeout)
+        return json.loads(result[1]) if result else None
+    
+    async def add_to_history(self, notification: dict):
+        await self.redis.lpush(self.history_key, json.dumps(notification))
+        await self.redis.ltrim(self.history_key, 0, 99)
+    
+    async def get_history(self, limit: int = 20):
+        items = await self.redis.lrange(self.history_key, 0, limit - 1)
+        return [json.loads(i) for i in items]
+    
+    async def pending_count(self):
+        return await self.redis.llen(self.queue_key)
+
+# Lifecycle
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    logger.info("ðŸ”” Notification Service starting...")
+    try:
+        app.state.redis = redis.from_url(settings.REDIS_URL, decode_responses=True)
+        await app.state.redis.ping()
+        app.state.queue = NotificationQueue(app.state.redis)
+        logger.info("âœ… Redis connected")
+    except Exception as e:
+        logger.warning(f"âš ï¸ Redis unavailable: {e}")
+        app.state.redis = None
+        app.state.queue = None
+    
+    app.state.http_client = httpx.AsyncClient(timeout=30.0)
+    app.state.worker = asyncio.create_task(notification_worker(app))
+    
+    yield
+    
+    app.state.worker.cancel()
+    await app.state.http_client.aclose()
+    if app.state.redis:
+        await app.state.redis.close()
+
+async def notification_worker(app: FastAPI):
+    """Process pending notifications."""
+    while True:
+        try:
+            if not app.state.queue:
+                await asyncio.sleep(5)
+                continue
+            
+            notification = await app.state.queue.dequeue(timeout=1)
+            if notification:
+                await send_notification(app, notification)
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.error(f"Worker error: {e}")
+            await asyncio.sleep(1)
+
+async def send_notification(app: FastAPI, notification: dict):
+    """Send notification via appropriate channel."""
+    channel = notification.get("channel", "push")
+    logger.info(f"Sending {channel} notification: {notification.get('title')}")
+    
+    notification["sent_at"] = datetime.utcnow().isoformat()
+    notification["status"] = "sent"
+    
+    await app.state.queue.add_to_history(notification)
+
+# App
+app = FastAPI(title="Notification Service", version="1.0.0", lifespan=lifespan)
+
+@app.get("/health", response_model=HealthResponse)
+async def health():
+    pending = 0
+    if app.state.queue:
+        pending = await app.state.queue.pending_count()
+    return HealthResponse(status="healthy", pending_count=pending, timestamp=datetime.utcnow().isoformat())
+
+@app.post("/send")
+async def send(notification: Notification):
+    if not app.state.queue:
+        raise HTTPException(status_code=503, detail="Service unavailable")
+    
+    import uuid
+    data = notification.model_dump()
+    data["id"] = str(uuid.uuid4())
+    data["created_at"] = datetime.utcnow().isoformat()
+    
+    await app.state.queue.enqueue(data)
+    return {"status": "queued", "notification_id": data["id"]}
+
+@app.get("/history")
+async def history(limit: int = 20):
+    if not app.state.queue:
+        raise HTTPException(status_code=503, detail="Service unavailable")
+    items = await app.state.queue.get_history(limit)
+    return {"notifications": items}
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8008)
+
+
+
+--------------------------------------------------------------------------------
+FILE: :\good projects\cost estimation\ai-stack\notifications\requirements.txt
+SIZE: 128 bytes
+MODIFIED: 2026-01-30 21:34:02
+--------------------------------------------------------------------------------
+
+# Notification Service Dependencies
+fastapi==0.109.0
+uvicorn[standard]==0.27.0
+httpx==0.26.0
+redis==5.0.1
+pydantic==2.5.3
+
+
+
+--------------------------------------------------------------------------------
+FILE: :\good projects\cost estimation\ai-stack\README.md
+SIZE: 6439 bytes
+MODIFIED: 2026-01-30 21:35:12
+--------------------------------------------------------------------------------
+
+# Personal AI Operating System
+
+A self-hosted, containerized AI platform with voice interaction, persistent memory, autonomous agents, and multi-client access.
+
+## ðŸ— Architecture
+
+```
+â”Œâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”
+â”‚                    Layer 1: Interface Layer                      â”‚
+â”‚              (Web UI, Android, Telegram, Voice Devices)          â”‚
+â””â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”¬â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”˜
+                             â”‚
+â”Œâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â–¼â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”
+â”‚                    Layer 2: Gateway Layer                        â”‚
+â”‚                   reverse-proxy â†’ api-gateway                    â”‚
+â””â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”¬â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”˜
+                             â”‚
+â”Œâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â–¼â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”
+â”‚                Layer 3: Core Intelligence                        â”‚
+â”‚     ai-brain â† memory-service â† ollama-runtime                  â”‚
+â”‚     stt-service â†’ tts-service                                   â”‚
+â””â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”¬â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”˜
+                             â”‚
+â”Œâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â–¼â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”
+â”‚               Layer 4: Autonomous Systems                        â”‚
+â”‚  agent-engine â†’ scheduler â†’ info-engine â†’ notifications         â”‚
+â””â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”¬â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”˜
+                             â”‚
+â”Œâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â–¼â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”
+â”‚                Layer 5: Persistence                              â”‚
+â”‚            PostgreSQL (pgvector) + Redis                        â”‚
+â””â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”˜
+```
+
+## ðŸš€ Quick Start
+
+### Prerequisites
+
+- Docker & Docker Compose
+- 8GB+ RAM (16GB recommended)
+- 30GB+ disk space
+
+### Deploy
+
+```bash
+# Clone and navigate
+cd ai-stack
+
+# Configure environment
+cp .env.example .env
+# Edit .env with your settings
+
+# Start core services (without voice)
+docker compose up -d memory-db redis ollama-runtime
+
+# Pull LLM model
+docker compose exec ollama-runtime ollama pull qwen2.5:3b
+
+# Start remaining services
+docker compose up -d
+
+# With voice services
+docker compose --profile voice up -d
+
+# With proactive services
+docker compose --profile proactive up -d
+```
+
+### Verify
+
+```bash
+# Check all services
+docker compose ps
+
+# Test API
+curl http://localhost/api/
+
+# Test chat
+curl -X POST http://localhost/api/chat \
+  -H "Content-Type: application/json" \
+  -d '{"message": "Hello!"}'
+```
+
+## ðŸ“¦ Services
+
+| Service | Port | Description |
+|---------|------|-------------|
+| reverse-proxy | 80/443 | Nginx gateway |
+| api-gateway | 8000 | REST/WebSocket API |
+| ai-brain | 8001 | LLM orchestration |
+| memory-service | 8002 | Semantic memory |
+| stt-service | 8003 | Speech-to-text |
+| tts-service | 8004 | Text-to-speech |
+| agent-engine | 8005 | Task execution |
+| scheduler | 8006 | Job scheduling |
+| info-engine | 8007 | News/RSS monitoring |
+| notifications | 8008 | Alert dispatch |
+| ollama-runtime | 11434 | LLM inference |
+| memory-db | 5432 | PostgreSQL |
+| redis | 6379 | Cache/queue |
+
+## ðŸ§  AI Configuration
+
+### Model Selection
+
+Edit `.env`:
+```
+LLM_MODEL=qwen2.5:3b  # Default, fits in 8GB RAM
+# LLM_MODEL=qwen2.5:7b  # Better quality, needs 16GB
+# LLM_MODEL=llama3.2:3b  # Alternative
+```
+
+### Personality
+
+Edit `brain/identity/persona.yaml`:
+```yaml
+name: Atlas
+personality:
+  tone: friendly, warm
+  traits: [helpful, curious, honest]
+```
+
+## ðŸŽ¤ Voice
+
+Enable voice services:
+```bash
+docker compose --profile voice up -d
+```
+
+STT models (edit `.env`):
+- `tiny` - Fastest, ~1GB RAM
+- `base` - Better quality, ~1GB RAM  
+- `small` - Best local quality, ~2GB RAM
+
+## ðŸ”§ Operations
+
+### Logs
+```bash
+docker compose logs -f ai-brain
+docker compose logs -f --tail 100
+```
+
+### Backup
+```bash
+# Database
+docker compose exec memory-db pg_dump -U ai_user ai_memory > backup.sql
+
+# All volumes
+docker run --rm -v ai-memory-data:/data -v $(pwd):/backup alpine \
+  tar czf /backup/memory-backup.tar.gz /data
+```
+
+### Update
+```bash
+docker compose pull
+docker compose up -d --build
+```
+
+## ðŸ“ Project Structure
+
+```
+ai-stack/
+â”œâ”€â”€ docker-compose.yml
+â”œâ”€â”€ .env.example
+â”œâ”€â”€ nginx/
+â”‚   â””â”€â”€ nginx.conf
+â”œâ”€â”€ api/                  # API Gateway
+â”œâ”€â”€ brain/                # AI Brain + Identity
+â”œâ”€â”€ memory/               # Memory Service
+â”œâ”€â”€ stt/                  # Speech-to-Text
+â”œâ”€â”€ tts/                  # Text-to-Speech
+â”œâ”€â”€ agents/               # Agent Engine
+â”œâ”€â”€ scheduler/            # Job Scheduler
+â”œâ”€â”€ info/                 # Info Engine
+â”œâ”€â”€ notifications/        # Notification Service
+â””â”€â”€ db/
+    â””â”€â”€ init.sql          # Database schema
+```
+
+## ðŸ“„ License
+
+MIT
+
+
+
+--------------------------------------------------------------------------------
+FILE: :\good projects\cost estimation\ai-stack\scheduler\Dockerfile
+SIZE: 610 bytes
+MODIFIED: 2026-01-30 21:31:56
+--------------------------------------------------------------------------------
+
+# =============================================================================
+# Scheduler Service - Dockerfile
+# =============================================================================
+FROM python:3.11-slim
+
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY . .
+
+RUN useradd -m -u 1000 appuser && chown -R appuser:appuser /app
+USER appuser
+
+EXPOSE 8006
+
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8006"]
+
+
+
+--------------------------------------------------------------------------------
+FILE: :\good projects\cost estimation\ai-stack\scheduler\main.py
+SIZE: 15605 bytes
+MODIFIED: 2026-01-30 21:32:53
+--------------------------------------------------------------------------------
+
+"""
+=============================================================================
+Personal AI Operating System - Scheduler Service
+=============================================================================
+Layer 4: Autonomous Systems - Time-Based Job Execution
+
+The Scheduler is the heartbeat of the system.
+Handles:
+- Reminders
+- Cron jobs
+- Recurring tasks
+- Polling cycles
+- Agent triggers
+
+Without scheduler: AI is reactive only.
+With scheduler: AI becomes autonomous.
+"""
+
+import os
+import logging
+from datetime import datetime, timedelta
+from contextlib import asynccontextmanager
+from typing import Optional, Dict, Any, List
+import asyncio
+import json
+
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel, Field
+from croniter import croniter
+import httpx
+import redis.asyncio as redis
+
+# =============================================================================
+# Configuration
+# =============================================================================
+
+class Settings:
+    REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379")
+    AGENT_ENGINE_URL = os.getenv("AGENT_ENGINE_URL", "http://agent-engine:8005")
+    MEMORY_URL = os.getenv("MEMORY_URL", "http://memory-service:8002")
+    LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
+    CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "10"))  # seconds
+
+settings = Settings()
+
+# =============================================================================
+# Logging
+# =============================================================================
+
+logging.basicConfig(
+    level=getattr(logging, settings.LOG_LEVEL),
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger("scheduler")
+
+# =============================================================================
+# Models
+# =============================================================================
+
+class JobType(str):
+    REMINDER = "reminder"
+    RECURRING = "recurring"
+    CRON = "cron"
+    ONE_TIME = "one_time"
+
+class ActionType(str):
+    NOTIFY = "notify"
+    AGENT = "agent"
+    MESSAGE = "message"
+
+class JobRequest(BaseModel):
+    job_type: str = Field(..., pattern="^(reminder|recurring|cron|one_time)$")
+    name: str
+    description: Optional[str] = None
+    cron_expression: Optional[str] = None  # For cron jobs
+    run_at: Optional[str] = None  # ISO datetime for one-time
+    interval_minutes: Optional[int] = None  # For recurring
+    action_type: str = Field(..., pattern="^(notify|agent|message)$")
+    action_payload: Dict[str, Any] = {}
+    user_id: str = "primary"
+
+class JobResponse(BaseModel):
+    job_id: str
+    name: str
+    job_type: str
+    next_run_at: Optional[str]
+    enabled: bool
+    created_at: str
+
+class HealthResponse(BaseModel):
+    status: str
+    active_jobs: int
+    next_execution: Optional[str]
+    timestamp: str
+
+# =============================================================================
+# Job Store (Redis-backed)
+# =============================================================================
+
+class JobStore:
+    """Redis-based job storage."""
+    
+    JOBS_KEY = "scheduler:jobs"
+    DUE_JOBS_KEY = "scheduler:due"
+    
+    def __init__(self, redis_client):
+        self.redis = redis_client
+    
+    async def add_job(self, job_id: str, job_data: Dict) -> None:
+        """Add a job to the store."""
+        await self.redis.hset(self.JOBS_KEY, job_id, json.dumps(job_data))
+        
+        # Add to due queue if has next_run_at
+        if job_data.get("next_run_at"):
+            score = datetime.fromisoformat(job_data["next_run_at"]).timestamp()
+            await self.redis.zadd(self.DUE_JOBS_KEY, {job_id: score})
+    
+    async def get_job(self, job_id: str) -> Optional[Dict]:
+        """Get a job by ID."""
+        data = await self.redis.hget(self.JOBS_KEY, job_id)
+        return json.loads(data) if data else None
+    
+    async def update_job(self, job_id: str, updates: Dict) -> None:
+        """Update a job."""
+        job = await self.get_job(job_id)
+        if job:
+            job.update(updates)
+            await self.redis.hset(self.JOBS_KEY, job_id, json.dumps(job))
+            
+            if updates.get("next_run_at"):
+                score = datetime.fromisoformat(updates["next_run_at"]).timestamp()
+                await self.redis.zadd(self.DUE_JOBS_KEY, {job_id: score})
+    
+    async def delete_job(self, job_id: str) -> None:
+        """Delete a job."""
+        await self.redis.hdel(self.JOBS_KEY, job_id)
+        await self.redis.zrem(self.DUE_JOBS_KEY, job_id)
+    
+    async def get_due_jobs(self, now: datetime) -> List[str]:
+        """Get jobs due for execution."""
+        score = now.timestamp()
+        job_ids = await self.redis.zrangebyscore(self.DUE_JOBS_KEY, 0, score)
+        return job_ids
+    
+    async def get_all_jobs(self, user_id: Optional[str] = None) -> List[Dict]:
+        """Get all jobs, optionally filtered by user."""
+        all_jobs = await self.redis.hgetall(self.JOBS_KEY)
+        jobs = [json.loads(v) for v in all_jobs.values()]
+        
+        if user_id:
+            jobs = [j for j in jobs if j.get("user_id") == user_id]
+        
+        return jobs
+    
+    async def get_next_execution(self) -> Optional[datetime]:
+        """Get timestamp of next scheduled execution."""
+        result = await self.redis.zrange(self.DUE_JOBS_KEY, 0, 0, withscores=True)
+        if result:
+            return datetime.fromtimestamp(result[0][1])
+        return None
+    
+    async def count_active(self) -> int:
+        """Count active jobs."""
+        return await self.redis.hlen(self.JOBS_KEY)
+
+# =============================================================================
+# Scheduler Logic
+# =============================================================================
+
+def calculate_next_run(job: Dict) -> Optional[datetime]:
+    """Calculate next run time for a job."""
+    now = datetime.utcnow()
+    job_type = job.get("job_type")
+    
+    if job_type == "cron" and job.get("cron_expression"):
+        cron = croniter(job["cron_expression"], now)
+        return cron.get_next(datetime)
+    
+    elif job_type == "recurring" and job.get("interval_minutes"):
+        interval = timedelta(minutes=job["interval_minutes"])
+        last_run = job.get("last_run_at")
+        if last_run:
+            last = datetime.fromisoformat(last_run)
+            return last + interval
+        return now + interval
+    
+    elif job_type == "one_time" and job.get("run_at"):
+        run_at = datetime.fromisoformat(job["run_at"])
+        if run_at > now:
+            return run_at
+        return None  # Already passed
+    
+    elif job_type == "reminder":
+        # Simple implementation - should parse natural language
+        return now + timedelta(hours=1)
+    
+    return None
+
+async def execute_job(job: Dict, http_client: httpx.AsyncClient) -> bool:
+    """Execute a scheduled job."""
+    action_type = job.get("action_type")
+    payload = job.get("action_payload", {})
+    
+    logger.info(f"Executing job: {job.get('name')} ({action_type})")
+    
+    try:
+        if action_type == "agent":
+            # Trigger agent
+            response = await http_client.post(
+                f"{settings.AGENT_ENGINE_URL}/execute",
+                json={
+                    "agent_type": payload.get("agent_type", "reminder"),
+                    "task_name": job.get("name"),
+                    "input_data": payload.get("input_data", {}),
+                    "user_id": job.get("user_id", "primary")
+                }
+            )
+            return response.status_code == 200
+        
+        elif action_type == "notify":
+            # Store notification in memory/cache
+            # In a full implementation, this would go to notification service
+            logger.info(f"Notification: {payload.get('message', job.get('name'))}")
+            return True
+        
+        elif action_type == "message":
+            # Could trigger a proactive message to user
+            logger.info(f"Message: {payload.get('content', '')}")
+            return True
+        
+        return False
+        
+    except Exception as e:
+        logger.error(f"Job execution failed: {e}")
+        return False
+
+# =============================================================================
+# Application Lifecycle
+# =============================================================================
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Manage application lifecycle."""
+    logger.info("â° Scheduler starting up...")
+    
+    # Initialize Redis
+    try:
+        app.state.redis = redis.from_url(settings.REDIS_URL, decode_responses=True)
+        await app.state.redis.ping()
+        app.state.job_store = JobStore(app.state.redis)
+        logger.info("âœ… Redis connected")
+    except Exception as e:
+        logger.warning(f"âš ï¸ Redis unavailable: {e}")
+        app.state.redis = None
+        app.state.job_store = None
+    
+    # Initialize HTTP client
+    app.state.http_client = httpx.AsyncClient(timeout=60.0)
+    
+    # Start scheduler loop
+    app.state.scheduler_task = asyncio.create_task(scheduler_loop(app))
+    
+    yield
+    
+    logger.info("ðŸ›‘ Scheduler shutting down...")
+    app.state.scheduler_task.cancel()
+    await app.state.http_client.aclose()
+    if app.state.redis:
+        await app.state.redis.close()
+
+async def scheduler_loop(app: FastAPI):
+    """Main scheduler loop - checks for due jobs."""
+    logger.info("Scheduler loop started")
+    
+    while True:
+        try:
+            if not app.state.job_store:
+                await asyncio.sleep(settings.CHECK_INTERVAL)
+                continue
+            
+            now = datetime.utcnow()
+            due_job_ids = await app.state.job_store.get_due_jobs(now)
+            
+            for job_id in due_job_ids:
+                job = await app.state.job_store.get_job(job_id)
+                if job and job.get("enabled", True):
+                    # Execute job
+                    success = await execute_job(job, app.state.http_client)
+                    
+                    # Update job
+                    job["last_run_at"] = now.isoformat()
+                    job["last_run_success"] = success
+                    
+                    # Calculate next run
+                    next_run = calculate_next_run(job)
+                    if next_run:
+                        job["next_run_at"] = next_run.isoformat()
+                        await app.state.job_store.update_job(job_id, job)
+                    else:
+                        # One-time job completed
+                        if job.get("job_type") == "one_time":
+                            await app.state.job_store.delete_job(job_id)
+                        else:
+                            job["enabled"] = False
+                            await app.state.job_store.update_job(job_id, job)
+            
+            await asyncio.sleep(settings.CHECK_INTERVAL)
+            
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.error(f"Scheduler error: {e}")
+            await asyncio.sleep(settings.CHECK_INTERVAL)
+
+# =============================================================================
+# FastAPI Application
+# =============================================================================
+
+app = FastAPI(
+    title="Personal AI OS - Scheduler",
+    description="Time-Based Job Execution",
+    version="1.0.0",
+    lifespan=lifespan
+)
+
+# =============================================================================
+# Endpoints
+# =============================================================================
+
+@app.get("/health", response_model=HealthResponse)
+async def health_check():
+    """Health check endpoint."""
+    active_jobs = 0
+    next_exec = None
+    
+    if app.state.job_store:
+        active_jobs = await app.state.job_store.count_active()
+        next_dt = await app.state.job_store.get_next_execution()
+        next_exec = next_dt.isoformat() if next_dt else None
+    
+    return HealthResponse(
+        status="healthy",
+        active_jobs=active_jobs,
+        next_execution=next_exec,
+        timestamp=datetime.utcnow().isoformat()
+    )
+
+@app.post("/jobs", response_model=JobResponse)
+async def create_job(request: JobRequest):
+    """Create a new scheduled job."""
+    if not app.state.job_store:
+        raise HTTPException(status_code=503, detail="Scheduler unavailable")
+    
+    import uuid
+    job_id = str(uuid.uuid4())
+    now = datetime.utcnow()
+    
+    job_data = {
+        "job_id": job_id,
+        "name": request.name,
+        "description": request.description,
+        "job_type": request.job_type,
+        "cron_expression": request.cron_expression,
+        "run_at": request.run_at,
+        "interval_minutes": request.interval_minutes,
+        "action_type": request.action_type,
+        "action_payload": request.action_payload,
+        "user_id": request.user_id,
+        "enabled": True,
+        "created_at": now.isoformat()
+    }
+    
+    # Calculate next run
+    next_run = calculate_next_run(job_data)
+    job_data["next_run_at"] = next_run.isoformat() if next_run else None
+    
+    await app.state.job_store.add_job(job_id, job_data)
+    
+    return JobResponse(
+        job_id=job_id,
+        name=request.name,
+        job_type=request.job_type,
+        next_run_at=job_data["next_run_at"],
+        enabled=True,
+        created_at=job_data["created_at"]
+    )
+
+@app.get("/jobs")
+async def list_jobs(user_id: Optional[str] = None):
+    """List all scheduled jobs."""
+    if not app.state.job_store:
+        raise HTTPException(status_code=503, detail="Scheduler unavailable")
+    
+    jobs = await app.state.job_store.get_all_jobs(user_id)
+    return {"jobs": jobs}
+
+@app.get("/jobs/{job_id}")
+async def get_job(job_id: str):
+    """Get job details."""
+    if not app.state.job_store:
+        raise HTTPException(status_code=503, detail="Scheduler unavailable")
+    
+    job = await app.state.job_store.get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    
+    return job
+
+@app.delete("/jobs/{job_id}")
+async def delete_job(job_id: str):
+    """Delete a job."""
+    if not app.state.job_store:
+        raise HTTPException(status_code=503, detail="Scheduler unavailable")
+    
+    await app.state.job_store.delete_job(job_id)
+    return {"status": "deleted", "job_id": job_id}
+
+@app.put("/jobs/{job_id}/enable")
+async def enable_job(job_id: str):
+    """Enable a job."""
+    if not app.state.job_store:
+        raise HTTPException(status_code=503, detail="Scheduler unavailable")
+    
+    await app.state.job_store.update_job(job_id, {"enabled": True})
+    return {"status": "enabled", "job_id": job_id}
+
+@app.put("/jobs/{job_id}/disable")
+async def disable_job(job_id: str):
+    """Disable a job."""
+    if not app.state.job_store:
+        raise HTTPException(status_code=503, detail="Scheduler unavailable")
+    
+    await app.state.job_store.update_job(job_id, {"enabled": False})
+    return {"status": "disabled", "job_id": job_id}
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8006)
+
+
+
+--------------------------------------------------------------------------------
+FILE: :\good projects\cost estimation\ai-stack\scheduler\requirements.txt
+SIZE: 168 bytes
+MODIFIED: 2026-01-30 21:32:49
+--------------------------------------------------------------------------------
+
+# Scheduler Service Dependencies
+fastapi==0.109.0
+uvicorn[standard]==0.27.0
+httpx==0.26.0
+redis==5.0.1
+pydantic==2.5.3
+pydantic-settings==2.1.0
+croniter==2.0.1
+
+
+
+--------------------------------------------------------------------------------
+FILE: :\good projects\cost estimation\ai-stack\stt\Dockerfile
+SIZE: 742 bytes
+MODIFIED: 2026-01-30 21:29:46
+--------------------------------------------------------------------------------
+
+# =============================================================================
+# STT (Speech-to-Text) Service - Dockerfile
+# =============================================================================
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# Install system dependencies for audio processing
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY . .
+
+# Create models directory
+RUN mkdir -p /app/models
+
+RUN useradd -m -u 1000 appuser && chown -R appuser:appuser /app
+USER appuser
+
+EXPOSE 8003
+
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8003"]
+
+
+
+--------------------------------------------------------------------------------
+FILE: :\good projects\cost estimation\ai-stack\stt\main.py
+SIZE: 7080 bytes
+MODIFIED: 2026-01-30 21:30:09
+--------------------------------------------------------------------------------
+
+"""
+=============================================================================
+Personal AI Operating System - STT (Speech-to-Text) Service
+=============================================================================
+Layer 3: Core Intelligence - Voice Input Processing
+
+Uses OpenAI Whisper for multilingual speech recognition.
+Supports tiny/base/small models based on RAM constraints.
+"""
+
+import os
+import logging
+import tempfile
+from datetime import datetime
+from contextlib import asynccontextmanager
+import asyncio
+
+from fastapi import FastAPI, HTTPException, UploadFile, File
+from pydantic import BaseModel
+
+# =============================================================================
+# Configuration
+# =============================================================================
+
+class Settings:
+    WHISPER_MODEL = os.getenv("WHISPER_MODEL", "tiny")
+    LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
+    MODEL_PATH = os.getenv("MODEL_PATH", "/app/models")
+
+settings = Settings()
+
+# =============================================================================
+# Logging
+# =============================================================================
+
+logging.basicConfig(
+    level=getattr(logging, settings.LOG_LEVEL),
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger("stt-service")
+
+# =============================================================================
+# Models
+# =============================================================================
+
+class TranscriptionResponse(BaseModel):
+    text: str
+    language: str
+    duration: float
+    model: str
+
+class HealthResponse(BaseModel):
+    status: str
+    model: str
+    model_loaded: bool
+    timestamp: str
+
+# =============================================================================
+# Whisper Service (Lazy Loading)
+# =============================================================================
+
+class WhisperService:
+    def __init__(self):
+        self._model = None
+        self._lock = asyncio.Lock()
+    
+    async def get_model(self):
+        """Lazy load Whisper model."""
+        if self._model is None:
+            async with self._lock:
+                if self._model is None:
+                    logger.info(f"Loading Whisper model: {settings.WHISPER_MODEL}")
+                    import whisper
+                    
+                    # Download to persistent directory
+                    self._model = whisper.load_model(
+                        settings.WHISPER_MODEL,
+                        download_root=settings.MODEL_PATH
+                    )
+                    logger.info("âœ… Whisper model loaded")
+        return self._model
+    
+    async def transcribe(self, audio_path: str) -> dict:
+        """Transcribe audio file."""
+        model = await self.get_model()
+        
+        # Run in thread pool to avoid blocking
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(
+            None,
+            lambda: model.transcribe(audio_path)
+        )
+        
+        return result
+    
+    @property
+    def is_loaded(self) -> bool:
+        return self._model is not None
+
+whisper_service = WhisperService()
+
+# =============================================================================
+# Application Lifecycle
+# =============================================================================
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Manage application lifecycle."""
+    logger.info("ðŸŽ¤ STT Service starting up...")
+    
+    # Optionally preload model
+    if os.getenv("PRELOAD_MODEL", "false").lower() == "true":
+        await whisper_service.get_model()
+    
+    yield
+    
+    logger.info("ðŸ›‘ STT Service shutting down...")
+
+# =============================================================================
+# FastAPI Application
+# =============================================================================
+
+app = FastAPI(
+    title="Personal AI OS - STT Service",
+    description="Speech-to-Text using Whisper",
+    version="1.0.0",
+    lifespan=lifespan
+)
+
+# =============================================================================
+# Endpoints
+# =============================================================================
+
+@app.get("/health", response_model=HealthResponse)
+async def health_check():
+    """Health check endpoint."""
+    return HealthResponse(
+        status="healthy",
+        model=settings.WHISPER_MODEL,
+        model_loaded=whisper_service.is_loaded,
+        timestamp=datetime.utcnow().isoformat()
+    )
+
+@app.post("/transcribe", response_model=TranscriptionResponse)
+async def transcribe(audio: UploadFile = File(...)):
+    """
+    Transcribe uploaded audio file.
+    
+    Supported formats: wav, mp3, m4a, flac, ogg, webm
+    """
+    logger.info(f"Transcription request: {audio.filename}")
+    
+    # Validate file type
+    allowed_extensions = {'.wav', '.mp3', '.m4a', '.flac', '.ogg', '.webm'}
+    file_ext = os.path.splitext(audio.filename or "")[1].lower()
+    
+    if file_ext and file_ext not in allowed_extensions:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported audio format. Allowed: {allowed_extensions}"
+        )
+    
+    try:
+        # Save to temporary file
+        with tempfile.NamedTemporaryFile(suffix=file_ext or '.wav', delete=False) as tmp:
+            content = await audio.read()
+            tmp.write(content)
+            tmp_path = tmp.name
+        
+        try:
+            # Transcribe
+            import time
+            start_time = time.time()
+            
+            result = await whisper_service.transcribe(tmp_path)
+            
+            duration = time.time() - start_time
+            
+            return TranscriptionResponse(
+                text=result["text"].strip(),
+                language=result.get("language", "unknown"),
+                duration=duration,
+                model=settings.WHISPER_MODEL
+            )
+            
+        finally:
+            # Clean up temp file
+            os.unlink(tmp_path)
+            
+    except Exception as e:
+        logger.error(f"Transcription failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Transcription failed: {str(e)}")
+
+@app.get("/models")
+async def list_models():
+    """List available Whisper models."""
+    return {
+        "available": ["tiny", "base", "small", "medium", "large"],
+        "current": settings.WHISPER_MODEL,
+        "loaded": whisper_service.is_loaded,
+        "recommendations": {
+            "tiny": "Fastest, lowest quality, ~1GB RAM",
+            "base": "Good balance, ~1GB RAM",
+            "small": "Better quality, ~2GB RAM",
+            "medium": "High quality, ~5GB RAM",
+            "large": "Best quality, ~10GB RAM"
+        }
+    }
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8003)
+
+
+
+--------------------------------------------------------------------------------
+FILE: :\good projects\cost estimation\ai-stack\stt\requirements.txt
+SIZE: 172 bytes
+MODIFIED: 2026-01-30 21:30:06
+--------------------------------------------------------------------------------
+
+# STT Service Dependencies
+fastapi==0.109.0
+uvicorn[standard]==0.27.0
+python-multipart==0.0.6
+openai-whisper==20231117
+numpy==1.26.3
+torch==2.1.2
+torchaudio==2.1.2
+
+
+
+--------------------------------------------------------------------------------
+FILE: :\good projects\cost estimation\ai-stack\tts\Dockerfile
+SIZE: 685 bytes
+MODIFIED: 2026-01-30 21:30:11
+--------------------------------------------------------------------------------
+
+# =============================================================================
+# TTS (Text-to-Speech) Service - Dockerfile
+# =============================================================================
+FROM python:3.11-slim
+
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    espeak-ng \
+    libsndfile1 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY . .
+
+RUN mkdir -p /app/models
+
+RUN useradd -m -u 1000 appuser && chown -R appuser:appuser /app
+USER appuser
+
+EXPOSE 8004
+
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8004"]
+
+
+
+--------------------------------------------------------------------------------
+FILE: :\good projects\cost estimation\ai-stack\tts\main.py
+SIZE: 8932 bytes
+MODIFIED: 2026-01-30 21:30:37
+--------------------------------------------------------------------------------
+
+"""
+=============================================================================
+Personal AI Operating System - TTS (Text-to-Speech) Service
+=============================================================================
+Layer 3: Core Intelligence - Voice Output Processing
+
+Uses Piper TTS for fast, high-quality speech synthesis.
+Lightweight and CPU-optimized.
+"""
+
+import os
+import io
+import logging
+from datetime import datetime
+from contextlib import asynccontextmanager
+import asyncio
+
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel
+
+# =============================================================================
+# Configuration
+# =============================================================================
+
+class Settings:
+    DEFAULT_VOICE = os.getenv("TTS_VOICE", "en_US-lessac-medium")
+    LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
+    MODEL_PATH = os.getenv("MODEL_PATH", "/app/models")
+    SAMPLE_RATE = 22050
+
+settings = Settings()
+
+# =============================================================================
+# Logging
+# =============================================================================
+
+logging.basicConfig(
+    level=getattr(logging, settings.LOG_LEVEL),
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger("tts-service")
+
+# =============================================================================
+# Models
+# =============================================================================
+
+class SynthesisRequest(BaseModel):
+    text: str
+    voice: str = None
+    speed: float = 1.0
+
+class HealthResponse(BaseModel):
+    status: str
+    default_voice: str
+    timestamp: str
+
+# =============================================================================
+# TTS Service
+# =============================================================================
+
+class TTSService:
+    """Piper TTS wrapper with lazy loading."""
+    
+    def __init__(self):
+        self._voices = {}
+        self._lock = asyncio.Lock()
+    
+    async def get_voice(self, voice_name: str = None):
+        """Get or load a voice model."""
+        voice = voice_name or settings.DEFAULT_VOICE
+        
+        if voice not in self._voices:
+            async with self._lock:
+                if voice not in self._voices:
+                    logger.info(f"Loading voice: {voice}")
+                    try:
+                        from piper import PiperVoice
+                        
+                        # Try to load from local models first
+                        model_path = os.path.join(settings.MODEL_PATH, f"{voice}.onnx")
+                        config_path = os.path.join(settings.MODEL_PATH, f"{voice}.onnx.json")
+                        
+                        if os.path.exists(model_path) and os.path.exists(config_path):
+                            self._voices[voice] = PiperVoice.load(model_path, config_path)
+                        else:
+                            # Download model
+                            self._voices[voice] = PiperVoice.load(voice, download_dir=settings.MODEL_PATH)
+                        
+                        logger.info(f"âœ… Voice loaded: {voice}")
+                    except Exception as e:
+                        logger.error(f"Failed to load voice {voice}: {e}")
+                        raise
+        
+        return self._voices.get(voice)
+    
+    async def synthesize(self, text: str, voice: str = None, speed: float = 1.0) -> bytes:
+        """Synthesize speech from text."""
+        voice_model = await self.get_voice(voice)
+        
+        if voice_model is None:
+            raise ValueError(f"Voice not available: {voice}")
+        
+        # Run synthesis in thread pool
+        loop = asyncio.get_event_loop()
+        
+        def _synthesize():
+            import soundfile as sf
+            import numpy as np
+            
+            audio_data = []
+            for audio_bytes in voice_model.synthesize_stream_raw(text):
+                audio_data.append(np.frombuffer(audio_bytes, dtype=np.int16))
+            
+            if not audio_data:
+                return b''
+            
+            audio = np.concatenate(audio_data)
+            
+            # Adjust speed if needed
+            if speed != 1.0:
+                # Simple resampling for speed adjustment
+                indices = np.round(np.arange(0, len(audio), speed)).astype(int)
+                indices = indices[indices < len(audio)]
+                audio = audio[indices]
+            
+            # Convert to WAV bytes
+            buffer = io.BytesIO()
+            sf.write(buffer, audio, settings.SAMPLE_RATE, format='WAV')
+            buffer.seek(0)
+            return buffer.read()
+        
+        return await loop.run_in_executor(None, _synthesize)
+
+tts_service = TTSService()
+
+# =============================================================================
+# Fallback TTS (if Piper fails)
+# =============================================================================
+
+async def fallback_synthesize(text: str) -> bytes:
+    """Fallback TTS using espeak-ng."""
+    import subprocess
+    import tempfile
+    
+    with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as tmp:
+        tmp_path = tmp.name
+    
+    try:
+        subprocess.run(
+            ['espeak-ng', '-w', tmp_path, text],
+            check=True,
+            capture_output=True
+        )
+        
+        with open(tmp_path, 'rb') as f:
+            return f.read()
+    finally:
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+
+# =============================================================================
+# Application Lifecycle
+# =============================================================================
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Manage application lifecycle."""
+    logger.info("ðŸ”Š TTS Service starting up...")
+    yield
+    logger.info("ðŸ›‘ TTS Service shutting down...")
+
+# =============================================================================
+# FastAPI Application
+# =============================================================================
+
+app = FastAPI(
+    title="Personal AI OS - TTS Service",
+    description="Text-to-Speech Synthesis",
+    version="1.0.0",
+    lifespan=lifespan
+)
+
+# =============================================================================
+# Endpoints
+# =============================================================================
+
+@app.get("/health", response_model=HealthResponse)
+async def health_check():
+    """Health check endpoint."""
+    return HealthResponse(
+        status="healthy",
+        default_voice=settings.DEFAULT_VOICE,
+        timestamp=datetime.utcnow().isoformat()
+    )
+
+@app.post("/synthesize")
+async def synthesize(request: SynthesisRequest):
+    """
+    Synthesize speech from text.
+    
+    Returns WAV audio stream.
+    """
+    if not request.text.strip():
+        raise HTTPException(status_code=400, detail="Text cannot be empty")
+    
+    if len(request.text) > 5000:
+        raise HTTPException(status_code=400, detail="Text too long (max 5000 chars)")
+    
+    logger.info(f"TTS request: {request.text[:50]}...")
+    
+    try:
+        audio_bytes = await tts_service.synthesize(
+            request.text,
+            voice=request.voice,
+            speed=request.speed
+        )
+    except Exception as e:
+        logger.warning(f"Piper TTS failed, using fallback: {e}")
+        try:
+            audio_bytes = await fallback_synthesize(request.text)
+        except Exception as e2:
+            logger.error(f"Fallback TTS also failed: {e2}")
+            raise HTTPException(status_code=500, detail="Speech synthesis failed")
+    
+    return StreamingResponse(
+        io.BytesIO(audio_bytes),
+        media_type="audio/wav",
+        headers={"Content-Disposition": "attachment; filename=speech.wav"}
+    )
+
+@app.get("/voices")
+async def list_voices():
+    """List available voices."""
+    return {
+        "default": settings.DEFAULT_VOICE,
+        "available": [
+            {"id": "en_US-lessac-medium", "language": "English (US)", "quality": "medium"},
+            {"id": "en_GB-alba-medium", "language": "English (UK)", "quality": "medium"},
+            {"id": "de_DE-thorsten-medium", "language": "German", "quality": "medium"},
+            {"id": "es_ES-carlfm-x-low", "language": "Spanish", "quality": "low"},
+            {"id": "fr_FR-upmc-medium", "language": "French", "quality": "medium"}
+        ],
+        "note": "Additional voices can be added to the models directory"
+    }
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8004)
+
+
+
+--------------------------------------------------------------------------------
+FILE: :\good projects\cost estimation\ai-stack\tts\requirements.txt
+SIZE: 125 bytes
+MODIFIED: 2026-01-30 21:30:35
+--------------------------------------------------------------------------------
+
+# TTS Service Dependencies
+fastapi==0.109.0
+uvicorn[standard]==0.27.0
+piper-tts==1.2.0
+numpy==1.26.3
+soundfile==0.12.1
+
+
+
+================================================================================
+SUMMARY
+================================================================================
+
+Total files processed: 32
+
+Files by directory:
+  :\good projects\cost estimation\ai-stack: 2 files
+  :\good projects\cost estimation\ai-stack\agents: 3 files
+  :\good projects\cost estimation\ai-stack\api: 3 files
+  :\good projects\cost estimation\ai-stack\brain: 3 files
+  :\good projects\cost estimation\ai-stack\brain\identity: 1 files
+  :\good projects\cost estimation\ai-stack\db: 1 files
+  :\good projects\cost estimation\ai-stack\info: 3 files
+  :\good projects\cost estimation\ai-stack\memory: 3 files
+  :\good projects\cost estimation\ai-stack\nginx: 1 files
+  :\good projects\cost estimation\ai-stack\notifications: 3 files
+  :\good projects\cost estimation\ai-stack\scheduler: 3 files
+  :\good projects\cost estimation\ai-stack\stt: 3 files
+  :\good projects\cost estimation\ai-stack\tts: 3 files
+
+Files by type:
+  .txt: 9 files
+  .py: 9 files
+  (no extension): 9 files
+  .conf: 1 files
+  .md: 1 files
+  .yml: 1 files
+  .yaml: 1 files
+  .sql: 1 files
+
+================================================================================
+END OF COMBINED CODE
+================================================================================
