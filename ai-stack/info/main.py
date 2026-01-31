@@ -175,22 +175,41 @@ async def lifespan(app: FastAPI):
         await app.state.redis.close()
 
 async def poll_loop(app: FastAPI):
-    """Background loop for polling feeds."""
+    """Background loop for polling feeds with adaptive backoff."""
     logger.info("Poll loop started")
+    
+    # Adaptive backoff state
+    consecutive_failures = 0
+    max_backoff = 1800  # 30 minutes max
+    base_interval = settings.POLL_INTERVAL
     
     while True:
         try:
-            if app.state.redis:
-                await poll_feeds(app)
-                app.state.last_poll = datetime.utcnow().isoformat()
+            if not app.state.redis:
+                # Redis unavailable - exponential backoff
+                consecutive_failures += 1
+                backoff = min(base_interval * (2 ** min(consecutive_failures, 5)), max_backoff)
+                logger.warning(f"Redis unavailable, backing off for {backoff}s (failures: {consecutive_failures})")
+                await asyncio.sleep(backoff)
+                continue
             
-            await asyncio.sleep(settings.POLL_INTERVAL)
+            await poll_feeds(app)
+            app.state.last_poll = datetime.utcnow().isoformat()
+            
+            # Reset backoff on success
+            if consecutive_failures > 0:
+                logger.info(f"Info engine recovered after {consecutive_failures} failures")
+            consecutive_failures = 0
+            
+            await asyncio.sleep(base_interval)
             
         except asyncio.CancelledError:
             break
         except Exception as e:
-            logger.error(f"Poll error: {e}")
-            await asyncio.sleep(settings.POLL_INTERVAL)
+            consecutive_failures += 1
+            backoff = min(base_interval * (2 ** min(consecutive_failures, 5)), max_backoff)
+            logger.error(f"Poll error (attempt {consecutive_failures}): {e}")
+            await asyncio.sleep(backoff)
 
 async def poll_feeds(app: FastAPI):
     """Poll all configured feeds."""

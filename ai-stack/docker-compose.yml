@@ -274,6 +274,32 @@ services:
     profiles:
       - proactive
 
+  memory-consolidation:
+    build:
+      context: ./consolidation
+      dockerfile: Dockerfile
+    container_name: ai-consolidation
+    restart: always
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-ai_user}:${POSTGRES_PASSWORD:-ai_secret_password}@memory-db:5432/${POSTGRES_DB:-ai_memory}
+      REDIS_URL: redis://redis:6379
+      CONSOLIDATION_INTERVAL: ${CONSOLIDATION_INTERVAL:-3600}
+      EMBEDDING_RETENTION_DAYS: ${EMBEDDING_RETENTION_DAYS:-90}
+    depends_on:
+      memory-db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - ai-network
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8009/health || exit 1"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+    profiles:
+      - maintenance
+
   # ===========================================================================
   # LAYER 2: GATEWAY LAYER
   # ===========================================================================
@@ -290,6 +316,11 @@ services:
       STT_URL: http://stt-service:8003
       TTS_URL: http://tts-service:8004
       REDIS_URL: redis://redis:6379
+      # Security settings
+      AUTH_ENABLED: ${AUTH_ENABLED:-false}
+      API_KEYS: ${API_KEYS:-}
+      RATE_LIMIT_RPM: ${RATE_LIMIT_RPM:-60}
+      CORS_ORIGINS: ${CORS_ORIGINS:-*}
     depends_on:
       ai-brain:
         condition: service_healthy
@@ -321,6 +352,25 @@ services:
       - ai-network
     healthcheck:
       test: ["CMD-SHELL", "curl -f http://localhost/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  web-ui:
+    build:
+      context: ./web
+      dockerfile: Dockerfile
+    container_name: ai-web-ui
+    restart: always
+    ports:
+      - "${WEB_PORT:-3000}:80"
+    depends_on:
+      api-gateway:
+        condition: service_healthy
+    networks:
+      - ai-network
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://localhost/ || exit 1"]
       interval: 30s
       timeout: 10s
       retries: 3

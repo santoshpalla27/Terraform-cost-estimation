@@ -269,17 +269,29 @@ async def lifespan(app: FastAPI):
         await app.state.redis.close()
 
 async def scheduler_loop(app: FastAPI):
-    """Main scheduler loop - checks for due jobs."""
+    """Main scheduler loop - checks for due jobs with adaptive backoff."""
     logger.info("Scheduler loop started")
+    
+    # Adaptive backoff state
+    consecutive_failures = 0
+    max_backoff = 300  # 5 minutes max
+    base_interval = settings.CHECK_INTERVAL
     
     while True:
         try:
             if not app.state.job_store:
-                await asyncio.sleep(settings.CHECK_INTERVAL)
+                # Redis unavailable - exponential backoff
+                consecutive_failures += 1
+                backoff = min(base_interval * (2 ** consecutive_failures), max_backoff)
+                logger.warning(f"Redis unavailable, backing off for {backoff}s (failures: {consecutive_failures})")
+                await asyncio.sleep(backoff)
                 continue
             
             now = datetime.utcnow()
             due_job_ids = await app.state.job_store.get_due_jobs(now)
+            
+            # Track job execution failures separately
+            job_failures = 0
             
             for job_id in due_job_ids:
                 job = await app.state.job_store.get_job(job_id)
@@ -287,9 +299,13 @@ async def scheduler_loop(app: FastAPI):
                     # Execute job
                     success = await execute_job(job, app.state.http_client)
                     
+                    if not success:
+                        job_failures += 1
+                    
                     # Update job
                     job["last_run_at"] = now.isoformat()
                     job["last_run_success"] = success
+                    job["failure_count"] = job.get("failure_count", 0) + (0 if success else 1)
                     
                     # Calculate next run
                     next_run = calculate_next_run(job)
@@ -304,13 +320,25 @@ async def scheduler_loop(app: FastAPI):
                             job["enabled"] = False
                             await app.state.job_store.update_job(job_id, job)
             
-            await asyncio.sleep(settings.CHECK_INTERVAL)
+            # Reset backoff on successful cycle
+            if consecutive_failures > 0:
+                logger.info(f"Scheduler recovered after {consecutive_failures} failures")
+            consecutive_failures = 0
+            
+            # Adjust interval based on job execution health
+            if job_failures > len(due_job_ids) / 2 and due_job_ids:
+                # More than half failed - brief backoff
+                await asyncio.sleep(base_interval * 2)
+            else:
+                await asyncio.sleep(base_interval)
             
         except asyncio.CancelledError:
             break
         except Exception as e:
-            logger.error(f"Scheduler error: {e}")
-            await asyncio.sleep(settings.CHECK_INTERVAL)
+            consecutive_failures += 1
+            backoff = min(base_interval * (2 ** min(consecutive_failures, 6)), max_backoff)
+            logger.error(f"Scheduler error (attempt {consecutive_failures}): {e}")
+            await asyncio.sleep(backoff)
 
 # =============================================================================
 # FastAPI Application

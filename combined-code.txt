@@ -1,7 +1,7 @@
 ﻿================================================================================
 PERSONAL AI OPERATING SYSTEM - COMBINED SOURCE CODE
-Generated: 2026-01-30 22:37:04
-Source Directory: D:\good projects\cost estimation\ai-stack
+Generated: 2026-01-30 22:37:45
+Source Directory: D:\good projects\cost estimation
 ================================================================================
 
 ================================================================================
@@ -9,66 +9,68 @@ DIRECTORY STRUCTURE
 ================================================================================
 
 ai-stack/
-|-- agents/
-|   |-- Dockerfile (605 B)
-|   |-- main.py (18.3 KB)
-|   +-- requirements.txt (146 B)
-|-- api/
-|   |-- Dockerfile (723 B)
-|   |-- main.py (21.4 KB)
-|   +-- requirements.txt (188 B)
-|-- brain/
-|   |-- identity/
-|   |   +-- persona.yaml (2.1 KB)
-|   |-- Dockerfile (609 B)
-|   |-- main.py (18.5 KB)
-|   +-- requirements.txt (157 B)
-|-- consolidation/
-|   |-- Dockerfile (621 B)
-|   |-- main.py (11.6 KB)
-|   +-- requirements.txt (138 B)
-|-- db/
-|   +-- init.sql (12.4 KB)
-|-- info/
-|   |-- Dockerfile (604 B)
-|   |-- main.py (12.6 KB)
-|   +-- requirements.txt (139 B)
-|-- memory/
-|   |-- Dockerfile (607 B)
-|   |-- main.py (17.5 KB)
-|   +-- requirements.txt (195 B)
-|-- nginx/
-|   |-- ssl/
-|   |   +-- .gitkeep (88 B)
-|   +-- nginx.conf (8.1 KB)
-|-- notifications/
-|   |-- Dockerfile (613 B)
-|   |-- main.py (5.4 KB)
-|   +-- requirements.txt (128 B)
-|-- scheduler/
-|   |-- Dockerfile (610 B)
-|   |-- main.py (16.6 KB)
-|   +-- requirements.txt (168 B)
-|-- shared/
-|   |-- __init__.py (938 B)
-|   |-- resilience.py (17.2 KB)
-|   +-- utils.py (11 KB)
-|-- stt/
-|   |-- Dockerfile (742 B)
-|   |-- main.py (6.9 KB)
-|   +-- requirements.txt (172 B)
-|-- tts/
-|   |-- Dockerfile (685 B)
-|   |-- main.py (8.7 KB)
-|   +-- requirements.txt (125 B)
-|-- web/
-|   |-- Dockerfile (447 B)
-|   |-- index.html (25.1 KB)
-|   +-- nginx.conf (1.4 KB)
-|-- .env.example (2.1 KB)
-|-- combine-code.ps1 (5.6 KB)
-|-- docker-compose.yml (11.4 KB)
-+-- README.md (6.3 KB)
+|-- ai-stack/
+|   |-- agents/
+|   |   |-- Dockerfile (605 B)
+|   |   |-- main.py (18.3 KB)
+|   |   +-- requirements.txt (146 B)
+|   |-- api/
+|   |   |-- Dockerfile (723 B)
+|   |   |-- main.py (21.4 KB)
+|   |   +-- requirements.txt (188 B)
+|   |-- brain/
+|   |   |-- identity/
+|   |   |   +-- persona.yaml (2.1 KB)
+|   |   |-- Dockerfile (609 B)
+|   |   |-- main.py (18.5 KB)
+|   |   +-- requirements.txt (157 B)
+|   |-- consolidation/
+|   |   |-- Dockerfile (621 B)
+|   |   |-- main.py (11.6 KB)
+|   |   +-- requirements.txt (138 B)
+|   |-- db/
+|   |   +-- init.sql (12.4 KB)
+|   |-- info/
+|   |   |-- Dockerfile (604 B)
+|   |   |-- main.py (12.6 KB)
+|   |   +-- requirements.txt (139 B)
+|   |-- memory/
+|   |   |-- Dockerfile (607 B)
+|   |   |-- main.py (17.5 KB)
+|   |   +-- requirements.txt (195 B)
+|   |-- nginx/
+|   |   |-- ssl/
+|   |   |   +-- .gitkeep (88 B)
+|   |   +-- nginx.conf (8.1 KB)
+|   |-- notifications/
+|   |   |-- Dockerfile (613 B)
+|   |   |-- main.py (5.4 KB)
+|   |   +-- requirements.txt (128 B)
+|   |-- scheduler/
+|   |   |-- Dockerfile (610 B)
+|   |   |-- main.py (16.6 KB)
+|   |   +-- requirements.txt (168 B)
+|   |-- shared/
+|   |   |-- __init__.py (938 B)
+|   |   |-- resilience.py (17.2 KB)
+|   |   +-- utils.py (11 KB)
+|   |-- stt/
+|   |   |-- Dockerfile (742 B)
+|   |   |-- main.py (6.9 KB)
+|   |   +-- requirements.txt (172 B)
+|   |-- tts/
+|   |   |-- Dockerfile (685 B)
+|   |   |-- main.py (8.7 KB)
+|   |   +-- requirements.txt (125 B)
+|   |-- web/
+|   |   |-- Dockerfile (447 B)
+|   |   |-- index.html (25.1 KB)
+|   |   +-- nginx.conf (1.4 KB)
+|   |-- .env.example (2.1 KB)
+|   |-- combine-code.ps1 (5.6 KB)
+|   |-- docker-compose.yml (11.4 KB)
+|   +-- README.md (6.3 KB)
++-- .gitignore (53 B)
 
 ================================================================================
 FILE CONTENTS

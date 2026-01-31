@@ -104,6 +104,41 @@ CREATE INDEX idx_facts_user_category ON facts(user_id, category);
 CREATE INDEX idx_facts_subject ON facts(subject);
 
 -- =============================================================================
+-- USER FACTS (for consolidation service archival)
+-- =============================================================================
+
+CREATE TABLE IF NOT EXISTS user_facts (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    user_id VARCHAR(255) REFERENCES user_profile(user_id) DEFAULT 'primary',
+    fact_key VARCHAR(255) NOT NULL,
+    fact_value TEXT NOT NULL,
+    confidence FLOAT DEFAULT 1.0,
+    is_active BOOLEAN DEFAULT true,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+CREATE INDEX idx_user_facts_active ON user_facts(user_id, is_active);
+
+-- =============================================================================
+-- CONVERSATION SUMMARIES (for memory consolidation)
+-- =============================================================================
+
+CREATE TABLE IF NOT EXISTS conversation_summaries (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    conversation_id UUID UNIQUE REFERENCES conversations(id) ON DELETE CASCADE,
+    user_id VARCHAR(255) REFERENCES user_profile(user_id) DEFAULT 'primary',
+    summary TEXT NOT NULL,
+    key_topics TEXT[],
+    message_count INTEGER DEFAULT 0,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+CREATE INDEX idx_conv_summaries_user ON conversation_summaries(user_id);
+CREATE INDEX idx_conv_summaries_created ON conversation_summaries(created_at DESC);
+
+-- =============================================================================
 -- AGENT TASKS & RESULTS
 -- =============================================================================
 

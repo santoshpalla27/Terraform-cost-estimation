@@ -10,15 +10,17 @@ Routes requests to appropriate backend services.
 
 import os
 import uuid
+import time
 import logging
 from datetime import datetime
 from contextlib import asynccontextmanager
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException, Request, UploadFile, File, WebSocket
+from fastapi import FastAPI, HTTPException, Request, UploadFile, File, WebSocket, Depends, Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
+from starlette.middleware.base import BaseHTTPMiddleware
 import httpx
 import redis.asyncio as redis
 
@@ -33,6 +35,12 @@ class Settings:
     TTS_URL = os.getenv("TTS_URL", "http://tts-service:8004")
     REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379")
     LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
+    
+    # Security settings
+    AUTH_ENABLED = os.getenv("AUTH_ENABLED", "false").lower() == "true"
+    API_KEYS = set(k.strip() for k in os.getenv("API_KEYS", "").split(",") if k.strip())
+    RATE_LIMIT_RPM = int(os.getenv("RATE_LIMIT_RPM", "60"))
+    CORS_ORIGINS = [o.strip() for o in os.getenv("CORS_ORIGINS", "*").split(",")]
 
 settings = Settings()
 
@@ -45,6 +53,126 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger("api-gateway")
+
+# =============================================================================
+# Security Utilities
+# =============================================================================
+
+class RateLimiter:
+    """In-memory sliding window rate limiter."""
+    
+    def __init__(self, requests_per_minute: int):
+        self.rpm = requests_per_minute
+        self.window = 60
+        self._requests: dict = {}
+    
+    def is_allowed(self, client_id: str) -> bool:
+        now = time.time()
+        window_start = now - self.window
+        
+        if client_id not in self._requests:
+            self._requests[client_id] = []
+        
+        # Clean old entries
+        self._requests[client_id] = [ts for ts in self._requests[client_id] if ts > window_start]
+        
+        if len(self._requests[client_id]) >= self.rpm:
+            return False
+        
+        self._requests[client_id].append(now)
+        return True
+    
+    def get_remaining(self, client_id: str) -> int:
+        now = time.time()
+        window_start = now - self.window
+        
+        if client_id not in self._requests:
+            return self.rpm
+        
+        current = len([ts for ts in self._requests[client_id] if ts > window_start])
+        return max(0, self.rpm - current)
+
+class CircuitBreaker:
+    """Circuit breaker for external service calls."""
+    
+    def __init__(self, name: str, threshold: int = 5, timeout: int = 30):
+        self.name = name
+        self.threshold = threshold
+        self.timeout = timeout
+        self.failures = 0
+        self.last_failure: Optional[float] = None
+        self.state = "closed"  # closed, open, half_open
+    
+    def can_execute(self) -> bool:
+        if self.state == "closed":
+            return True
+        if self.state == "open":
+            if self.last_failure and time.time() - self.last_failure >= self.timeout:
+                self.state = "half_open"
+                return True
+            return False
+        return True  # half_open
+    
+    def record_success(self):
+        self.failures = 0
+        self.state = "closed"
+    
+    def record_failure(self):
+        self.failures += 1
+        self.last_failure = time.time()
+        if self.failures >= self.threshold:
+            self.state = "open"
+            logger.warning(f"Circuit breaker '{self.name}' opened")
+
+# Global instances
+rate_limiter = RateLimiter(settings.RATE_LIMIT_RPM)
+brain_circuit = CircuitBreaker("brain", threshold=3, timeout=20)
+
+# =============================================================================
+# Auth Middleware
+# =============================================================================
+
+class SecurityMiddleware(BaseHTTPMiddleware):
+    """Authentication and rate limiting middleware."""
+    
+    EXCLUDED_PATHS = {"/health", "/api/", "/docs", "/openapi.json", "/redoc"}
+    
+    async def dispatch(self, request: Request, call_next):
+        path = request.url.path
+        
+        # Skip middleware for excluded paths
+        if any(path == p or path.startswith(p) for p in self.EXCLUDED_PATHS if p.endswith("/")):
+            pass
+        elif path in self.EXCLUDED_PATHS:
+            pass
+        else:
+            # Rate limiting
+            client_ip = request.client.host if request.client else "unknown"
+            if not rate_limiter.is_allowed(client_ip):
+                return JSONResponse(
+                    status_code=429,
+                    content={"detail": "Rate limit exceeded"},
+                    headers={"X-RateLimit-Remaining": "0"}
+                )
+            
+            # Auth check
+            if settings.AUTH_ENABLED:
+                auth_header = request.headers.get("Authorization", "")
+                api_key = auth_header.replace("Bearer ", "") if auth_header.startswith("Bearer ") else auth_header
+                
+                if not api_key or api_key not in settings.API_KEYS:
+                    return JSONResponse(
+                        status_code=401,
+                        content={"detail": "Invalid or missing API key"}
+                    )
+        
+        response = await call_next(request)
+        
+        # Add rate limit headers
+        client_ip = request.client.host if request.client else "unknown"
+        response.headers["X-RateLimit-Remaining"] = str(rate_limiter.get_remaining(client_ip))
+        
+        return response
 
 # =============================================================================
 # Models
@@ -115,10 +243,13 @@ app = FastAPI(
     lifespan=lifespan
 )
 
-# CORS middleware
+# Security middleware (auth + rate limiting)
+app.add_middleware(SecurityMiddleware)
+
+# CORS middleware - use configured origins
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Configure appropriately for production
+    allow_origins=settings.CORS_ORIGINS if settings.CORS_ORIGINS != ["*"] else ["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

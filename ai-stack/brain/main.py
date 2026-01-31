@@ -166,7 +166,7 @@ app = FastAPI(
 # Prompt Construction
 # =============================================================================
 
-def build_system_prompt(identity: dict) -> str:
+def build_system_prompt(identity: dict, include_tools: bool = True) -> str:
     """Build system prompt from identity configuration."""
     name = identity.get("name", "Assistant")
     role = identity.get("role", "AI Assistant")
@@ -194,6 +194,10 @@ EXPERTISE:
 CURRENT TIME: {datetime.now().strftime('%Y-%m-%d %H:%M %Z')}
 
 Respond naturally as {name}, maintaining consistency with your identity."""
+    
+    # Add tool-calling instructions
+    if include_tools:
+        prompt += "\n" + get_tool_calling_instructions()
     
     return prompt
 
@@ -246,25 +250,120 @@ async def fetch_memory_context(
         logger.warning(f"Failed to fetch memory: {e}")
         return ""
 
+import re
+import json as json_module
+
+# Available tools the AI can call
+AVAILABLE_TOOLS = {
+    "reminder": {
+        "description": "Set a reminder for the user",
+        "parameters": ["message", "time"]
+    },
+    "search": {
+        "description": "Search the web for information",
+        "parameters": ["query"]
+    },
+    "calculator": {
+        "description": "Perform mathematical calculation",
+        "parameters": ["expression"]
+    },
+    "note": {
+        "description": "Save a note to memory",
+        "parameters": ["title", "content"]
+    },
+    "weather": {
+        "description": "Get weather information",
+        "parameters": ["location"]
+    }
+}
+
+def get_tool_calling_instructions() -> str:
+    """Generate instructions for LLM to use structured tool calling."""
+    tool_descriptions = []
+    for name, info in AVAILABLE_TOOLS.items():
+        params = ", ".join(f'"{p}": "<value>"' for p in info["parameters"])
+        tool_descriptions.append(
+            f'- {name}: {info["description"]}\n  Parameters: {{{params}}}'
+        )
+    
+    return f"""
+TOOL CALLING:
+When you need to perform an action, output a tool call in this exact format:
+<tool_call>{{"tool": "tool_name", "params": {{...}}}}</tool_call>
+
+Available tools:
+{chr(10).join(tool_descriptions)}
+
+IMPORTANT:
+- Only use tool calls when the user explicitly requests an action
+- Always include the tool_call tag with valid JSON inside
+- Continue your response after the tool call if needed
+- Never fabricate tool results - wait for actual execution
+"""
+
+def parse_tool_calls(response: str) -> list:
+    """
+    Parse structured tool calls from AI response.
+    
+    Returns list of {"tool": str, "params": dict} or empty list.
+    This is deterministic - no keyword guessing.
+    """
+    tool_calls = []
+    
+    # Match <tool_call>{...}</tool_call> pattern
+    pattern = r'<tool_call>\s*(\{.*?\})\s*</tool_call>'
+    matches = re.findall(pattern, response, re.DOTALL)
+    
+    for match in matches:
+        try:
+            parsed = json_module.loads(match)
+            tool_name = parsed.get("tool", "")
+            params = parsed.get("params", {})
+            
+            # Validate tool exists
+            if tool_name in AVAILABLE_TOOLS:
+                tool_calls.append({
+                    "tool": tool_name,
+                    "params": params,
+                    "valid": True
+                })
+            else:
+                logger.warning(f"Unknown tool requested: {tool_name}")
+                tool_calls.append({
+                    "tool": tool_name,
+                    "params": params,
+                    "valid": False,
+                    "error": f"Unknown tool: {tool_name}"
+                })
+        except json_module.JSONDecodeError as e:
+            logger.warning(f"Failed to parse tool call JSON: {e}")
+            tool_calls.append({
+                "tool": "unknown",
+                "params": {},
+                "valid": False,
+                "error": f"Invalid JSON: {str(e)}"
+            })
+    
+    return tool_calls
+
+def extract_clean_response(response: str) -> str:
+    """Remove tool_call tags from response for clean user display."""
+    pattern = r'<tool_call>\s*\{.*?\}\s*</tool_call>'
+    return re.sub(pattern, '', response, flags=re.DOTALL).strip()
+
 def detect_agent_intent(response: str) -> Optional[str]:
     """
-    Detect if the AI response suggests an agent action.
+    Detect agent triggers using structured tool-calling protocol.
     
-    Returns agent type if action is needed, None otherwise.
+    Returns first valid tool name if found, None otherwise.
+    Falls back to None if no structured calls detected.
     """
-    # Simple keyword detection - can be made more sophisticated
-    triggers = {
-        "reminder": ["remind me", "set a reminder", "schedule a reminder"],
-        "search": ["let me search", "searching for", "looking up"],
-        "calculate": ["calculating", "let me compute"],
-        "weather": ["weather forecast", "checking weather"],
-        "calendar": ["scheduling", "adding to calendar", "checking schedule"]
-    }
+    tool_calls = parse_tool_calls(response)
     
-    response_lower = response.lower()
-    for agent, keywords in triggers.items():
-        if any(kw in response_lower for kw in keywords):
-            return agent
+    # Return first valid tool
+    for call in tool_calls:
+        if call.get("valid"):
+            return call.get("tool")
     
     return None
 
